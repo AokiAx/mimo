@@ -105,10 +105,10 @@ async def startup_event():
     except Exception as e:
         print(f"[startup] Failed to start scheduler: {e}")
     try:
-        from gateway.health import start_health_checker
-        start_health_checker()
+        from gateway.runtime import start_probe as start_router_probe
+        start_router_probe()
     except Exception as e:
-        print(f"[startup] Failed to start health checker: {e}")
+        print(f"[startup] Failed to start gateway probe: {e}")
     try:
         from gateway.vps_probe import start_probe
         start_probe()
@@ -937,7 +937,7 @@ async def auto_deploy_history(account_filename: str):
 async def gateway_status():
     """Gateway status overview for dashboard."""
     try:
-        from gateway.router import get_router_status
+        from gateway.runtime import get_router_status
         return get_router_status()
     except ImportError:
         return {"error": "Gateway module not installed"}
@@ -947,7 +947,7 @@ async def gateway_status():
 async def gateway_backends():
     """List all backend servers with health/routing info."""
     try:
-        from gateway.router import get_all_backends
+        from gateway.runtime import get_all_backends
         return {"backends": get_all_backends()}
     except ImportError:
         return {"backends": []}
@@ -957,9 +957,20 @@ async def gateway_backends():
 async def gateway_backend_toggle(backend_id: str):
     """Enable/disable a backend."""
     try:
-        from gateway.router import toggle_backend
+        from gateway.runtime import toggle_backend
         result = toggle_backend(backend_id)
         return result
+    except ImportError:
+        return {"success": False, "error": "Gateway module not installed"}
+
+
+@app.post("/api/gateway/backends/reload")
+async def gateway_backends_reload():
+    """Re-read auto_deploy.json and rebuild the backend registry."""
+    try:
+        from gateway.runtime import reload_backends
+        count = reload_backends()
+        return {"success": True, "backends": count}
     except ImportError:
         return {"success": False, "error": "Gateway module not installed"}
 
@@ -1082,50 +1093,22 @@ async def gateway_proxy(request: Request, path: str):
     body = await request.body()
     headers = dict(request.headers)
 
-    # Detect source format
-    source_format = "openai"
+    # Map source path → adapter name (the new pipeline does protocol
+    # encoding/decoding bidirectionally — including streaming SSE frames).
+    adapter_name = "openai_chat"
     if full_path == "/v1/messages":
-        source_format = "anthropic"
+        adapter_name = "anthropic"
     elif full_path == "/v1/responses":
-        source_format = "responses"
+        adapter_name = "openai_responses"
 
     try:
-        from gateway.proxy import proxy_request
-        status_code, resp_headers, resp_content = await proxy_request(
-            request.method, full_path, headers, body, source_format
-        )
+        from gateway.runtime import dispatch
+        return await dispatch(adapter_name, request)
     except ImportError:
         return JSONResponse(
-            {"error": {"message": "Gateway proxy module not installed"}},
+            {"error": {"message": "Gateway module not installed"}},
             status_code=503,
         )
-    except Exception as e:
-        return JSONResponse(
-            {"error": {"message": f"Gateway error: {e}", "type": "proxy_error"}},
-            status_code=502,
-        )
-
-    # Check if streaming response
-    if hasattr(resp_content, "__aiter__"):
-        # Async iterator — streaming SSE
-        safe_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        }
-        return StreamingResponse(
-            resp_content,
-            status_code=status_code,
-            headers=safe_headers,
-        )
-
-    # Non-streaming: bytes response
-    safe_headers = {
-        "Content-Type": resp_headers.get("Content-Type", "application/json"),
-        "Access-Control-Allow-Origin": "*",
-    }
-    return HTMLResponse(content=resp_content, status_code=status_code, headers=safe_headers)
 
 
 @app.options("/v1/{path:path}")
@@ -1147,7 +1130,7 @@ async def gateway_cors_preflight(path: str):
 async def gateway_health():
     """Public health endpoint for the gateway."""
     try:
-        from gateway.router import get_router_status
+        from gateway.runtime import get_router_status
         status = get_router_status()
         return {"status": "ok", **status}
     except ImportError:
@@ -1158,7 +1141,7 @@ async def gateway_health():
 async def gateway_status_page():
     """Public gateway status (no auth required, for monitoring)."""
     try:
-        from gateway.router import get_router_status
+        from gateway.runtime import get_router_status
         return get_router_status()
     except ImportError:
         return {"error": "Gateway module not installed"}

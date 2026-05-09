@@ -36,34 +36,49 @@ bash run.sh
 
 ```
 mimo/
-├── app.py                  # 管理面板 + 旧版 gateway 入口（生产使用）
+├── app.py                  # FastAPI 入口：管理面板 + /v1/* gateway 路由
 ├── run.sh                  # 启动脚本
 ├── requirements.txt
-├── gateway.example.yaml    # 新版 pipeline 配置示例
+├── gateway.example.yaml    # 独立部署 gateway/server.py 时的配置示例
 │
-├── claw/                   # MiMo 自动化（原 core/）
+├── claw/                   # MiMo 自动化
 │   ├── mimo_auth.py        # 小米 SSO 登录 + Cookie 管理
 │   ├── mimo_chat.py        # HTTP/SSE 对话客户端
 │   ├── mimo_ws_client.py   # WebSocket 对话客户端
 │   ├── auto_deploy.py      # 定时部署调度器（10 步流程）
 │   └── deploy.py           # 手动单次部署
 │
-├── gateway/                # API gateway（OpenAI / Anthropic 兼容）
-│   ├── proxy.py            # ⭐ 旧版代理（生产路径，app.py 使用中）
-│   ├── router.py           # ⭐ 旧版路由：从 auto_deploy.json 自动发现后端
-│   ├── converter.py        # ⭐ 协议转换 Anthropic / Responses → Chat
-│   ├── health.py           # ⭐ 后端健康巡检
-│   ├── metrics.py          # ⭐ SQLite 指标存储 + 聚合查询
-│   ├── vps_probe.py        # ⭐ VPS 节点 TCP 探针
+├── gateway/                # API gateway（OpenAI / Anthropic / Responses 兼容）
+│   ├── runtime.py          # 进程级 singleton：从 auto_deploy.json 自动发现后端，
+│   │                       # 把 handler+adapters+routing+transport 串起来；
+│   │                       # 提供 dispatch() 给 app.py，提供状态接口给面板
+│   ├── server.py           # 独立 FastAPI 入口（含完整中间件栈，可单独部署）
+│   ├── handler.py          # 终端 handler：路由→协议编码→上游→响应解码
+│   ├── transport.py        # httpx 上游传输（流式 + 非流式）
+│   ├── metrics.py          # SQLite 指标存储 + 聚合查询
+│   ├── vps_probe.py        # VPS 节点 TCP 探针
 │   │
-│   ├── server.py           # 新版 FastAPI 入口（未接入 app.py，参考）
-│   ├── handler.py          # 新版终端 handler
-│   ├── transport.py        # 新版 httpx 上游
-│   ├── adapters/           # 新版协议适配器
-│   ├── core/               # 新版 pipeline / context / errors
-│   ├── middleware/         # 新版中间件（auth/rate_limit/logging/timing）
-│   ├── routing/            # 新版评分路由 + decision log
-│   └── config/             # 新版 yaml 配置 + APIKeyStore
+│   ├── adapters/           # 协议双向适配器
+│   │   ├── base.py             # ProtocolAdapter / UpstreamCodec 接口
+│   │   ├── openai_chat.py      # OpenAI Chat ⇄ IES（同时也是上游 codec）
+│   │   ├── anthropic.py        # Anthropic Messages ⇄ IES（含 SSE 帧重组）
+│   │   └── openai_responses.py # OpenAI Responses ⇄ IES
+│   ├── core/               # 协议无关的核心
+│   │   ├── context.py          # RequestContext + 决策追踪
+│   │   ├── pipeline.py         # Middleware ABC + Pipeline 折叠
+│   │   ├── errors.py           # GatewayError 家族
+│   │   └── types.py            # InternalEvent (IES) 中间表示
+│   ├── middleware/         # pipeline 洋葱（仅 server.py 启用）
+│   │   ├── logging.py / timing.py / auth.py / rate_limit.py
+│   ├── routing/            # 后端选择
+│   │   ├── backend.py          # Backend：health/breaker/EWMA/in_flight
+│   │   ├── registry.py         # BackendRegistry
+│   │   ├── router.py           # 评分选择 score = lat*(1+inflight)/weight
+│   │   ├── probe.py            # chat-style 健康探测
+│   │   └── decision_log.py     # 路由决策审计
+│   └── config/             # gateway.yaml 加载 + APIKeyStore
+│       ├── loader.py
+│       └── api_keys.py
 │
 ├── templates/
 │   ├── index.html          # 管理面板（受密码保护）
@@ -72,7 +87,7 @@ mimo/
 ├── scripts/
 │   └── api-proxy.py        # 独立 asyncio 代理（零依赖，遗留参考）
 │
-├── tests/                  # pytest，180+ 用例
+├── tests/                  # pytest，180 用例
 ├── docs/                   # 设计笔记
 ├── data/                   # 运行时（已 gitignore）
 │   ├── api_keys.db         # API key 存储
@@ -87,24 +102,32 @@ mimo/
 
 ---
 
-## Gateway 状态（必读）
+## Gateway 架构
 
-`gateway/` 目录里同时存在 **两套** 实现，请勿混淆：
+```
+client request (OpenAI / Anthropic / Responses)
+   ↓
+app.py /v1/{path:path}
+   ↓ Bearer / 面板 cookie 鉴权
+gateway.runtime.dispatch(adapter_name, request)
+   ↓
+GatewayHandler.handle(ctx, adapter, body)
+   ├─ adapter.parse_request(body)         ← 客户端协议 → IES
+   ├─ Router.choose(model)                ← 评分选后端
+   ├─ HttpxTransport.post_json/post_stream ← 上游 (MiMo OpenAI Chat)
+   ├─ codec.parse_upstream_*              ← 上游响应 → IES
+   ├─ adapter.serialize_response_*        ← IES → 客户端协议
+   └─ metrics + decision log
+```
 
-| 项 | 旧版（生产）| 新版（参考）|
-|---|---|---|
-| 入口 | `app.py` 的路由 | `gateway/server.py:create_app()` |
-| 代理 | `gateway/proxy.py` | `gateway/handler.py` + `transport.py` |
-| 路由 | `gateway/router.py` | `gateway/routing/router.py` |
-| 后端发现 | 从 `data/auto_deploy.json` 自动读取 | 从 yaml 配置静态加载 |
-| 协议 | `converter.py` 把 Anthropic/Responses 转成 Chat | `adapters/` 各协议独立 |
-| 配置 | 全局常量 + json | `gateway.yaml` |
-| 是否运行 | ✅ 是 | ❌ 否（仅 `gateway.metrics`、`vps_probe` 被 app.py 引用）|
+**关键特性**：
+- **后端自动发现**：`gateway.runtime` 启动时从 `data/auto_deploy.json` 读 enabled 账号，每个账号 → 一个 `http://127.0.0.1:{api_port}` 后端。改完配置可调 `POST /api/gateway/backends/reload` 热加载。
+- **协议双向转换**：三种客户端协议都用 `InternalEvent` 中间表示双向编解码。Anthropic 的 `event: message_start / content_block_delta / message_stop` SSE 帧会正确生成。
+- **评分路由**：`score = ewma_latency * (1 + in_flight) / weight`，更低更优。
+- **熔断**：连续失败 3 次后冷却 30s。
+- **健康探测**：30s 一次 chat probe（实打 `/v1/chat/completions`，max_tokens=1）。
 
-新版 pipeline 测试齐全（180 用例通过），但 **未接入 `app.py`**。生产流量目前完全走旧版。
-两者通过 `gateway/metrics.py` 的 SQLite 表共享指标，所以面板 / 公开统计页拿到的数据一致。
-
-后续是合并新旧、还是删掉新版回归单一实现，待用户决定。
+`gateway/server.py` 是另一种部署方式——独立 FastAPI 进程 + 完整中间件栈（Bearer key store、限流、决策日志），从 `gateway.yaml` 静态读后端。app.py 不用它，但测试仍覆盖。
 
 ---
 
@@ -120,6 +143,10 @@ mimo/
 - `GET /` — 主面板
 - `GET /api/accounts` / `POST /api/account/*` — 账号管理
 - `GET /api/deploy/*` — 部署调度
+- `GET /api/gateway/status` — 路由概览（uptime / qps / 后端数）
+- `GET /api/gateway/backends` — 后端列表
+- `POST /api/gateway/backends/{id}/toggle` — 启停某后端
+- `POST /api/gateway/backends/reload` — 重读 auto_deploy.json
 - `GET /api/gateway/metrics/{summary|hourly|backends|status}` — 指标
 - `GET /api/gateway/vps` / `POST /api/gateway/vps/refresh` — 节点状态
 
