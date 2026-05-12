@@ -33,6 +33,8 @@ bash run.sh
 - `MIMO_PANEL_PASSWORD` — 覆盖面板密码
 - `MIMO_PUBLIC_API_TOKEN` — 覆盖公开 API Bearer token
 - `MIMO_UPSTREAM_API_KEY` — 覆盖上游默认 API key
+- `DISABLE_SCHEDULER=1` — 不启动 auto-deploy 调度器（面板仍可手动触发部署）
+- `MIMO_JUMP_LOCAL=1` — 面板**就跑在跳板机本机**时启用。`auto_deploy` 的端口清理 / 加公钥等操作改走本地 `bash -c`，避免 root 自连 SSH
 
 ---
 

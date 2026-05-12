@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -41,6 +42,11 @@ HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
 
 JUMP_SERVER = "149.88.90.137"
 JUMP_USER = "root"
+
+# Set MIMO_JUMP_LOCAL=1 when the panel runs ON the jump server. ``ssh_jump``
+# then dispatches via local ``bash -c`` instead of self-SSH, which would
+# otherwise need root↔root key trust on the same host.
+_JUMP_LOCAL = os.environ.get("MIMO_JUMP_LOCAL") in ("1", "true", "yes")
 
 # Stale-deploy entries (state ∈ done/error/cancelled) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
@@ -214,6 +220,17 @@ def get_deploy_status(account_filename: str = None) -> dict:
 # ─── SSH jump helper ───
 
 def ssh_jump(command: str, timeout: int = 30) -> tuple:
+    if _JUMP_LOCAL:
+        try:
+            r = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return "", "local exec timeout", 1
+        except Exception as e:
+            return "", str(e), 1
     cmd = [
         "ssh", "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=10",
