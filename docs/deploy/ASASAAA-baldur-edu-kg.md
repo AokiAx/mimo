@@ -52,12 +52,18 @@ chmod +x /root/.openclaw/workspace/scripts/api-proxy.py
 
 **不要修改脚本内容**。脚本会：
 - 监听 `127.0.0.1:18800`（与 SSH 隧道客户端同 netns，loopback 互通；不暴露到其他接口）
-- 从环境变量 `MIMO_API_KEY` / `MIMO_API_ENDPOINT` 读上游配置（由 openclaw-gateway 进程注入，无需手动设置）
+- 从环境变量 `MIMO_API_KEY` / `MIMO_API_ENDPOINT` 读上游配置（这两个变量在你（Claw）的交互 shell env 里，但 systemd 启的独立进程不继承 —— 步骤 6 会显式注入）
 - 用 `Authorization: Bearer sk-Aoki-MiMo` 鉴权调用方
 
 ### 6. 注册 systemd 服务
 
+api-proxy.py 由 systemd 起独立进程，**不在 openclaw-gateway 进程树里**，所以 `$MIMO_API_KEY` / `$MIMO_API_ENDPOINT` 不会自动继承。先把你 shell env 里的值落到 `/etc/openclaw/api-proxy.env`，unit 用 `EnvironmentFile=` 读：
+
 ```bash
+mkdir -p /etc/openclaw
+printf 'MIMO_API_KEY=%s\nMIMO_API_ENDPOINT=%s\n' "$MIMO_API_KEY" "$MIMO_API_ENDPOINT" > /etc/openclaw/api-proxy.env
+chmod 600 /etc/openclaw/api-proxy.env
+
 cat > /etc/systemd/system/api-proxy.service << 'EOF'
 [Unit]
 Description=MiMo API Proxy
@@ -65,6 +71,7 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/openclaw/api-proxy.env
 ExecStart=/usr/bin/python3 /root/.openclaw/workspace/scripts/api-proxy.py
 Restart=always
 RestartSec=5
