@@ -40,6 +40,14 @@ data/auto_deploy.json
 data/deploy_history/
 data/deploy_logs/
 
+# Gateway secrets & backend config (contains credentials)
+data/secrets.json
+data/backends.json
+
+# Gateway runtime state (panel CRUD / discovery)
+data/model_groups.json
+data/probe_nodes.json
+
 # Gateway runtime config (often contains secrets)
 gateway.yaml
 

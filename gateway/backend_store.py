@@ -1,0 +1,192 @@
+"""Persistent backend store — CRUD for data/backends.json.
+
+Each entry is a dict with:
+  id, name, base_url, models (list[str]), api_key, weight, enabled, account_id
+
+Legacy format with ``model`` (str) + ``aliases`` (comma-string) is migrated
+to ``models`` on read; written entries always use the new shape.
+
+The store is the single source of truth. ``runtime.py`` reloads the
+BackendRegistry from it on startup and after every mutation.
+"""
+from __future__ import annotations
+
+import json
+import secrets
+import threading
+from pathlib import Path
+from typing import Any
+
+DATA_PATH = Path(__file__).parent.parent / "data" / "backends.json"
+
+_lock = threading.Lock()
+
+
+def _empty() -> dict:
+    return {"backends": []}
+
+
+def _normalize_models(raw: Any) -> list[str]:
+    """Accept list[str], comma-string, or a single str; emit a deduped list."""
+    out: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str):
+        items = raw.split(",")
+    else:
+        return out
+    for m in items:
+        if not isinstance(m, str):
+            continue
+        s = m.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _migrate_entry(entry: dict) -> dict:
+    """If entry uses legacy {model, aliases}, fold them into models[]."""
+    if "models" in entry and isinstance(entry["models"], list):
+        entry["models"] = _normalize_models(entry["models"])
+        entry.pop("model", None)
+        entry.pop("aliases", None)
+        return entry
+    merged: list[str] = []
+    primary = entry.pop("model", None)
+    if isinstance(primary, str) and primary.strip():
+        merged.append(primary.strip())
+    aliases = entry.pop("aliases", None)
+    if isinstance(aliases, str):
+        for a in aliases.split(","):
+            a = a.strip()
+            if a and a not in merged:
+                merged.append(a)
+    entry["models"] = merged
+    return entry
+
+
+def _load() -> dict:
+    if not DATA_PATH.exists():
+        return _empty()
+    try:
+        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty()
+    for b in data.get("backends") or []:
+        _migrate_entry(b)
+    return data
+
+
+def _save(data: dict) -> None:
+    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_PATH.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def list_backends() -> list[dict[str, Any]]:
+    with _lock:
+        data = _load()
+    return data.get("backends") or []
+
+
+def add_backend(
+    *,
+    name: str,
+    base_url: str,
+    models: Any = None,
+    api_key: str = "",
+    weight: int = 1,
+    account_id: str = "",
+    # legacy kwargs accepted for callers that still pass model/aliases
+    model: str = "",
+    aliases: str = "",
+) -> dict[str, Any]:
+    name = (name or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    model_list = _normalize_models(models) if models is not None else []
+    if not model_list:
+        # legacy path
+        if model:
+            model_list.append(model.strip())
+        for a in (aliases or "").split(","):
+            a = a.strip()
+            if a and a not in model_list:
+                model_list.append(a)
+    if not name:
+        raise ValueError("name 不能为空")
+    if not base_url:
+        raise ValueError("base_url 不能为空")
+    if not model_list:
+        raise ValueError("models 不能为空")
+
+    backend_id = secrets.token_hex(6)
+    entry: dict[str, Any] = {
+        "id": backend_id,
+        "name": name,
+        "base_url": base_url,
+        "models": model_list,
+        "api_key": api_key,
+        "weight": max(1, int(weight)),
+        "account_id": account_id,
+        "enabled": True,
+    }
+    with _lock:
+        data = _load()
+        for b in data["backends"]:
+            if b.get("name") == name:
+                raise ValueError(f"后端名 '{name}' 已存在")
+        data["backends"].append(entry)
+        _save(data)
+    return entry
+
+
+def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
+    allowed = {"name", "base_url", "models", "api_key", "weight",
+               "account_id", "enabled"}
+    # Legacy: caller passes {model, aliases} — fold into models.
+    if "model" in fields or "aliases" in fields:
+        legacy = []
+        m = fields.pop("model", "")
+        if isinstance(m, str) and m.strip():
+            legacy.append(m.strip())
+        a = fields.pop("aliases", "")
+        if isinstance(a, str):
+            for x in a.split(","):
+                x = x.strip()
+                if x and x not in legacy:
+                    legacy.append(x)
+        if legacy and "models" not in fields:
+            fields["models"] = legacy
+
+    with _lock:
+        data = _load()
+        for b in data["backends"]:
+            if b["id"] == backend_id:
+                for k, v in fields.items():
+                    if k not in allowed:
+                        continue
+                    if k == "base_url" and isinstance(v, str):
+                        v = v.rstrip("/")
+                    if k == "models":
+                        v = _normalize_models(v)
+                        if not v:
+                            continue  # ignore empty list — keep old
+                    b[k] = v
+                _save(data)
+                return b
+    return None
+
+
+def delete_backend(backend_id: str) -> bool:
+    with _lock:
+        data = _load()
+        before = len(data["backends"])
+        data["backends"] = [b for b in data["backends"] if b["id"] != backend_id]
+        if len(data["backends"]) == before:
+            return False
+        _save(data)
+    return True

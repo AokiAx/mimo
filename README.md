@@ -23,12 +23,16 @@ python app.py
 bash run.sh
 ```
 
-打开 `http://localhost:8088`，默认密码 `Aoki-MiMo`。
+打开 `http://localhost:8088`，面板密码见 `data/secrets.json` 的 `panel_password` 字段。
+首次运行会自动生成 `data/secrets.json`，包含随机面板密码和 API token。
+
 公开统计页（无需登录）：`http://localhost:8088/stats`
 
 环境变量：
 - `MIMO_EMAIL`、`MIMO_PASSWORD` — 跳过交互输入
-- `GATEWAY_CONFIG` — 新版 pipeline 的 yaml 配置路径（见下文「Gateway 状态」）
+- `MIMO_PANEL_PASSWORD` — 覆盖面板密码
+- `MIMO_PUBLIC_API_TOKEN` — 覆盖公开 API Bearer token
+- `MIMO_UPSTREAM_API_KEY` — 覆盖上游默认 API key
 
 ---
 
@@ -39,24 +43,24 @@ mimo/
 ├── app.py                  # FastAPI 入口：管理面板 + /v1/* gateway 路由
 ├── run.sh                  # 启动脚本
 ├── requirements.txt
-├── gateway.example.yaml    # 独立部署 gateway/server.py 时的配置示例
 │
 ├── claw/                   # MiMo 自动化
 │   ├── mimo_auth.py        # 小米 SSO 登录 + Cookie 管理
 │   ├── mimo_chat.py        # HTTP/SSE 对话客户端
 │   ├── mimo_ws_client.py   # WebSocket 对话客户端
 │   ├── auto_deploy.py      # 定时部署调度器（10 步流程）
-│   └── deploy.py           # 手动单次部署
+│   └── payload/
+│       └── api-proxy.py    # 部署到 ECS 的独立 asyncio 代理（零依赖）
 │
 ├── gateway/                # API gateway（OpenAI / Anthropic / Responses 兼容）
-│   ├── runtime.py          # 进程级 singleton：从 auto_deploy.json 自动发现后端，
+│   ├── runtime.py          # 进程级 singleton：从 backends.json 读后端，
 │   │                       # 把 handler+adapters+routing+transport 串起来；
 │   │                       # 提供 dispatch() 给 app.py，提供状态接口给面板
-│   ├── server.py           # 独立 FastAPI 入口（含完整中间件栈，可单独部署）
 │   ├── handler.py          # 终端 handler：路由→协议编码→上游→响应解码
 │   ├── transport.py        # httpx 上游传输（流式 + 非流式）
 │   ├── metrics.py          # SQLite 指标存储 + 聚合查询
-│   ├── vps_probe.py        # VPS 节点 TCP 探针
+│   ├── secrets_store.py    # 从 data/secrets.json 读凭证（支持环境变量覆盖）
+│   ├── backend_store.py    # CRUD 持久化 data/backends.json
 │   │
 │   ├── adapters/           # 协议双向适配器
 │   │   ├── base.py             # ProtocolAdapter / UpstreamCodec 接口
@@ -65,34 +69,30 @@ mimo/
 │   │   └── openai_responses.py # OpenAI Responses ⇄ IES
 │   ├── core/               # 协议无关的核心
 │   │   ├── context.py          # RequestContext + 决策追踪
-│   │   ├── pipeline.py         # Middleware ABC + Pipeline 折叠
 │   │   ├── errors.py           # GatewayError 家族
 │   │   └── types.py            # InternalEvent (IES) 中间表示
-│   ├── middleware/         # pipeline 洋葱（仅 server.py 启用）
-│   │   ├── logging.py / timing.py / auth.py / rate_limit.py
 │   ├── routing/            # 后端选择
-│   │   ├── backend.py          # Backend：health/breaker/EWMA/in_flight
+│   │   ├── backend.py          # Backend：health/breaker/EWMA/in_flight/enabled
 │   │   ├── registry.py         # BackendRegistry
 │   │   ├── router.py           # 评分选择 score = lat*(1+inflight)/weight
-│   │   ├── probe.py            # chat-style 健康探测
 │   │   └── decision_log.py     # 路由决策审计
-│   └── config/             # gateway.yaml 加载 + APIKeyStore
-│       ├── loader.py
+│   └── config/             # APIKeyStore（SQLite）
 │       └── api_keys.py
 │
 ├── templates/
 │   ├── index.html          # 管理面板（受密码保护）
 │   └── stats.html          # 公开统计页（无需登录）
 │
-├── scripts/
-│   └── api-proxy.py        # 独立 asyncio 代理（零依赖，遗留参考）
-│
-├── tests/                  # pytest，180 用例
-├── docs/                   # 设计笔记
+├── probe/                  # VPS 探针 agent（可选部署）
+├── tests/                  # pytest
+├── docs/
+│   └── deploy/             # 每个账号一份部署文案（被 auto_deploy 读取）
 ├── data/                   # 运行时（已 gitignore）
+│   ├── secrets.json        # 面板密码 + API token（首次运行自动生成）
+│   ├── backends.json       # 后端配置（面板 CRUD 或手动编辑）
 │   ├── api_keys.db         # API key 存储
 │   ├── metrics.db          # 请求指标
-│   ├── auto_deploy.json    # 部署配置 + 后端发现源
+│   ├── auto_deploy.json    # Claw 部署调度配置
 │   ├── deploy_history/
 │   └── deploy_logs/
 └── accounts/               # Cookie 存储（已 gitignore）
@@ -121,13 +121,12 @@ GatewayHandler.handle(ctx, adapter, body)
 ```
 
 **关键特性**：
-- **后端自动发现**：`gateway.runtime` 启动时从 `data/auto_deploy.json` 读 enabled 账号，每个账号 → 一个 `http://127.0.0.1:{api_port}` 后端。改完配置可调 `POST /api/gateway/backends/reload` 热加载。
+- **手动后端管理**：后端配置存 `data/backends.json`，通过管理面板 CRUD 或手动编辑。面板支持增删改查、启停、热加载。
+- **凭证隔离**：密码和 token 存 `data/secrets.json`，首次运行自动生成。支持 `MIMO_PANEL_PASSWORD` / `MIMO_PUBLIC_API_TOKEN` / `MIMO_UPSTREAM_API_KEY` 环境变量覆盖。
 - **协议双向转换**：三种客户端协议都用 `InternalEvent` 中间表示双向编解码。Anthropic 的 `event: message_start / content_block_delta / message_stop` SSE 帧会正确生成。
 - **评分路由**：`score = ewma_latency * (1 + in_flight) / weight`，更低更优。
-- **熔断**：连续失败 3 次后冷却 30s。
-- **健康探测**：30s 一次 chat probe（实打 `/v1/chat/completions`，max_tokens=1）。
-
-`gateway/server.py` 是另一种部署方式——独立 FastAPI 进程 + 完整中间件栈（Bearer key store、限流、决策日志），从 `gateway.yaml` 静态读后端。app.py 不用它，但测试仍覆盖。
+- **熔断**：连续失败 3 次后冷却 30s。`enabled` 开关可独立禁用后端。
+- **健康探测**：60s 一次 HTTP GET `/v1/models`（不消耗推理 token）。
 
 ---
 

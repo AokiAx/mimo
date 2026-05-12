@@ -38,6 +38,7 @@ import re
 import sys
 import time
 import subprocess
+import uuid
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -658,6 +659,230 @@ def _fetch_ph(session, auth_data):
         pass
 
     return None
+
+
+# === Web-driven login (panel-friendly, non-interactive) ===
+#
+# The CLI flow above uses ``input()`` for the 2FA verification code, which
+# is fine from a terminal but useless from a web request. The two functions
+# below (``web_start_login`` / ``web_submit_code``) implement the same SSO
+# state machine but suspend at the 2FA step so the panel can collect the
+# code in a second HTTP call. Pending sessions live in memory, keyed by a
+# random session_id, and expire after ``_PENDING_TTL`` seconds.
+
+_PENDING_LOGINS: "dict[str, dict]" = {}
+_PENDING_TTL = 300  # 5 min
+
+
+def _gc_pending_logins():
+    now = time.time()
+    for sid in list(_PENDING_LOGINS.keys()):
+        if _PENDING_LOGINS[sid]["expires_at"] < now:
+            del _PENDING_LOGINS[sid]
+
+
+def _finish_login(session, location, auth_data):
+    """Shared post-2FA / post-no-2FA path: exchange location → serviceToken,
+    format cookies, ensure ``xiaomichatbot_ph`` and GA cookies are present."""
+    _xiaomi_exchange_token(session, location)
+
+    st = None
+    for c in session.cookies:
+        if c.name == "serviceToken" and "xiaomimimo" in (c.domain or ""):
+            st = c.value
+            break
+    if not st:
+        for c in session.cookies:
+            if c.name == "serviceToken":
+                st = c.value
+                break
+    if not st:
+        raise Exception("登录流程完成但未获取到 serviceToken")
+
+    cookies = _format_cookies(session)
+
+    has_mimo_cookie = any("xiaomimimo" in c.get("domain", "") for c in cookies)
+    if not has_mimo_cookie:
+        for c in session.cookies:
+            if c.name in ("serviceToken", "userId"):
+                cookies.append({
+                    "name": c.name, "value": c.value,
+                    "domain": ".xiaomimimo.com", "path": "/",
+                    "expires": c.expires if c.expires else -1,
+                    "httpOnly": c.name == "serviceToken",
+                    "secure": False, "sameSite": "Lax",
+                })
+
+    if not any(c["name"] == "xiaomichatbot_ph" for c in cookies):
+        ph_val = _fetch_ph(session, auth_data)
+        if ph_val:
+            cookies.append({
+                "name": "xiaomichatbot_ph", "value": ph_val,
+                "domain": ".xiaomimimo.com", "path": "/",
+                "expires": -1, "httpOnly": False, "secure": False,
+                "sameSite": "Lax",
+            })
+
+    if not any(c["name"] == "_ga" for c in cookies):
+        ga_id = str(random.randint(100000000, 999999999))
+        ts = int(time.time())
+        expiry = ts + 86400 * 365 * 2
+        cookies.append({"name": "_ga", "value": f"GA1.1.{ga_id}.{ts}",
+                        "domain": ".xiaomi.com", "path": "/", "expires": expiry,
+                        "httpOnly": False, "secure": False, "sameSite": "Lax"})
+        cookies.append({"name": "_ga_XWN774PE8J",
+                        "value": f"GS2.1.s{ts}$o1$g1$t{ts}$j60$l0$h0",
+                        "domain": ".xiaomi.com", "path": "/", "expires": expiry,
+                        "httpOnly": False, "secure": False, "sameSite": "Lax"})
+
+    return cookies
+
+
+def web_start_login(email, password):
+    """Begin a web-driven login. Returns one of:
+      {"status": "ok",         "cookies": [...]}            — no 2FA needed
+      {"status": "needs_code", "session_id": "...",
+                               "method": "email"|"phone"}    — caller must POST code
+      {"status": "error",      "error": "..."}
+    """
+    _gc_pending_logins()
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+
+        callback = _fetch_callback(session)
+        if not callback:
+            return {"status": "error", "error": "获取 callback URL 失败"}
+
+        sign, init_resp = _xiaomi_get_sign(session, callback)
+        if not sign:
+            return {"status": "error", "error": "获取 _sign 失败"}
+
+        auth_data = _xiaomi_authenticate(session, email, password, sign, callback)
+
+        # Branch A — needs 2FA
+        if auth_data.get("notificationUrl") and not auth_data.get("location"):
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(auth_data.get("notificationUrl", ""))
+            context = parse_qs(parsed.query).get("context", [""])[0]
+            if not context:
+                return {"status": "error", "error": "无法获取验证上下文"}
+
+            data, _ = _identity_list(session, SID, context)
+            if not data or data.get("code") not in (0, 2):
+                return {"status": "error", "error": "获取验证方式失败"}
+
+            options = data.get("options", [])
+            flag = options[0] if options else data.get("flag", 4)
+            user_id = data.get("externalId", "") or auth_data.get("userId", "")
+
+            try:
+                _send_email_code(session, flag)
+            except Exception:
+                # 即使首次发送失败也不阻塞 — 用户可重试或验证码已通过其他方式发送
+                pass
+
+            session_id = uuid.uuid4().hex
+            _PENDING_LOGINS[session_id] = {
+                "session": session,
+                "callback": callback,
+                "flag": flag,
+                "user_id": user_id,
+                "auth_data": auth_data,
+                "expires_at": time.time() + _PENDING_TTL,
+            }
+            return {
+                "status": "needs_code",
+                "session_id": session_id,
+                "method": "email" if flag == 8 else ("phone" if flag == 4 else "unknown"),
+            }
+
+        # Branch B — direct login (no 2FA)
+        if auth_data.get("result") == "ok":
+            location = auth_data.get("location", "")
+            if not location:
+                return {"status": "error", "error": "登录成功但无 location"}
+            cookies = _finish_login(session, location, auth_data)
+            return {"status": "ok", "cookies": cookies}
+
+        desc = auth_data.get("desc", auth_data.get("code", "unknown"))
+        return {"status": "error", "error": f"登录失败: {desc}"}
+
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+def web_submit_code(session_id, code):
+    """Submit verification code. Returns:
+      {"status": "ok",         "cookies": [...]}
+      {"status": "needs_code", "session_id": "...", "error": "验证码错误..."}
+      {"status": "error",      "error": "..."}                         — fatal
+    """
+    _gc_pending_logins()
+    state = _PENDING_LOGINS.get(session_id)
+    if not state:
+        return {"status": "error", "error": "session_id 无效或已过期"}
+    if time.time() > state["expires_at"]:
+        del _PENDING_LOGINS[session_id]
+        return {"status": "error", "error": "session 已过期"}
+
+    try:
+        session = state["session"]
+        flag = state["flag"]
+        user_id = state["user_id"]
+        callback = state["callback"]
+        auth_data = state["auth_data"]
+
+        verify_data = _verify_code(session, flag, code)
+
+        if verify_data.get("code") == 87001:
+            return {
+                "status": "needs_code", "session_id": session_id,
+                "method": "email" if flag == 8 else "phone",
+                "error": "验证码错误，请重试",
+            }
+        if verify_data.get("code") != 0:
+            del _PENDING_LOGINS[session_id]
+            desc = verify_data.get("desc", verify_data.get("code", "unknown"))
+            return {"status": "error", "error": f"验证码验证失败: {desc}"}
+
+        identity_token = verify_data.get("identityToken", "")
+        verify_sign = verify_data.get("_sign", "")
+        location = verify_data.get("location", "")
+
+        if not location and identity_token:
+            from urllib.parse import quote
+            end_callback = (
+                f"{XIAOMI_AUTH}/end?userId={user_id}&sid={SID}"
+                f"&callback={quote(callback, safe='')}"
+            )
+            result_resp = _identity_result_check(
+                session, end_callback, user_id, SID, identity_token, verify_sign,
+            )
+            location = result_resp.url
+            if not ("sts" in location or "aistudio" in location):
+                if result_resp.history:
+                    for hist_resp in result_resp.history:
+                        loc = hist_resp.headers.get("Location", "")
+                        if "sts" in loc or "aistudio" in loc:
+                            location = loc
+                            break
+
+        if not location:
+            del _PENDING_LOGINS[session_id]
+            return {"status": "error", "error": "验证后未获取跳转 URL"}
+
+        cookies = _finish_login(session, location, auth_data)
+        del _PENDING_LOGINS[session_id]
+        return {"status": "ok", "cookies": cookies}
+
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 # === CLI 命令 ===

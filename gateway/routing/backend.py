@@ -18,6 +18,10 @@ class Backend:
     pipeline (untouched by this refactor) tie a backend back to the Studio
     account that produced it.
 
+    ``models`` lists every native model name this Claw serves (a single MiMo
+    Claw usually exposes ~9 native models). The router matches a request if
+    ``req.model in b.models`` — no notion of "primary".
+
     Health/breaker fields are intentionally simple — no rolling windows,
     no failure-rate math. We trust the chat probe to be the source of
     truth and use consecutive_failures as the only suppression signal.
@@ -29,7 +33,7 @@ class Backend:
 
     backend_id: str
     base_url: str
-    model: str
+    models: list[str] = field(default_factory=list)
     account_id: str = ""
     api_key: str = ""                       # bearer token if upstream needs one
 
@@ -40,6 +44,9 @@ class Backend:
     last_failure_at: float = 0.0
     consecutive_failures: int = 0
     last_error: str = ""
+
+    # Enable/disable (user-controlled, persisted in backends.json)
+    enabled: bool = True
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
@@ -52,6 +59,9 @@ class Backend:
     latency_alpha: float = 0.3               # EWMA smoothing factor
     total_requests: int = 0                  # lifetime success counter
     total_failures: int = 0                  # lifetime failure counter
+
+    def serves(self, model: str) -> bool:
+        return model in self.models
 
     # ───── breaker helpers ─────
 
@@ -96,6 +106,8 @@ class Backend:
             self.health = "degraded"
 
     def is_selectable(self, now: float | None = None) -> bool:
+        if not self.enabled:
+            return False
         if self.is_open(now):
             return False
         if self.health == "dead":

@@ -1,4 +1,4 @@
-"""Gateway core: protocol-agnostic abstractions shared by adapters, routing, middleware."""
+"""Gateway core: protocol-agnostic abstractions shared by adapters, routing."""
 from .context import RequestContext
 from .errors import (
     AdapterError,
@@ -6,11 +6,11 @@ from .errors import (
     BackendUnavailableError,
     BadRequestError,
     GatewayError,
+    ModelNotFoundError,
     RateLimitError,
     UpstreamError,
     UpstreamTimeoutError,
 )
-from .pipeline import Handler, Middleware, Pipeline
 from .types import (
     ContentBlockEnd,
     ContentBlockStart,
@@ -42,11 +42,8 @@ __all__ = [
     "BackendUnavailableError",
     "UpstreamTimeoutError",
     "AdapterError",
-    # pipeline
-    "Pipeline",
-    "Middleware",
-    "Handler",
-    # types — request side
+    "ModelNotFoundError",
+# types — request side
     "InternalRequest",
     "InternalMessage",
     "InternalContent",

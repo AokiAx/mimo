@@ -2,7 +2,10 @@
 """
 MiMo Claw/API Management Dashboard - FastAPI Backend
 """
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -13,14 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
+
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 # Paths
 BASE_DIR = Path(__file__).parent
 CLAW_DIR = BASE_DIR / "claw"
-COOKIE_FILE = CLAW_DIR / "mimo_cookies.json"
 ACCOUNTS_DIR = BASE_DIR / "accounts"
 CURRENT_ACCOUNT_FILE = ACCOUNTS_DIR / "_current.json"
 MIMO_BASE = "https://aistudio.xiaomimimo.com"
@@ -28,10 +32,12 @@ MIMO_BASE = "https://aistudio.xiaomimimo.com"
 app = FastAPI(title="MiMo Manager")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-# ── Access Password ──
-PANEL_PASSWORD = "Aoki-MiMo"
+# ── Credentials (from data/secrets.json, no hardcoded values) ──
+from gateway.secrets_store import secrets as _secrets
+
 AUTH_COOKIE = "mimo_panel_auth"
-AUTH_TOKEN = "aoki_mimo_2026"
+AUTH_TOKEN = _secrets.public_api_token
+PANEL_PASSWORD = _secrets.panel_password
 
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -88,6 +94,12 @@ async def auth_middleware(request: Request, call_next):
     # Gateway API routes handle their own auth (Bearer token)
     if path.startswith("/v1/") or path in ("/health", "/gateway/status"):
         return await call_next(request)
+    # Probe agent uses its own X-Probe-Token header
+    if path == "/api/probe/report":
+        return await call_next(request)
+    # Probe install assets (agent.py + install.sh) are public — token is in URL
+    if path.startswith("/probe/"):
+        return await call_next(request)
     # Publicly readable endpoints (no auth — safe to expose)
     if path in ("/stats", "/api/public/stats"):
         return await call_next(request)
@@ -97,23 +109,35 @@ async def auth_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
-    """Run account migration on startup and start auto-deploy scheduler."""
-    _migrate_legacy_accounts()
-    try:
-        from claw.auto_deploy import start_scheduler
-        start_scheduler()
-    except Exception as e:
-        print(f"[startup] Failed to start scheduler: {e}")
+    """Start auto-deploy scheduler and gateway probe."""
+    # Set DISABLE_SCHEDULER=1 in the systemd unit to keep the scheduler off
+    # (e.g. when first deploying to a new host — operators usually want to
+    # verify accounts / cookies before letting cron fire real Claw deploys).
+    if os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
+        print("[startup] DISABLE_SCHEDULER set — auto-deploy scheduler not started", flush=True)
+    else:
+        try:
+            from claw.auto_deploy import start_scheduler
+            start_scheduler()
+        except Exception as e:
+            print(f"[startup] Failed to start scheduler: {e}")
     try:
         from gateway.runtime import start_probe as start_router_probe
         start_router_probe()
     except Exception as e:
         print(f"[startup] Failed to start gateway probe: {e}")
-    try:
-        from gateway.vps_probe import start_probe
-        start_probe()
-    except Exception as e:
-        print(f"[startup] Failed to start VPS probe: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close shared resources on shutdown."""
+    global _http_client, _sync_http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+    if _sync_http_client is not None:
+        _sync_http_client.close()
+        _sync_http_client = None
 
 # ──────────── Account management helpers ────────────
 
@@ -142,6 +166,8 @@ def _set_current_account(filename):
     _ensure_accounts_dir()
     with open(CURRENT_ACCOUNT_FILE, "w") as f:
         json.dump({"current": filename}, f)
+    # is_current flag on every summary may flip; cheapest correct move is to drop all.
+    _invalidate_summary()
 
 def _load_account_by_filename(filename):
     """Load an account dict by its filename (without .json)."""
@@ -160,6 +186,7 @@ def _save_account(filename, account_data):
     path = ACCOUNTS_DIR / "{}.json".format(filename)
     with open(path, "w") as f:
         json.dump(account_data, f, indent=2, ensure_ascii=False)
+    _invalidate_summary(filename)
 
 def _list_account_files():
     """Return list of account filenames (without .json) in accounts dir."""
@@ -171,95 +198,13 @@ def _list_account_files():
         result.append(p.stem)
     return result
 
-def _fetch_user_info(cookies_list):
+async def _afetch_user_info(cookies_list):
     """Fetch user info from MiMo API given a cookies list. Returns (user_id, user_name) or (None, None)."""
-    parts = []
-    for c in cookies_list:
-        val = c.get("value", "")
-        if val.startswith('"') and val.endswith('"'):
-            val = val[1:-1]
-        parts.append("{0}={1}".format(c.get("name", ""), val))
-    cookie_header = "; ".join(parts)
-
-    ph = None
-    for c in cookies_list:
-        if c["name"] == "xiaomichatbot_ph":
-            ph = c["value"]
-            if ph.startswith('"') and ph.endswith('"'):
-                ph = ph[1:-1]
-            break
-
-    url = "{0}/open-apis/user/mi/get".format(MIMO_BASE)
-    if ph:
-        url = "{0}?xiaomichatbot_ph={1}".format(url, quote(ph, safe=""))
-
-    cmd = ["curl", "-s", "-w", "\nHTTP_%{http_code}", "-X", "GET", url,
-           "-H", "cookie: {0}".format(cookie_header),
-           "-H", "content-type: application/json"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        lines = r.stdout.strip().split("\n")
-        resp_text = "\n".join(lines[:-1])
-        resp = json.loads(resp_text)
-        if isinstance(resp, dict) and resp.get("code") == 0:
-            data = resp.get("data", {})
-            return data.get("userId"), data.get("userName")
-    except Exception:
-        pass
+    code, data = await acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies_list)
+    if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+        info = data.get("data", {}) or {}
+        return info.get("userId"), info.get("userName")
     return None, None
-
-def _migrate_legacy_accounts():
-    """On startup: convert legacy raw-cookie files in accounts/ to account format.
-    Also import from claw/mimo_cookies.json if accounts/ is empty."""
-    _ensure_accounts_dir()
-    account_files = _list_account_files()
-
-    # Check each existing file - if it's a raw cookie list, convert it
-    for fname in list(account_files):
-        path = ACCOUNTS_DIR / "{}.json".format(fname)
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        # If it's a list (raw cookies), convert to account format
-        if isinstance(data, list):
-            user_id, user_name = _fetch_user_info(data)
-            account = {
-                "name": fname,
-                "email": "",
-                "cookies": data,
-                "user_id": user_id or "",
-                "user_name": user_name or "",
-                "added_at": datetime.now(timezone.utc).isoformat(),
-            }
-            _save_account(fname, account)
-
-    # If no accounts at all, import from claw/mimo_cookies.json
-    account_files = _list_account_files()
-    if not account_files and COOKIE_FILE.exists():
-        try:
-            with open(COOKIE_FILE) as f:
-                cookies = json.load(f)
-            if isinstance(cookies, list) and cookies:
-                user_id, user_name = _fetch_user_info(cookies)
-                account = {
-                    "name": "default",
-                    "email": "",
-                    "cookies": cookies,
-                    "user_id": user_id or "",
-                    "user_name": user_name or "",
-                    "added_at": datetime.now(timezone.utc).isoformat(),
-                }
-                _save_account("default", account)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # Set current if not set yet
-    if not _get_current_account_name():
-        acc_files = _list_account_files()
-        if acc_files:
-            _set_current_account(acc_files[0])
 
 def _get_current_account():
     """Get the current account dict, or None if no current account."""
@@ -271,19 +216,14 @@ def _get_current_account():
 # ──────────── Cookie helpers ────────────
 
 def load_cookies():
-    """Load cookies from current account, falling back to COOKIE_FILE."""
+    """Load cookies from current account."""
     account = _get_current_account()
     if account and isinstance(account, dict) and account.get("cookies"):
         return account["cookies"]
-    # Fallback to legacy file
-    if COOKIE_FILE.exists():
-        with open(COOKIE_FILE) as f:
-            return json.load(f)
     return []
 
-def get_cookie_parts():
+def _cookie_parts_from(cookies):
     """Return (cookie_header_str, ph_value) for xiaomimimo domain cookies."""
-    cookies = load_cookies()
     parts = []
     ph = None
     for c in cookies:
@@ -295,7 +235,6 @@ def get_cookie_parts():
             if c["name"] == "xiaomichatbot_ph":
                 ph = val
     if not ph:
-        # Try all cookies if none in xiaomimimo domain
         for c in cookies:
             if c["name"] == "xiaomichatbot_ph":
                 ph = c["value"]
@@ -304,16 +243,8 @@ def get_cookie_parts():
                 break
     return "; ".join(parts), ph
 
-def get_ph_encoded():
-    """Get URL-encoded ph value."""
-    _, ph = get_cookie_parts()
-    if not ph:
-        return None
-    return quote(ph, safe="")
-
-def get_cookie_header_all():
+def _cookie_header_all_from(cookies):
     """Build cookie header from ALL cookies (for curl calls)."""
-    cookies = load_cookies()
     parts = []
     for c in cookies:
         val = c["value"]
@@ -322,36 +253,127 @@ def get_cookie_header_all():
         parts.append("{0}={1}".format(c["name"], val))
     return "; ".join(parts)
 
+def get_cookie_parts():
+    return _cookie_parts_from(load_cookies())
+
+def get_ph_encoded():
+    _, ph = get_cookie_parts()
+    if not ph:
+        return None
+    return quote(ph, safe="")
+
+def get_cookie_header_all():
+    return _cookie_header_all_from(load_cookies())
+
 # ──────────── API proxy helpers ────────────
 
-def curl_api(method, path, body=None, with_ph=True):
-    """Make API call via curl subprocess."""
-    cookie_header = get_cookie_header_all()
-    ph_enc = get_ph_encoded()
+_http_client: httpx.AsyncClient | None = None
+
+# Per-account summary cache: filename → (timestamp, payload).
+# TTL slightly < the panel's 30 s refresh so a manual reload always picks up changes.
+_summary_cache: dict[str, tuple[float, dict]] = {}
+_SUMMARY_TTL = 20.0
+
+
+def _invalidate_summary(filename: str | None = None) -> None:
+    """Drop one or all entries from the summary cache."""
+    if filename is None:
+        _summary_cache.clear()
+    else:
+        _summary_cache.pop(filename, None)
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            trust_env=False,
+            follow_redirects=False,
+        )
+    return _http_client
+
+
+_sync_http_client: httpx.Client | None = None
+
+
+def _get_sync_http_client() -> httpx.Client:
+    """Sync httpx client for callers running outside the FastAPI event loop
+    (e.g. claw.auto_deploy scheduler thread)."""
+    global _sync_http_client
+    if _sync_http_client is None:
+        _sync_http_client = httpx.Client(
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            trust_env=False,
+            follow_redirects=False,
+        )
+    return _sync_http_client
+
+
+def _build_mimo_request(method, path, body, with_ph, cookies):
+    """Shared URL/header/content builder for both sync and async API paths."""
+    if cookies is None:
+        cookies = load_cookies()
+    cookie_header = _cookie_header_all_from(cookies)
+    _, ph = _cookie_parts_from(cookies)
+    ph_enc = quote(ph, safe="") if ph else None
 
     url = "{0}{1}".format(MIMO_BASE, path)
     if with_ph and ph_enc:
         sep = "&" if "?" in path else "?"
         url = "{0}{1}xiaomichatbot_ph={2}".format(url, sep, ph_enc)
 
-    cmd = ["curl", "-s", "-w", "\nHTTP_%{http_code}", "-X", method, url,
-           "-H", "cookie: {0}".format(cookie_header),
-           "-H", "content-type: application/json"]
-    if body is not None:
-        cmd += ["-d", json.dumps(body, ensure_ascii=False)]
+    headers = {
+        "cookie": cookie_header,
+        "content-type": "application/json",
+    }
+    content = (
+        json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if body is not None
+        else None
+    )
+    return method, url, headers, content
 
+
+def _parse_mimo_response(resp):
+    code_line = "HTTP_{0}".format(resp.status_code)
+    text = resp.text
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        lines = r.stdout.strip().split("\n")
-        code_line = lines[-1] if lines[-1].startswith("HTTP_") else "?"
-        resp_text = "\n".join(lines[:-1])
-        try:
-            resp_json = json.loads(resp_text)
-        except (json.JSONDecodeError, ValueError):
-            resp_json = resp_text
-        return code_line, resp_json
+        resp_json = json.loads(text) if text else ""
+    except (json.JSONDecodeError, ValueError):
+        resp_json = text
+    return code_line, resp_json
+
+
+def curl_api(method, path, body=None, with_ph=True, cookies=None):
+    """Sync MiMo API call. Used by background threads (claw.auto_deploy) that
+    are not running on the FastAPI event loop. Async handlers should use acurl()."""
+    method, url, headers, content = _build_mimo_request(method, path, body, with_ph, cookies)
+    try:
+        resp = _get_sync_http_client().request(method, url, headers=headers, content=content)
+        return _parse_mimo_response(resp)
+    except httpx.TimeoutException as e:
+        return "ERROR", "Timeout: {}".format(e)
+    except httpx.HTTPError as e:
+        return "ERROR", "{}: {}".format(type(e).__name__, e)
     except Exception as e:
-        return "ERROR", str(e)
+        return "ERROR", "{}: {}".format(type(e).__name__, e)
+
+
+async def acurl(method, path, body=None, with_ph=True, cookies=None):
+    """Call MiMo API via shared httpx.AsyncClient. Pass cookies=[...] for a specific account."""
+    method, url, headers, content = _build_mimo_request(method, path, body, with_ph, cookies)
+    try:
+        resp = await _get_http_client().request(method, url, headers=headers, content=content)
+        return _parse_mimo_response(resp)
+    except httpx.TimeoutException as e:
+        return "ERROR", "Timeout: {}".format(e)
+    except httpx.HTTPError as e:
+        return "ERROR", "{}: {}".format(type(e).__name__, e)
+    except Exception as e:
+        return "ERROR", "{}: {}".format(type(e).__name__, e)
 
 # ──────────── HTML page ────────────
 
@@ -378,7 +400,7 @@ async def api_status():
 
     # Claw status
     try:
-        code, data = curl_api("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
+        code, data = await acurl("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
         if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
             info = data.get("data", {})
             result["claw"] = {
@@ -398,13 +420,13 @@ async def api_status():
 
 @app.post("/api/claw/create")
 async def claw_create():
-    code, data = curl_api("POST", "/open-apis/user/mimo-claw/create", body={})
+    code, data = await acurl("POST", "/open-apis/user/mimo-claw/create", body={})
     success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
     return {"success": success, "code": code, "data": data}
 
 @app.get("/api/claw/status")
 async def claw_status():
-    code, data = curl_api("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
+    code, data = await acurl("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
     if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
         info = data.get("data", {})
         expire_ms = info.get("expireTime", 0)
@@ -426,7 +448,7 @@ async def claw_status():
 
 @app.post("/api/claw/destroy")
 async def claw_destroy():
-    code, data = curl_api("POST", "/open-apis/user/mimo-claw/destroy", body={})
+    code, data = await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={})
     success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
     return {"success": success, "code": code, "data": data}
 
@@ -437,40 +459,132 @@ async def claw_chat(request: Request):
     session_key = body.get("session_key", "agent:main:deploy-" + uuid.uuid4().hex[:8])
     if not message:
         return JSONResponse({"error": "No message"}, status_code=400)
+    text, err = await claw_ws_chat(message, session_key)
+    if err:
+        return {"success": False, "error": err}
+    return {"success": True, "reply": text}
 
-    # Use curl-based approach for WS chat (shell out to a helper)
-    cookie_header = get_cookie_header_all()
-    ph_enc = get_ph_encoded()
+
+async def upload_to_claw_fds(
+    filename: str,
+    content: bytes,
+    cookies: list | None = None,
+    file_type: str = "txt",
+) -> tuple[dict | None, str | None]:
+    """Upload ``content`` to MiMo's Galaxy FDS so Claw can fetch it.
+
+    Two-step exchange matching what the Studio web UI does:
+
+      1. ``POST /open-apis/resource/genUploadInfo`` with ``{fileName, fileContentMd5}``
+         → returns ``{resourceId, uploadUrl, resourceUrl, objectName}``. The
+         ``uploadUrl`` is a short-lived pre-signed PUT; ``resourceUrl`` is the
+         long-lived (>1y) GET URL we hand to Claw.
+      2. ``PUT <uploadUrl>`` with ``Content-Type: application/octet-stream`` AND
+         ``Content-MD5: <hex>``. Both headers must be present and match the MD5
+         passed in step 1 — Galaxy FDS binds the pre-signed signature to them.
+
+    Returns ``(attachment_dict, None)`` on success, where ``attachment_dict`` is
+    ready to plug into ``claw_ws_chat(attachments=[…])``. On failure returns
+    ``(None, error_message)``.
+    """
+    md5_hex = hashlib.md5(content).hexdigest()
+    code, data = await acurl(
+        "POST", "/open-apis/resource/genUploadInfo",
+        body={"fileName": filename, "fileContentMd5": md5_hex},
+        cookies=cookies,
+    )
+    if not (code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0):
+        return None, f"genUploadInfo failed: {code} {data}"
+    info = data.get("data") or {}
+    upload_url = info.get("uploadUrl")
+    resource_url = info.get("resourceUrl")
+    if not upload_url or not resource_url:
+        return None, f"genUploadInfo missing urls: {info}"
+
+    try:
+        resp = await _get_http_client().put(
+            upload_url,
+            content=content,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-MD5": md5_hex,
+            },
+        )
+    except httpx.HTTPError as e:
+        return None, f"FDS PUT failed: {type(e).__name__}: {e}"
+    if resp.status_code != 200:
+        return None, f"FDS PUT status {resp.status_code}: {resp.text[:200]}"
+
+    return {
+        "name": filename,
+        "size": len(content),
+        "url": resource_url,
+        "type": file_type,
+    }, None
+
+
+async def claw_ws_chat(
+    message: str,
+    session_key: str | None = None,
+    cookies: list | None = None,
+    attachments: list[dict] | None = None,
+) -> tuple[str, str | None]:
+    """Send a message to Claw over the WS gateway and return ``(reply, error)``.
+
+    When ``cookies`` is None, falls back to the current account's cookies (same
+    behaviour as the HTTP handler). When non-None, scopes the call to that
+    account — used by the auto-deploy thread to talk to a specific Claw without
+    needing an HTTP loopback.
+
+    ``attachments`` is the result of :func:`upload_to_claw_fds` calls — a list of
+    ``{name, size, url, type}`` dicts. They are inlined into the message body
+    using MiMo Studio's ``<mimo-files>`` envelope (the same one the official
+    web UI produces), which signals to Claw that the URLs are trusted user
+    uploads and should be downloaded via ``curl``.
+    """
+    if not session_key:
+        session_key = "agent:main:deploy-" + uuid.uuid4().hex[:8]
+
+    if attachments:
+        envelope = {
+            "files": attachments,
+            "prompt": "以上为用户上传的文件列表，请先下载上述文件后再回答 用户的问题。",
+        }
+        message = (
+            "<mimo-files>\n"
+            + json.dumps(envelope, ensure_ascii=False)
+            + "\n</mimo-files>\n"
+            + message
+        )
 
     # Ensure claw available
-    curl_api("POST", "/open-apis/user/mimo-claw/create", body={})
+    await acurl("POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies)
 
     # Get ticket
-    code, data = curl_api("GET", "/open-apis/user/ws/ticket")
+    code, data = await acurl("GET", "/open-apis/user/ws/ticket", cookies=cookies)
     ticket = None
     if isinstance(data, dict) and data.get("code") == 0:
         ticket = data.get("data", {}).get("ticket")
 
     # Get userId
-    code2, data2 = curl_api("GET", "/open-apis/user/mi/get", with_ph=False)
+    code2, data2 = await acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies)
     user_id = None
     if isinstance(data2, dict) and data2.get("code") == 0:
         user_id = data2.get("data", {}).get("userId")
 
     if not ticket or not user_id:
-        return JSONResponse({"error": "Failed to get WS ticket/userId"}, status_code=500)
+        return "", "Failed to get WS ticket/userId"
 
     ws_url = "wss://aistudio.xiaomimimo.com/ws/proxy?ticket={0}&userId={1}".format(ticket, user_id)
 
-    # Run async WS chat
     try:
         import websockets
     except ImportError:
-        return JSONResponse({"error": "websockets not installed"}, status_code=500)
+        return "", "websockets not installed"
 
-    async def ws_chat():
-        full_text = ""
-        debug_log = []
+    full_text = ""
+    debug_log: list[str] = []
+    try:
         async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
             init_msg = await asyncio.wait_for(ws.recv(), timeout=10)
             debug_log.append(f"init: {init_msg[:200]}")
@@ -493,18 +607,17 @@ async def claw_chat(request: Request):
                 debug_log.append(f"pre-connect: type={d.get('type')} id={d.get('id','')[:8]} ok={d.get('ok')}")
                 if d.get("id") == req_id:
                     if not d.get("ok"):
-                        return "", "Connect failed: {0} | debug: {1}".format(d, debug_log)
+                        return "", "Connect failed: {0}".format(d)
                     break
 
-            session_key_passed = session_key
             msg_id = str(uuid.uuid4())
             await ws.send(json.dumps({
                 "type": "req", "id": msg_id, "method": "chat.send",
                 "params": {
-                    "sessionKey": session_key_passed,
+                    "sessionKey": session_key,
                     "message": message,
                     "deliver": False,
-                    "idempotencyKey": msg_id
+                    "idempotencyKey": msg_id,
                 }
             }))
             debug_log.append(f"sent chat.send msg_id={msg_id[:8]}")
@@ -517,26 +630,23 @@ async def claw_chat(request: Request):
                     devent = data.get("event", "")
                     dpayload = data.get("payload", {})
                     did = data.get("id", "")
-                    if i < 50:  # Log first 50 messages for debug
-                        debug_log.append(f"[{i}] type={dtype} event={devent} id={did[:8]} ok={data.get('ok')} payload_keys={list(dpayload.keys()) if isinstance(dpayload, dict) else 'N/A'}")
+                    if i < 50:
+                        debug_log.append(f"[{i}] type={dtype} event={devent} id={did[:8]} ok={data.get('ok')}")
 
-                    if data.get("type") == "res":
-                        if data.get("id") == msg_id and not data.get("ok"):
-                            return "", "chat.send error: {0} | debug: {1}".format(data, debug_log)
+                    if dtype == "res":
+                        if did == msg_id and not data.get("ok"):
+                            return "", "chat.send error: {0}".format(data)
                         continue
-                    if data.get("type") != "event":
-                        debug_log.append(f"[{i}] non-event type={dtype}, continuing")
+                    if dtype != "event":
                         continue
-                    event = data.get("event", "")
-                    payload = data.get("payload", {})
-                    if event == "health":
+                    if devent == "health":
                         continue
-                    if event == "agent" and payload.get("stream") == "assistant":
-                        delta = payload.get("data", {}).get("delta", "")
+                    if devent == "agent" and dpayload.get("stream") == "assistant":
+                        delta = dpayload.get("data", {}).get("delta", "")
                         if delta:
                             full_text += delta
-                    if event == "chat" and payload.get("state") == "final":
-                        msg_content = payload.get("message", {})
+                    if devent == "chat" and dpayload.get("state") == "final":
+                        msg_content = dpayload.get("message", {})
                         if msg_content.get("content"):
                             for block in msg_content["content"]:
                                 if block.get("type") == "text":
@@ -544,46 +654,37 @@ async def claw_chat(request: Request):
                                     if final_text and len(final_text) >= len(full_text):
                                         full_text = final_text
                         break
-                    # Catch agent.tool-use events (Claw executing commands)
-                    if event == "agent" and payload.get("stream") == "tool-result":
-                        tool_data = payload.get("data", {})
-                        debug_log.append(f"tool-result: {json.dumps(tool_data, ensure_ascii=False)[:300]}")
                 except asyncio.TimeoutError:
                     debug_log.append(f"timeout at iteration {i}")
                     break
                 except Exception as ws_err:
-                    debug_log.append(f"ws_error at iteration {i}: {type(ws_err).__name__}: {ws_err}")
+                    debug_log.append(f"ws_error: {type(ws_err).__name__}: {ws_err}")
                     break
+    except Exception as e:
+        return "", "WS connect failed: {}: {}".format(type(e).__name__, e)
 
-            # Write debug to file for inspection
-            with open("/tmp/ws_debug.log", "a") as _df:
-                _df.write(f"\n=== chat.send {msg_id[:8]} at {time.strftime('%H:%M:%S')} ===\n")
-                for entry in debug_log:
-                    _df.write(f"  {entry}\n")
-                _df.write(f"  full_text={repr(full_text[:200])}\n")
-                _df.flush()
-
-            return full_text, None
-
-    text, err = await ws_chat()
-    if err:
-        return {"success": False, "error": err}
-    return {"success": True, "reply": text}
+    if not full_text:
+        return "", "No reply (debug tail: {})".format(" | ".join(debug_log[-3:]))
+    return full_text, None
 
 # ──────────── Cookie management ────────────
 
 @app.post("/api/cookie/refresh")
 async def cookie_refresh():
-    auth_script = CLAW_DIR / "mimo_auth.py"
-    if not auth_script.exists():
-        return {"success": False, "error": "mimo_auth.py not found"}
-    try:
-        r = subprocess.run(["python3", str(auth_script), "login"],
-                           capture_output=True, text=True, timeout=120,
-                           cwd=str(CLAW_DIR))
-        return {"success": r.returncode == 0, "stdout": r.stdout[-1000:], "stderr": r.stderr[-500:]}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    """Try to re-fetch user info for the current account using its existing cookies.
+    For full re-login, use the per-account /api/account/{filename}/login endpoint."""
+    name = _get_current_account_name()
+    acc = _get_current_account()
+    if not name or not acc:
+        return {"success": False, "error": "无当前账号"}
+    cookies = acc.get("cookies", [])
+    user_id, user_name = await _afetch_user_info(cookies)
+    if user_id:
+        acc["user_id"] = user_id
+        acc["user_name"] = user_name or acc.get("user_name", "")
+        _save_account(name, acc)
+        return {"success": True, "user_id": user_id, "user_name": user_name or ""}
+    return {"success": False, "error": "Cookie 失效，请重新登录"}
 
 @app.get("/api/cookie/status")
 async def cookie_status():
@@ -598,7 +699,7 @@ async def cookie_status():
                 ph = ph[1:-1]
             break
     # Test if cookies work by hitting a simple endpoint
-    code, data = curl_api("GET", "/open-apis/user/mi/get", with_ph=False)
+    code, data = await acurl("GET", "/open-apis/user/mi/get", with_ph=False)
     valid = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
     return {
         "valid": valid,
@@ -607,6 +708,294 @@ async def cookie_status():
         "test_code": code,
         "user_id": data.get("data", {}).get("userId", "") if isinstance(data, dict) else "",
     }
+
+# ──────────── Per-account endpoints (claw + cookie + SSO login) ────────────
+
+async def _persist_login_cookies(filename, email, cookies):
+    """Save cookies returned by web_start_login/web_submit_code into accounts/{filename}.json."""
+    user_id, user_name = await _afetch_user_info(cookies)
+    existing = _load_account_by_filename(filename) or {}
+    account = {
+        "name": existing.get("name") or filename,
+        "email": email or existing.get("email", ""),
+        "cookies": cookies,
+        "user_id": user_id or existing.get("user_id", ""),
+        "user_name": user_name or existing.get("user_name", ""),
+        "added_at": existing.get("added_at") or datetime.now(timezone.utc).isoformat(),
+    }
+    _save_account(filename, account)
+    if not _get_current_account_name():
+        _set_current_account(filename)
+    return account
+
+@app.post("/api/account/{filename}/login")
+async def account_login(filename: str, request: Request):
+    """Start SSO login for an account. Body: {email, password}.
+    Returns {status: ok|needs_code|error, ...}."""
+    from claw.mimo_auth import web_start_login
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or not password:
+        return JSONResponse({"status": "error", "error": "缺少 email 或 password"}, status_code=400)
+    result = await asyncio.to_thread(web_start_login, email, password)
+    if result.get("status") == "ok":
+        acc = await _persist_login_cookies(filename, email, result["cookies"])
+        result["filename"] = filename
+        result["user_id"] = acc.get("user_id", "")
+        result["user_name"] = acc.get("user_name", "")
+    return result
+
+@app.post("/api/account/{filename}/login/verify")
+async def account_login_verify(filename: str, request: Request):
+    """Submit 2FA verification code. Body: {session_id, code, email?}."""
+    from claw.mimo_auth import web_submit_code
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    code = body.get("code", "")
+    email = (body.get("email") or "").strip()
+    if not session_id or not code:
+        return JSONResponse({"status": "error", "error": "缺少 session_id 或 code"}, status_code=400)
+    result = await asyncio.to_thread(web_submit_code, session_id, code)
+    if result.get("status") == "ok":
+        acc = await _persist_login_cookies(filename, email, result["cookies"])
+        result["filename"] = filename
+        result["user_id"] = acc.get("user_id", "")
+        result["user_name"] = acc.get("user_name", "")
+    return result
+
+@app.get("/api/account/{filename}/cookie/status")
+async def account_cookie_status(filename: str):
+    """Per-account cookie status — does NOT depend on current account."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"valid": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    if not cookies:
+        return {"valid": False, "count": 0, "has_ph": False, "reason": "无 Cookie"}
+    ph = None
+    for c in cookies:
+        if c["name"] == "xiaomichatbot_ph":
+            ph = c["value"]
+            break
+    code, data = await acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies)
+    valid = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    user_id = data.get("data", {}).get("userId", "") if isinstance(data, dict) else ""
+    user_name = data.get("data", {}).get("userName", "") if isinstance(data, dict) else ""
+    return {
+        "valid": valid, "count": len(cookies), "has_ph": ph is not None,
+        "test_code": code, "user_id": user_id, "user_name": user_name,
+    }
+
+@app.get("/api/account/{filename}/claw/status")
+async def account_claw_status(filename: str):
+    """Per-account claw status."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    code, data = await acurl("GET", "/open-apis/user/mimo-claw/status",
+                             with_ph=False, cookies=cookies)
+    if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+        info = data.get("data", {})
+        expire_ms = info.get("expireTime", 0)
+        expire_str = ""
+        if expire_ms:
+            try:
+                expire_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_ms / 1000))
+            except Exception:
+                expire_str = str(expire_ms)
+        return {"success": True, "data": {
+            "status": info.get("status", ""),
+            "message": info.get("message", ""),
+            "expireTime": expire_ms,
+            "expireStr": expire_str,
+        }}
+    return {"success": False, "code": code, "data": data}
+
+@app.post("/api/account/{filename}/claw/create")
+async def account_claw_create(filename: str):
+    """Create claw for a specific account."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    code, data = await acurl("POST", "/open-apis/user/mimo-claw/create",
+                             body={}, cookies=cookies)
+    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    _invalidate_summary(filename)
+    return {"success": success, "code": code, "data": data}
+
+@app.post("/api/account/{filename}/claw/destroy")
+async def account_claw_destroy(filename: str):
+    """Destroy claw for a specific account."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    code, data = await acurl("POST", "/open-apis/user/mimo-claw/destroy",
+                             body={}, cookies=cookies)
+    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    _invalidate_summary(filename)
+    return {"success": success, "code": code, "data": data}
+
+@app.post("/api/account/{filename}/claw/refresh")
+async def account_claw_refresh(filename: str):
+    """Destroy + recreate claw for an account."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
+    await asyncio.sleep(1.0)
+    code, data = await acurl("POST", "/open-apis/user/mimo-claw/create",
+                             body={}, cookies=cookies)
+    success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
+    _invalidate_summary(filename)
+    return {"success": success, "code": code, "data": data}
+
+@app.get("/api/account/{filename}/summary")
+async def account_summary(filename: str):
+    """Combined snapshot: cookie status + claw status + user info, for one account."""
+    cached = _summary_cache.get(filename)
+    if cached and time.time() - cached[0] < _SUMMARY_TTL:
+        return cached[1]
+
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+
+    # Fire both upstream calls concurrently on the shared httpx client.
+    user_task = acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies)
+    claw_task = acurl("GET", "/open-apis/user/mimo-claw/status", with_ph=False, cookies=cookies)
+    (code_u, data_u), (code_c, data_c) = await asyncio.gather(user_task, claw_task)
+
+    cookie_valid = code_u == "HTTP_200" and isinstance(data_u, dict) and data_u.get("code") == 0
+    user_id = data_u.get("data", {}).get("userId", "") if isinstance(data_u, dict) else ""
+    user_name = data_u.get("data", {}).get("userName", "") if isinstance(data_u, dict) else ""
+
+    claw_status = "unknown"
+    claw_expire_str = ""
+    if code_c == "HTTP_200" and isinstance(data_c, dict) and data_c.get("code") == 0:
+        info = data_c.get("data", {}) or {}
+        claw_status = info.get("status", "unknown")
+        expire_ms = info.get("expireTime", 0)
+        if expire_ms:
+            try:
+                claw_expire_str = time.strftime("%Y-%m-%d %H:%M:%S",
+                                                time.localtime(expire_ms / 1000))
+            except Exception:
+                pass
+
+    result = {
+        "success": True,
+        "filename": filename,
+        "name": acc.get("name", filename),
+        "email": acc.get("email", ""),
+        "user_id": user_id or acc.get("user_id", ""),
+        "user_name": user_name or acc.get("user_name", ""),
+        "cookie_valid": cookie_valid,
+        "cookie_count": len(cookies),
+        "claw_status": claw_status,
+        "claw_expire": claw_expire_str,
+        "is_current": filename == _get_current_account_name(),
+    }
+    # Only cache fresh, non-error snapshots — a transient upstream failure shouldn't get pinned.
+    if cookie_valid or claw_status != "unknown":
+        _summary_cache[filename] = (time.time(), result)
+    return result
+
+@app.post("/api/account/{filename}/chat")
+async def account_chat(filename: str, request: Request):
+    """Per-account claw chat (WebSocket-based, like /api/claw/chat but explicit)."""
+    acc = _load_account_by_filename(filename)
+    if not acc:
+        return JSONResponse({"success": False, "error": "账号不存在"}, status_code=404)
+    cookies = acc.get("cookies", [])
+    body = await request.json()
+    message = body.get("message", "")
+    session_key = body.get("session_key", "agent:main:deploy-" + uuid.uuid4().hex[:8])
+    if not message:
+        return JSONResponse({"error": "No message"}, status_code=400)
+
+    # Ensure claw exists
+    await acurl("POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies)
+
+    # Get ticket + userId using the account's cookies (run concurrently)
+    ticket_task = acurl("GET", "/open-apis/user/ws/ticket", cookies=cookies)
+    uid_task = acurl("GET", "/open-apis/user/mi/get", with_ph=False, cookies=cookies)
+    (_, data), (_, data2) = await asyncio.gather(ticket_task, uid_task)
+    ticket = data.get("data", {}).get("ticket") if isinstance(data, dict) and data.get("code") == 0 else None
+    user_id = data2.get("data", {}).get("userId") if isinstance(data2, dict) and data2.get("code") == 0 else None
+    if not ticket or not user_id:
+        return JSONResponse({"error": "Failed to get WS ticket/userId"}, status_code=500)
+
+    ws_url = "wss://aistudio.xiaomimimo.com/ws/proxy?ticket={0}&userId={1}".format(ticket, user_id)
+
+    try:
+        import websockets
+    except ImportError:
+        return JSONResponse({"error": "websockets not installed"}, status_code=500)
+
+    full_text = ""
+    try:
+        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=10)
+            req_id = str(uuid.uuid4())
+            await ws.send(json.dumps({
+                "type": "req", "id": req_id, "method": "connect",
+                "params": {
+                    "minProtocol": 3, "maxProtocol": 3,
+                    "client": {"id": "cli", "version": "mimo-manager", "platform": "Linux", "mode": "cli"},
+                    "role": "operator",
+                    "scopes": ["operator.admin", "operator.read", "operator.write"],
+                    "caps": ["tool-events"], "userAgent": "Mozilla/5.0", "locale": "zh-CN"
+                }
+            }))
+            while True:
+                msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                d = json.loads(msg)
+                if d.get("id") == req_id:
+                    if not d.get("ok"):
+                        return {"success": False, "error": "Connect failed"}
+                    break
+
+            msg_id = str(uuid.uuid4())
+            await ws.send(json.dumps({
+                "type": "req", "id": msg_id, "method": "chat.send",
+                "params": {"sessionKey": session_key, "message": message,
+                           "deliver": False, "idempotencyKey": msg_id}
+            }))
+            for _ in range(500):
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=300)
+                    data = json.loads(raw)
+                    if data.get("type") == "res" and data.get("id") == msg_id and not data.get("ok"):
+                        return {"success": False, "error": "chat.send error"}
+                    if data.get("type") != "event":
+                        continue
+                    event = data.get("event", "")
+                    payload = data.get("payload", {})
+                    if event == "agent" and payload.get("stream") == "assistant":
+                        delta = payload.get("data", {}).get("delta", "")
+                        if delta:
+                            full_text += delta
+                    if event == "chat" and payload.get("state") == "final":
+                        msg_content = payload.get("message", {})
+                        if msg_content.get("content"):
+                            for block in msg_content["content"]:
+                                if block.get("type") == "text":
+                                    final_text = block.get("text", "")
+                                    if final_text and len(final_text) >= len(full_text):
+                                        full_text = final_text
+                        break
+                except asyncio.TimeoutError:
+                    break
+    except Exception as e:
+        return {"success": False, "error": "{}: {}".format(type(e).__name__, e)}
+
+    return {"success": True, "reply": full_text}
 
 # ──────────── Account management endpoints ────────────
 
@@ -663,7 +1052,7 @@ async def accounts_add(request: Request):
     if (ACCOUNTS_DIR / "{}.json".format(fname)).exists():
         return JSONResponse({"success": False, "error": "Account '{0}' already exists".format(name)}, status_code=409)
 
-    user_id, user_name = _fetch_user_info(cookies)
+    user_id, user_name = await _afetch_user_info(cookies)
     account = {
         "name": name,
         "email": body.get("email", ""),
@@ -751,7 +1140,7 @@ async def sync_cookies(request: Request):
         return {"success": False, "error": "缺少 xiaomichatbot_ph cookie，请确认已登录 MiMo"}
     
     # Get user info
-    user_id, user_name = _fetch_user_info(cookies)
+    user_id, user_name = await _afetch_user_info(cookies)
     
     # Save as account
     name = body.get("name", "default")
@@ -966,11 +1355,66 @@ async def gateway_backend_toggle(backend_id: str):
 
 @app.post("/api/gateway/backends/reload")
 async def gateway_backends_reload():
-    """Re-read auto_deploy.json and rebuild the backend registry."""
+    """Re-read backends.json and rebuild the backend registry."""
     try:
         from gateway.runtime import reload_backends
         count = reload_backends()
         return {"success": True, "backends": count}
+    except ImportError:
+        return {"success": False, "error": "Gateway module not installed"}
+
+
+@app.post("/api/gateway/backends/add")
+async def gateway_backend_add(request: Request):
+    """Add a new backend server."""
+    body = await request.json()
+    try:
+        from gateway.backend_store import add_backend
+        from gateway.runtime import reload_backends
+        entry = add_backend(
+            name=body.get("name", ""),
+            base_url=body.get("base_url", ""),
+            models=body.get("models") if body.get("models") is not None else body.get("model", ""),
+            api_key=body.get("api_key", ""),
+            aliases=body.get("aliases", ""),
+            weight=body.get("weight", 1),
+            account_id=body.get("account_id", ""),
+        )
+        reload_backends()
+        return {"success": True, "backend": entry}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    except ImportError:
+        return {"success": False, "error": "Gateway module not installed"}
+
+
+@app.post("/api/gateway/backends/{backend_id}/update")
+async def gateway_backend_update(backend_id: str, request: Request):
+    """Update a backend's config (name, base_url, model, aliases, weight, api_key, enabled)."""
+    body = await request.json()
+    try:
+        from gateway.backend_store import update_backend
+        from gateway.runtime import reload_backends
+        entry = update_backend(backend_id, **body)
+        if entry is None:
+            return {"success": False, "error": f"Backend {backend_id!r} not found"}
+        reload_backends()
+        return {"success": True, "backend": entry}
+    except ImportError:
+        return {"success": False, "error": "Gateway module not installed"}
+
+
+@app.post("/api/gateway/backends/{backend_id}/delete")
+async def gateway_backend_delete(backend_id: str):
+    """Delete a backend."""
+    try:
+        from gateway.backend_store import delete_backend
+        from gateway.runtime import reload_backends
+        ok = delete_backend(backend_id)
+        if not ok:
+            return {"success": False, "error": f"Backend {backend_id!r} not found"}
+        reload_backends()
+        return {"success": True}
     except ImportError:
         return {"success": False, "error": "Gateway module not installed"}
 
@@ -1027,24 +1471,302 @@ async def public_stats():
 
 @app.get("/api/gateway/vps")
 async def gateway_vps_status():
-    """Latest VPS probe snapshot (jump host + every enabled tunnel)."""
-    try:
-        from gateway.vps_probe import get_status
-        return get_status()
-    except ImportError:
-        return {"summary": {"total": 0, "up": 0, "down": 0, "unknown": 0}, "targets": []}
+    """List monitored VPS nodes with latest agent samples."""
+    from gateway.probe_registry import list_nodes, OFFLINE_AFTER_S
+    nodes = list_nodes()
+    online = sum(1 for n in nodes if n["online"])
+    return {
+        "summary": {
+            "total": len(nodes),
+            "up": online,
+            "down": len(nodes) - online,
+            "offline_after_s": OFFLINE_AFTER_S,
+        },
+        "nodes": nodes,
+    }
 
 
 @app.post("/api/gateway/vps/refresh")
 async def gateway_vps_refresh():
-    """Force a probe cycle now (panel "刷新" button)."""
+    """Re-read latest snapshots (no-op now: agent push, not poll)."""
+    return await gateway_vps_status()
+
+
+# ────────────── Model mapping groups ──────────────
+
+@app.get("/api/model-groups")
+async def model_groups_list():
+    from gateway.model_groups_store import list_groups, ensure_default_initialized
+    ensure_default_initialized()
+    return {"groups": list_groups()}
+
+
+@app.post("/api/model-groups")
+async def model_groups_add(request: Request):
+    """Create a new group. Body: {id, name, description}."""
+    body = await request.json()
     try:
-        from gateway.vps_probe import probe_once
-        await probe_once()
-        from gateway.vps_probe import get_status
-        return get_status()
-    except ImportError:
-        return {"summary": {"total": 0, "up": 0, "down": 0, "unknown": 0}, "targets": []}
+        from gateway.model_groups_store import add_group
+        group = add_group(
+            id=body.get("id", ""),
+            name=body.get("name", ""),
+            description=body.get("description", ""),
+        )
+        return {"success": True, "group": group}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/model-groups/{group_id}/update")
+async def model_groups_update(group_id: str, request: Request):
+    """Update group metadata. Body: {name?, description?}."""
+    body = await request.json()
+    from gateway.model_groups_store import update_group
+    group = update_group(
+        group_id,
+        name=body.get("name", ""),
+        description=body.get("description", ""),
+    )
+    if group is None:
+        return {"success": False, "error": f"分组 {group_id!r} 不存在"}
+    return {"success": True, "group": group}
+
+
+@app.post("/api/model-groups/{group_id}/delete")
+async def model_groups_delete(group_id: str):
+    from gateway.model_groups_store import delete_group
+    ok = delete_group(group_id)
+    if not ok:
+        return {"success": False, "error": f"分组 {group_id!r} 不存在"}
+    return {"success": True}
+
+
+@app.post("/api/model-groups/{group_id}/mappings")
+async def model_groups_mapping_add(group_id: str, request: Request):
+    """Add a mapping to a group. Body: {exposed_name, native_model, protocols?}."""
+    body = await request.json()
+    try:
+        from gateway.model_groups_store import add_mapping
+        mapping = add_mapping(
+            group_id,
+            exposed_name=body.get("exposed_name", ""),
+            native_model=body.get("native_model", ""),
+            protocols=body.get("protocols"),
+        )
+        if mapping is None:
+            return {"success": False, "error": f"分组 {group_id!r} 不存在"}
+        return {"success": True, "mapping": mapping}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/model-groups/{group_id}/mappings/{mapping_id}/update")
+async def model_groups_mapping_update(group_id: str, mapping_id: str, request: Request):
+    body = await request.json()
+    from gateway.model_groups_store import update_mapping
+    mapping = update_mapping(
+        group_id,
+        mapping_id,
+        exposed_name=body.get("exposed_name", ""),
+        native_model=body.get("native_model", ""),
+        protocols=body.get("protocols"),
+    )
+    if mapping is None:
+        return {"success": False, "error": "映射不存在"}
+    return {"success": True, "mapping": mapping}
+
+
+@app.post("/api/model-groups/{group_id}/mappings/{mapping_id}/delete")
+async def model_groups_mapping_delete(group_id: str, mapping_id: str):
+    from gateway.model_groups_store import delete_mapping
+    ok = delete_mapping(group_id, mapping_id)
+    if not ok:
+        return {"success": False, "error": "映射不存在"}
+    return {"success": True}
+
+
+@app.post("/api/model-groups/import-from-backends")
+async def model_groups_import_backends(request: Request):
+    """One-click: scan all backends and create 1:1 mappings in a target group.
+
+    Body (all optional): {group_id="mimo", group_name="MiMo 原生"}.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    from gateway.model_groups_store import import_from_backends
+    result = import_from_backends(
+        group_id=body.get("group_id") or "mimo",
+        group_name=body.get("group_name") or "MiMo 原生",
+    )
+    return {"success": True, **result}
+
+
+@app.get("/api/probe/nodes")
+async def probe_nodes_list():
+    """Panel-only: list nodes including their tokens (for install command)."""
+    from gateway.probe_registry import list_nodes
+    return {"nodes": list_nodes(include_token=True)}
+
+
+@app.post("/api/probe/nodes/add")
+async def probe_node_add(request: Request):
+    """Body: {name}. Returns {id, name, token}."""
+    from gateway.probe_registry import add_node
+    body = await request.json()
+    try:
+        return add_node(body.get("name", ""))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/probe/nodes/{node_id}/delete")
+async def probe_node_delete(node_id: str):
+    from gateway.probe_registry import delete_node
+    ok = delete_node(node_id)
+    return {"success": ok} if ok else JSONResponse(
+        {"success": False, "error": "节点不存在"}, status_code=404)
+
+
+@app.post("/api/probe/nodes/{node_id}/regen-token")
+async def probe_node_regen_token(node_id: str):
+    from gateway.probe_registry import regenerate_token
+    token = regenerate_token(node_id)
+    return {"token": token} if token else JSONResponse(
+        {"error": "节点不存在"}, status_code=404)
+
+
+@app.post("/api/probe/report")
+async def probe_report(request: Request):
+    """Agent endpoint — called every interval seconds with a sample."""
+    from gateway.probe_registry import ingest_report
+    token = request.headers.get("X-Probe-Token", "")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    ok = ingest_report(token, body.get("name"), body.get("sample") or {})
+    if not ok:
+        return JSONResponse({"error": "unknown token"}, status_code=401)
+    return {"ok": True}
+
+
+# ──────────── Probe public install assets ────────────
+# These are intentionally unauthenticated so the one-liner
+# `curl panel/probe/install.sh/<token> | sudo bash` works on a fresh VPS.
+# The token in the URL is the same per-node token used for /api/probe/report.
+
+PROBE_DIR = BASE_DIR / "probe"
+
+
+@app.get("/probe/agent.py")
+async def probe_get_agent():
+    """Serve agent.py for the install script to download."""
+    p = PROBE_DIR / "agent.py"
+    if not p.exists():
+        return PlainTextResponse("agent.py not found", status_code=404)
+    return PlainTextResponse(p.read_text(encoding="utf-8"), media_type="text/x-python")
+
+
+@app.get("/probe/install.sh/{token}")
+async def probe_install_script(token: str, request: Request, name: str = ""):
+    """One-shot installer. URL: <panel>/probe/install.sh/<token>?name=<optional>.
+
+    Validates the token exists, then returns a bash script with all values
+    baked in. The script downloads agent.py, writes a systemd unit, starts it.
+    """
+    from gateway.probe_registry import list_nodes
+    nodes = list_nodes(include_token=True)
+    matched = next((n for n in nodes if n.get("token") == token), None)
+    if not matched:
+        return PlainTextResponse(
+            "echo 'ERROR: invalid or expired token'; exit 1\n",
+            status_code=404, media_type="text/x-shellscript",
+        )
+    base = str(request.base_url).rstrip("/")
+    display_name = name or matched.get("name", "")
+    # Shell-escape values that get interpolated into the script.
+    def _q(s):
+        return "'" + str(s).replace("'", "'\\''") + "'"
+
+    script = f"""#!/bin/bash
+# MiMo VPS probe — one-shot installer
+set -e
+
+PROBE_URL={_q(base + "/api/probe/report")}
+PROBE_TOKEN={_q(token)}
+PROBE_NAME={_q(display_name) if display_name else '"$(hostname)"'}
+PROBE_INTERVAL="${{PROBE_INTERVAL:-10}}"
+INSTALL_DIR="${{INSTALL_DIR:-/opt/mimo-probe}}"
+AGENT_URL={_q(base + "/probe/agent.py")}
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: must run as root (try: curl ... | sudo bash)"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found. Please install python3 first."
+    exit 1
+fi
+
+echo ">> Installing to $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+
+echo ">> Fetching agent.py from $AGENT_URL"
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$AGENT_URL" -o "$INSTALL_DIR/agent.py"
+elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$INSTALL_DIR/agent.py" "$AGENT_URL"
+else
+    echo "ERROR: need curl or wget"
+    exit 1
+fi
+chmod 755 "$INSTALL_DIR/agent.py"
+
+echo ">> Writing /etc/systemd/system/mimo-probe.service"
+cat > /etc/systemd/system/mimo-probe.service <<UNIT
+[Unit]
+Description=MiMo VPS Probe Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PROBE_URL=$PROBE_URL
+Environment=PROBE_TOKEN=$PROBE_TOKEN
+Environment=PROBE_NAME=$PROBE_NAME
+Environment=PROBE_INTERVAL=$PROBE_INTERVAL
+ExecStart=/usr/bin/python3 $INSTALL_DIR/agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo ">> Enabling and starting mimo-probe"
+systemctl daemon-reload
+systemctl enable --now mimo-probe
+
+sleep 2
+if systemctl is-active --quiet mimo-probe; then
+    echo ""
+    echo "✓ mimo-probe is running"
+    echo "  Logs:   journalctl -u mimo-probe -f"
+    echo "  Status: systemctl status mimo-probe"
+else
+    echo ""
+    echo "✗ mimo-probe failed to start"
+    journalctl -u mimo-probe --no-pager -n 30
+    exit 1
+fi
+"""
+    return PlainTextResponse(script, media_type="text/x-shellscript")
 
 
 @app.get("/stats", response_class=HTMLResponse)
@@ -1064,24 +1786,39 @@ async def gateway_proxy(request: Request, path: str):
     """Proxy OpenAI-compatible requests through the gateway router."""
     full_path = f"/v1/{path}"
 
-    # /v1/models — return static model list
+    # /v1/models — return exposed model names from configured mappings (openai protocol).
+    # Falls back to backend.models[] if no mappings exist yet, so the gateway
+    # still answers something useful pre-config.
     if full_path == "/v1/models" and request.method == "GET":
-        return {
-            "object": "list",
-            "data": [
+        try:
+            from gateway.model_groups_store import list_exposed_names, ensure_default_initialized
+            ensure_default_initialized()
+            names = list_exposed_names("openai")
+            if not names:
+                from gateway.runtime import get_all_backends
+                seen: set[str] = set()
+                for b in get_all_backends():
+                    for m in b.get("models") or []:
+                        if m and m not in seen:
+                            seen.add(m)
+                            names.append(m)
+            if not names:
+                names = ["mimo-v2.5-pro"]
+            return {
+                "object": "list",
+                "data": [{"id": m, "object": "model", "owned_by": "mimo"} for m in names],
+            }
+        except ImportError:
+            return {"object": "list", "data": [
                 {"id": "mimo-v2.5-pro", "object": "model", "owned_by": "mimo"},
-                {"id": "mimo-v2.5", "object": "model", "owned_by": "mimo"},
-                {"id": "mimo-v2-flash", "object": "model", "owned_by": "mimo"},
-                {"id": "mimo-v2.5-tts", "object": "model", "owned_by": "mimo"},
-            ],
-        }
+            ]}
 
     if full_path not in _GATEWAY_PATHS:
         return JSONResponse({"error": {"message": f"Unknown path: {full_path}"}}, status_code=404)
 
     # Auth: accept Bearer token or panel cookie
     auth = request.headers.get("Authorization", "")
-    is_api_auth = auth.startswith("Bearer ") and auth[7:].strip() == "sk-Aoki-MiMo"
+    is_api_auth = auth.startswith("Bearer ") and auth[7:].strip() == AUTH_TOKEN
     is_panel_auth = request.cookies.get(AUTH_COOKIE) == AUTH_TOKEN
     if not is_api_auth and not is_panel_auth:
         return JSONResponse(

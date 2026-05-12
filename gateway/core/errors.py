@@ -45,6 +45,12 @@ class BadRequestError(GatewayError):
     error_code = "invalid_request"
 
 
+class ModelNotFoundError(GatewayError):
+    """The requested model name is not configured in any mapping."""
+    http_status = 404
+    error_code = "model_not_found"
+
+
 class UpstreamError(GatewayError):
     """Backend returned non-2xx, or transport raised."""
     http_status = 502

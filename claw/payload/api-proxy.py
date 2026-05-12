@@ -19,6 +19,8 @@ MiMo API Proxy — asyncio 高性能 OpenAI 兼容代理
 import asyncio
 import json
 import os
+import secrets as _secrets
+import socket
 import ssl
 import sys
 import time
@@ -88,7 +90,10 @@ class AsyncConnection:
         self.created_at = time.monotonic()
 
     def is_alive(self) -> bool:
-        return not self.writer.is_closing()
+        """对端 FIN 或自己已关都视为死。仅看 ``writer.is_closing()`` 不够 ——
+        服务端 keep-alive 超时后我们这边 socket 还在，但 ``reader.at_eof()``
+        会变 True，下次复用就 EOF/502。"""
+        return not self.writer.is_closing() and not self.reader.at_eof()
 
     async def close(self):
         try:
@@ -121,7 +126,7 @@ class AsyncConnectionPool:
         sock = writer.get_extra_info("socket")
         if sock:
             try:
-                sock.setsockopt(6, 1, 1)  # TCP_NODELAY
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
         self._created += 1
@@ -189,7 +194,8 @@ _pool = AsyncConnectionPool(BACKEND_HOST, BACKEND_PORT, BACKEND_SSL)
 # ────────────── HTTP 解析工具 ──────────────
 
 async def _parse_headers(reader: asyncio.StreamReader) -> dict[str, str]:
-    """读取 HTTP 头直到空行。"""
+    """读取 HTTP 头直到空行。Key 统一小写（HTTP 头本就大小写不敏感），
+    避免 ``Authorization`` vs ``authorization`` 误判。"""
     headers: dict[str, str] = {}
     while True:
         line = await asyncio.wait_for(reader.readline(), timeout=REQUEST_TIMEOUT)
@@ -199,7 +205,7 @@ async def _parse_headers(reader: asyncio.StreamReader) -> dict[str, str]:
             decoded = line.decode("utf-8", errors="replace")
             if ":" in decoded:
                 key, val = decoded.split(":", 1)
-                headers[key.strip()] = val.strip().rstrip("\r\n")
+                headers[key.strip().lower()] = val.strip().rstrip("\r\n")
         except Exception:
             continue
     return headers
@@ -240,14 +246,26 @@ async def _read_chunked_body(reader: asyncio.StreamReader) -> bytes:
 
 
 async def _read_full_body(reader: asyncio.StreamReader, headers: dict[str, str]) -> bytes:
-    """根据响应头读取完整 body（支持 chunked 和 Content-Length）。"""
-    te = headers.get("Transfer-Encoding", "").lower()
+    """根据响应头读取完整 body：
+
+    * ``transfer-encoding: chunked`` → chunked decode
+    * 有 ``content-length`` → readexactly
+    * 都没有 → 视为 close-delimited，``reader.read()`` 直到 EOF
+    """
+    te = headers.get("transfer-encoding", "").lower()
     if "chunked" in te:
         return await _read_chunked_body(reader)
-    cl = int(headers.get("Content-Length", 0))
-    if cl <= 0:
-        return b""
-    return await asyncio.wait_for(reader.readexactly(cl), timeout=REQUEST_TIMEOUT)
+    cl_raw = headers.get("content-length")
+    if cl_raw is not None:
+        try:
+            cl = int(cl_raw)
+        except ValueError:
+            cl = 0
+        if cl <= 0:
+            return b""
+        return await asyncio.wait_for(reader.readexactly(cl), timeout=REQUEST_TIMEOUT)
+    # No length info → read until server closes the connection.
+    return await asyncio.wait_for(reader.read(), timeout=REQUEST_TIMEOUT)
 
 
 # ────────────── 响应构建 ──────────────
@@ -289,10 +307,13 @@ def _build_error(code: int, message: str) -> bytes:
 _MODELS_BODY = json.dumps({
     "object": "list",
     "data": [
-        {"id": "mimo-v2.5-pro", "object": "model", "owned_by": "mimo"},
-        {"id": "mimo-v2.5", "object": "model", "owned_by": "mimo"},
-        {"id": "mimo-v2-flash", "object": "model", "owned_by": "mimo"},
-        {"id": "mimo-v2.5-tts", "object": "model", "owned_by": "mimo"},
+        {"id": m, "object": "model", "owned_by": "mimo"}
+        for m in (
+            "mimo-v2.5-pro", "mimo-v2.5",
+            "mimo-v2-pro", "mimo-v2-flash", "mimo-v2-omni",
+            "mimo-v2-tts", "mimo-v2.5-tts",
+            "mimo-v2.5-tts-voiceclone", "mimo-v2.5-tts-voicedesign",
+        )
     ]
 }).encode()
 
@@ -335,13 +356,6 @@ async def _proxy(method: str, path: str, req_headers: dict[str, str],
     global _req_count
     _req_count += 1
 
-    is_stream = False
-    if body:
-        try:
-            is_stream = json.loads(body).get("stream", False)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
     # 构建后端路径: 处理 MIMO_API_ENDPOINT 含路径前缀的情况
     endpoint_path = _parsed_ep.path
     if endpoint_path and endpoint_path != "/":
@@ -349,20 +363,24 @@ async def _proxy(method: str, path: str, req_headers: dict[str, str],
             pass  # 已经匹配，直接用
         # 否则保持客户端请求路径不变（大多数情况 endpoint 是 base URL）
 
-    # 构建请求头
+    # 构建请求头（注意 req_headers 的 key 都是小写）
     backend_headers = {
         "Host": BACKEND_HOST,
         "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": req_headers.get("Content-Type", "application/json"),
-        "Accept": req_headers.get("Accept", "*/*"),
+        "Content-Type": req_headers.get("content-type", "application/json"),
+        "Accept": req_headers.get("accept", "*/*"),
         "Connection": "keep-alive",
         "Content-Length": str(len(body)),
     }
-    # 保留自定义头
-    for key in ("X-Request-Id", "X-Conversation-Id", "anthropic-version"):
+    # 保留自定义头（lookup 用小写，转发时保留惯用大小写）
+    for canonical, key in (
+        ("X-Request-Id", "x-request-id"),
+        ("X-Conversation-Id", "x-conversation-id"),
+        ("anthropic-version", "anthropic-version"),
+    ):
         val = req_headers.get(key)
         if val:
-            backend_headers[key] = val
+            backend_headers[canonical] = val
 
     t0 = time.monotonic()
     conn = await _pool.acquire()
@@ -374,38 +392,48 @@ async def _proxy(method: str, path: str, req_headers: dict[str, str],
         conn.writer.write((request_line + header_block + "\r\n").encode() + body)
         await conn.writer.drain()
 
-        # 读取后端响应
+        # 读取后端响应头 —— 让响应头决定是不是 SSE，比请求体里的 stream 字段更准
+        # （客户端可能没标 stream，但上游决定流式返回；或反之）
         resp_status, resp_reason, resp_headers = await _read_response_headers(conn.reader)
+        resp_ct = resp_headers.get("content-type", "")
+        is_stream = "text/event-stream" in resp_ct.lower()
 
         if is_stream:
             # ─── 流式 SSE 转发 ───
             # 透传后端响应头和 body，不做 chunk 解码再编码
             resp_header = _http_status_line(resp_status)
             for k, v in resp_headers.items():
-                if k.lower() not in ("connection",):
-                    resp_header += f"{k}: {v}\r\n"
+                # 跳过 connection / transfer-encoding（我们这层直接 read→write，
+                # 客户端按字节流接收即可，无需声明 chunked）
+                if k.lower() in ("connection", "transfer-encoding"):
+                    continue
+                resp_header += f"{k}: {v}\r\n"
             resp_header += "Access-Control-Allow-Origin: *\r\n"
-            resp_header += "Connection: keep-alive\r\n"
+            resp_header += "Connection: close\r\n"
             resp_header += "\r\n"
 
             client_writer.write(resp_header.encode())
             await client_writer.drain()
 
-            # 直接按块读取后端原始字节转发给客户端，零解析
+            # 单 chunk 30s 超时，整体不另设限（长流量靠 chunk 间隔超时兜底）
+            total_bytes = 0
             while True:
                 try:
                     chunk = await asyncio.wait_for(
-                        conn.reader.read(CHUNK_SIZE), timeout=REQUEST_TIMEOUT)
+                        conn.reader.read(CHUNK_SIZE), timeout=30,
+                    )
                 except (asyncio.TimeoutError, ConnectionError):
                     break
                 if not chunk:
                     break
+                total_bytes += len(chunk)
                 client_writer.write(chunk)
                 await client_writer.drain()
 
             latency_ms = (time.monotonic() - t0) * 1000
-            log(f"{method} {path} → {resp_status} SSE ({latency_ms:.0f}ms)")
-            await _pool.release(conn, healthy=(resp_status < 500))
+            log(f"{method} {path} → {resp_status} SSE {total_bytes}B ({latency_ms:.0f}ms)")
+            # SSE 流结束意味着上游已经 close 或半 close —— 不要放回池
+            await _pool.release(conn, healthy=False)
 
         else:
             # ─── 非流式：读完整响应 ───
@@ -413,25 +441,26 @@ async def _proxy(method: str, path: str, req_headers: dict[str, str],
             latency_ms = (time.monotonic() - t0) * 1000
 
             client_writer.write(_build_response(resp_status, {
-                "Content-Type": resp_headers.get("Content-Type", "application/json"),
+                "Content-Type": resp_headers.get("content-type", "application/json"),
                 "Content-Length": str(len(resp_body)),
                 "Access-Control-Allow-Origin": "*",
                 "Connection": "close",
             }, resp_body))
             await client_writer.drain()
 
-            if resp_status >= 400:
-                log(f"{method} {path} → {resp_status} ({latency_ms:.0f}ms)")
-            else:
-                log(f"{method} {path} → {resp_status} JSON ({latency_ms:.0f}ms)")
+            level = "JSON" if resp_status < 400 else "ERR"
+            log(f"{method} {path} → {resp_status} {level} ({latency_ms:.0f}ms)")
+            # 上游可能用 Connection: close 结束 body —— 此时 reader 已 EOF，
+            # 复用会立即报 502。让 is_alive() 二次检查兜底，这里仍按状态码判定。
             await _pool.release(conn, healthy=(resp_status < 500))
 
     except Exception as e:
         latency_ms = (time.monotonic() - t0) * 1000
-        log(f"{method} {path} → ERROR {e} ({latency_ms:.0f}ms)")
+        # 内部错误日志保留细节，但回给客户端的消息脱敏，避免泄露 Python 异常栈
+        log(f"{method} {path} → ERROR {type(e).__name__}: {e} ({latency_ms:.0f}ms)")
         await _pool.release(conn, healthy=False)
         try:
-            client_writer.write(_build_error(502, f"Proxy error: {e}"))
+            client_writer.write(_build_error(502, "Upstream error"))
             await client_writer.drain()
         except Exception:
             pass
@@ -476,9 +505,11 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await writer.wait_closed()
             return
 
-        # 认证检查
-        auth = req_headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:].strip() != AUTH_TOKEN:
+        # 认证检查（timing-safe 比较，防侧信道；header key 已小写）
+        auth = req_headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or not _secrets.compare_digest(
+            auth[7:].strip(), AUTH_TOKEN
+        ):
             writer.write(_build_error(401, "Missing or invalid Authorization"))
             await writer.drain()
             writer.close()
@@ -486,7 +517,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             return
 
         # 读取请求体
-        content_length = int(req_headers.get("Content-Length", 0))
+        content_length = int(req_headers.get("content-length", 0))
         body = await _read_request_body(reader, content_length)
         if body is None:
             writer.write(_build_error(413, "Request body too large"))
@@ -534,7 +565,11 @@ async def main():
 
     parser = argparse.ArgumentParser(description="MiMo API Proxy (asyncio)")
     parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="bind address (default 127.0.0.1 — sshd reverse-tunnel client "
+             "在同 netns 内通过 loopback 连接即可；显式传 0.0.0.0 才暴露到其他接口)",
+    )
     args = parser.parse_args()
 
     server = await asyncio.start_server(

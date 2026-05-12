@@ -1,29 +1,39 @@
 """
-Auto-deploy engine: per-account scheduled deployment with 10-step flow.
+Auto-deploy engine: per-account scheduled deployment with full 10-step flow.
 
 Flow per account:
-  0. Destroy claw (skip if no claw)
-  1. Create claw
-  2. Wait for claw creation to complete
-  3. Send deploy text to claw
-  4. Wait for claw reply to complete
-  5. Capture SSH key from claw reply
-  6. Add SSH key on jump server
-  7. Reply to claw that key is added
-  8. Test API endpoint
-  9. Done → enter silent mode
+  0. Destroy old claw (skip if none)
+  0.5. Clean up stale tunnel processes on jump server
+  1. Create new claw
+  2. Wait until claw is AVAILABLE
+  3. Send deploy text → claw executes (multi-step in claw)
+  4. Capture SSH public key from claw reply
+  5. Add SSH key to jump server's authorized_keys
+  6. Tell claw the key is added (claw establishes reverse tunnel)
+  7. (Reserved)
+  8. Verify the API endpoint on jump server is reachable
+  9. Done — record run history
+
+All upstream Studio API calls and Claw WS chat are async; the deploy itself
+runs as an async coroutine inside a dedicated thread (one event loop per
+deploy). The scheduler stays sync and just spawns those threads.
 """
+from __future__ import annotations
+
+import asyncio
 import json
-import time
-import threading
-import subprocess
+import logging
 import re
 import shlex
+import subprocess
+import threading
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timedelta
-from croniter import croniter
 from typing import Optional
+
+from croniter import croniter
 
 CONFIG_PATH = Path(__file__).parent.parent / "data" / "auto_deploy.json"
 LOG_DIR = Path(__file__).parent.parent / "data" / "deploy_logs"
@@ -31,6 +41,24 @@ HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
 
 JUMP_SERVER = "149.88.90.137"
 JUMP_USER = "root"
+
+# Stale-deploy entries (state ∈ done/error/cancelled) older than this are
+# treated as idle by ``get_deploy_status``. No cleanup threads needed.
+_STALE_AFTER_S = 300
+
+# Per-step timing knobs.
+_DESTROY_POLL_INTERVAL_S = 5
+_DESTROY_POLL_MAX_ITERS = 12  # → up to 60s wait
+_CREATE_POLL_INTERVAL_S = 5
+_CREATE_POLL_MAX_ITERS = 24   # → up to 120s wait
+_PROBE_API_INTERVAL_S = 5
+_PROBE_API_MAX_ITERS = 12     # → up to 60s wait
+
+# In-memory log size cap; on-disk log is rotated past this many bytes.
+_LOG_LINES_MAX = 2000
+_LOG_FILE_MAX_BYTES = 1_000_000  # ~1MB → keep current + one .1 backup
+
+logger_module = logging.getLogger(__name__)
 
 
 def _ensure_dirs():
@@ -40,39 +68,31 @@ def _ensure_dirs():
 
 
 def _save_run_history(account_filename: str, status: str, log_lines: list):
-    """Save a completed run to history."""
     _ensure_dirs()
     safe_name = account_filename.replace("/", "_").replace("\\", "_")
     history_file = HISTORY_DIR / f"{safe_name}.json"
-    
     history = []
     if history_file.exists():
         try:
             history = json.loads(history_file.read_text(encoding="utf-8"))
         except Exception:
             history = []
-    
     history.append({
         "id": uuid.uuid4().hex[:8],
         "started_at": datetime.now().isoformat(),
         "status": status,
         "lines": log_lines,
     })
-    
-    # Keep last 50 runs
     history = history[-50:]
     history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def get_run_history(account_filename: str) -> list:
-    """Get run history for an account, newest first."""
     _ensure_dirs()
     safe_name = account_filename.replace("/", "_").replace("\\", "_")
     history_file = HISTORY_DIR / f"{safe_name}.json"
-    
     if not history_file.exists():
         return []
-    
     try:
         history = json.loads(history_file.read_text(encoding="utf-8"))
         history.reverse()
@@ -88,9 +108,7 @@ def load_config() -> dict:
             return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {
-        "accounts": {},
-    }
+    return {"accounts": {}}
 
 
 def save_config(cfg: dict):
@@ -109,55 +127,84 @@ def get_account_config(account_filename: str) -> dict:
 # ─── Log management ───
 
 class DeployLogger:
+    """Append-only run log with rotation + in-memory tail.
+
+    The on-disk file is truncated to its tail when it exceeds
+    ``_LOG_FILE_MAX_BYTES``; the in-memory ``lines`` list is capped at
+    ``_LOG_LINES_MAX`` so long-running deploys can't OOM."""
+
     def __init__(self, account_filename: str):
         self.account = account_filename
-        self.lines = []
+        self.lines: list[str] = []
         self._file = LOG_DIR / f"{account_filename.replace('/', '_')}.log"
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         self.lines.append(line)
+        if len(self.lines) > _LOG_LINES_MAX:
+            self.lines = self.lines[-_LOG_LINES_MAX:]
         print(f"[deploy:{self.account}] {line}", flush=True)
         try:
             with open(self._file, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            self._rotate_if_needed()
         except Exception:
+            pass
+
+    def _rotate_if_needed(self):
+        try:
+            size = self._file.stat().st_size
+        except OSError:
+            return
+        if size <= _LOG_FILE_MAX_BYTES:
+            return
+        try:
+            backup = self._file.with_suffix(self._file.suffix + ".1")
+            if backup.exists():
+                backup.unlink()
+            self._file.replace(backup)
+        except OSError:
             pass
 
     def get_recent(self, n: int = 50) -> list:
         return self.lines[-n:]
 
-    def clear(self):
-        self.lines = []
-        try:
-            self._file.write_text("")
-        except Exception:
-            pass
 
+# ─── Active deployments ───
 
-# ─── Active deployments tracking ───
-
-_active_deploys: dict = {}  # account_filename -> {"thread": Thread, "logger": DeployLogger, "state": str, "cancel": Event}
+_active_deploys: dict = {}
 _scheduler_running = False
 _scheduler_thread: Optional[threading.Thread] = None
 
 
+def _gc_active_deploys() -> None:
+    """Drop entries that finished more than ``_STALE_AFTER_S`` seconds ago.
+    Replaces the old per-deploy ``sleep(300)`` cleanup thread."""
+    now = time.time()
+    stale = [
+        acc for acc, d in _active_deploys.items()
+        if d.get("finished_ts") and (now - d["finished_ts"]) > _STALE_AFTER_S
+    ]
+    for acc in stale:
+        _active_deploys.pop(acc, None)
+
+
 def get_deploy_status(account_filename: str = None) -> dict:
+    _gc_active_deploys()
     if account_filename:
         d = _active_deploys.get(account_filename)
         if d:
             return {
-                "running": True,
+                "running": d.get("state") not in ("done", "error", "cancelled"),
                 "state": d["state"],
                 "log": d["logger"].get_recent(50),
             }
         return {"running": False, "state": "idle", "log": []}
-    # All
     result = {}
     for acc, d in _active_deploys.items():
         result[acc] = {
-            "running": True,
+            "running": d.get("state") not in ("done", "error", "cancelled"),
             "state": d["state"],
             "log": d["logger"].get_recent(20),
         }
@@ -182,291 +229,438 @@ def ssh_jump(command: str, timeout: int = 30) -> tuple:
         return "", str(e), 1
 
 
-# ─── Core deploy flow ───
+async def _ssh_jump_async(command: str, timeout: int = 30) -> tuple:
+    """Async wrapper so the deploy loop doesn't block on subprocess.run."""
+    return await asyncio.to_thread(ssh_jump, command, timeout)
 
-def _curl_api(method: str, path: str, body=None, with_ph: bool = True):
-    """Import curl_api from app module at runtime to avoid circular imports."""
+
+def _clean_tunnel_ports_cmd(ports: list[int]) -> str:
+    pattern = "|".join(str(p) for p in ports)
+    return (
+        f"ss -tlnp | grep -E '{pattern}' | grep sshd | "
+        f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; echo DONE"
+    )
+
+
+# ─── App bridge ───
+
+def _get_app_module():
+    """Lazy import to avoid circular deps when app imports auto_deploy."""
     import importlib
-    app_mod = importlib.import_module("app")
-    return app_mod.curl_api(method, path, body, with_ph)
+    return importlib.import_module("app")
 
 
-def _claw_chat(message: str, session_key: str = None) -> str:
-    """Call the claw chat endpoint synchronously."""
-    if not session_key:
-        session_key = "agent:main:auto-deploy-" + uuid.uuid4().hex[:8]
-    import urllib.request
+def _load_account_cookies(account_filename: str) -> Optional[list]:
+    """Read the account's saved cookies without touching global state.
+    Returns None if the account file is missing or has no cookies."""
+    accounts_dir = Path(__file__).parent.parent / "accounts"
+    path = accounts_dir / f"{account_filename}.json"
+    if not path.exists():
+        return None
     try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:8088/api/claw/chat",
-            data=json.dumps({"message": message, "session_key": session_key}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        req.add_header("Cookie", "mimo_panel_auth=aoki_mimo_2026")
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            data = json.loads(resp.read())
-            return data.get("reply", "")
-    except Exception as e:
-        return f"[ERROR] {e}"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cookies = data.get("cookies") or []
+        return cookies if cookies else None
+    except Exception:
+        return None
+
+
+# ─── SSH key parsing ───
+
+_SSH_KEY_RE = re.compile(r'(ssh-(?:rsa|ed25519|ecdsa)\s+[A-Za-z0-9+/=]+(?:\s+\S+)?)')
 
 
 def _parse_ssh_key(text: str) -> Optional[str]:
-    """Extract SSH public key from text."""
-    match = re.search(r'(ssh-(?:rsa|ed25519|ecdsa)\s+[A-Za-z0-9+/=]+(?:\s+\S+)?)', text)
-    if match:
-        return match.group(1).strip()
-    return None
+    match = _SSH_KEY_RE.search(text or "")
+    return match.group(1).strip() if match else None
 
 
-def _deploy_ssh_key(public_key: str, logger: DeployLogger) -> tuple:
-    """Deploy SSH public key to jump server."""
-    check_cmd = f'grep -qF {shlex.quote(public_key.strip())} /root/.ssh/authorized_keys 2>/dev/null && echo "EXISTS" || echo "NEW"'
-    stdout, stderr, rc = ssh_jump(check_cmd)
+async def _deploy_ssh_key(public_key: str, logger: DeployLogger) -> tuple:
+    quoted = shlex.quote(public_key.strip())
+    check_cmd = (
+        f'grep -qF {quoted} /root/.ssh/authorized_keys 2>/dev/null '
+        f'&& echo "EXISTS" || echo "NEW"'
+    )
+    stdout, stderr, rc = await _ssh_jump_async(check_cmd)
     if "EXISTS" in stdout:
-        logger.log("SSH key already exists")
+        logger.log("SSH key already exists on jump server")
         return True, "Key already deployed"
 
-    add_cmd = f'echo {shlex.quote(public_key.strip())} >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && echo "OK"'
-    stdout, stderr, rc = ssh_jump(add_cmd)
+    add_cmd = (
+        f'echo {quoted} >> /root/.ssh/authorized_keys && '
+        f'chmod 600 /root/.ssh/authorized_keys && echo "OK"'
+    )
+    stdout, stderr, rc = await _ssh_jump_async(add_cmd)
     if rc != 0 or "OK" not in stdout:
         logger.log(f"Failed to deploy SSH key: {stderr}")
         return False, f"Failed: {stderr}"
-
     logger.log("SSH key deployed to jump server")
     return True, "Key deployed"
 
 
+# ─── Endpoint probe (Step 8) ───
 
-def run_deploy(account_filename: str, force: bool = False):
-    """Execute the full 10-step deployment flow for one account."""
+async def _probe_api_endpoint(host: str, port: int, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Hit ``http://host:port/`` and accept any 2xx/3xx as alive. Falls back
+    to a raw TCP connect so we still count it as alive if the API proxy is
+    listening but not yet serving HTTP."""
+    url = f"http://{host}:{port}/"
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
+            resp = await client.get(url)
+            if 200 <= resp.status_code < 500:
+                return True, f"HTTP {resp.status_code}"
+            return False, f"HTTP {resp.status_code}"
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    # Fallback: bare TCP connect
+    try:
+        fut = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(fut, timeout=timeout_s)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True, "TCP open"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ─── Core deploy flow ───
+
+async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     cfg = load_config()
     acc_cfg = cfg.get("accounts", {}).get(account_filename, {})
     deploy_text = acc_cfg.get("deploy_text", "")
-    logger = DeployLogger(account_filename)
+    ssh_port = acc_cfg.get("ssh_port", 8022)
+    api_port = acc_cfg.get("api_port", 8800)
+    ports_to_clean = [ssh_port, api_port]
+
+    log = DeployLogger(account_filename)
     cancel_event = threading.Event()
 
     _active_deploys[account_filename] = {
         "thread": threading.current_thread(),
-        "logger": logger,
+        "logger": log,
         "state": "starting",
         "cancel": cancel_event,
         "started_at": datetime.now().isoformat(),
+        "started_ts": time.time(),
+        "finished_ts": None,
     }
 
-    def set_state(s):
+    def set_state(s: str) -> None:
         _active_deploys[account_filename]["state"] = s
 
-    def check_cancel():
+    def mark_finished(state: str, history_status: str | None = None) -> None:
+        set_state(state)
+        _active_deploys[account_filename]["finished_ts"] = time.time()
+        if history_status is not None:
+            _save_run_history(account_filename, history_status, log.lines[:])
+
+    def cancelled() -> bool:
         return cancel_event.is_set()
 
+    cookies = _load_account_cookies(account_filename)
+    if cookies is None:
+        log.log(f"❌ 账号 {account_filename} 不存在或没有 cookies")
+        mark_finished("error", history_status="error")
+        return
+
+    app_mod = _get_app_module()
+    acurl = app_mod.acurl
+    claw_ws_chat = app_mod.claw_ws_chat
+    upload_to_claw_fds = app_mod.upload_to_claw_fds
+
+    # Local path of the reference api-proxy.py that Claw should save verbatim.
+    # Lives under claw/payload/ — it's a deployment payload, not a panel runtime
+    # script, so it sits next to auto_deploy.py rather than in the top-level
+    # scripts/ directory.
+    api_proxy_path = Path(__file__).parent / "payload" / "api-proxy.py"
+
     try:
-        logger.log("=== 开始部署 ===")
+        log.log("=== 开始部署 ===")
+        log.log(f"账号: {account_filename} · SSH 端口: {ssh_port} · API 端口: {api_port}")
 
-        # Switch to this account first
-        import importlib
-        app_mod = importlib.import_module("app")
-        switch_result = app_mod.switch_to_account(account_filename)
-        if not switch_result:
-            logger.log(f"❌ 无法切换到账号 {account_filename}")
-            set_state("error")
-            return
-        logger.log(f"已切换到账号 {account_filename}")
-
-        # Step 0: Destroy existing claw
+        # Step 0: Destroy existing claw if any.
         set_state("step0_destroy")
-        logger.log("Step 0: 检查并销毁旧 Claw...")
-        code, data = _curl_api("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
+        log.log("Step 0: 检查并销毁旧 Claw...")
+        code, data = await acurl(
+            "GET", "/open-apis/user/mimo-claw/status",
+            with_ph=False, cookies=cookies,
+        )
         has_claw = False
         if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-            info = data.get("data", {})
-            status = info.get("status", "")
+            status = (data.get("data") or {}).get("status", "")
             if status not in ("", "DESTROYED", "DESTROYING"):
                 has_claw = True
 
         if has_claw:
-            logger.log("发现旧 Claw，销毁中...")
-            _curl_api("POST", "/open-apis/user/mimo-claw/destroy", body={})
-            for _ in range(12):
-                if check_cancel():
-                    logger.log("⚠️ 部署已取消")
-                    set_state("cancelled")
+            log.log("发现旧 Claw，销毁中...")
+            await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
+            for _ in range(_DESTROY_POLL_MAX_ITERS):
+                if cancelled():
+                    log.log("⚠️ 部署已取消")
+                    mark_finished("cancelled", history_status="cancelled")
                     return
-                time.sleep(5)
-                code, data = _curl_api("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
+                await asyncio.sleep(_DESTROY_POLL_INTERVAL_S)
+                code, data = await acurl(
+                    "GET", "/open-apis/user/mimo-claw/status",
+                    with_ph=False, cookies=cookies,
+                )
                 if code == "HTTP_200" and isinstance(data, dict):
-                    info = data.get("data", {})
-                    if info.get("status") in ("DESTROYED", ""):
+                    if (data.get("data") or {}).get("status") in ("DESTROYED", ""):
                         break
-            logger.log("旧 Claw 已销毁")
+            log.log("旧 Claw 已销毁")
         else:
-            logger.log("无旧 Claw，跳过销毁")
+            log.log("无旧 Claw，跳过销毁")
 
-        # Step 0.5: Clean up old tunnel processes on jump server
+        # Step 0.5: Kill stale sshd tunnel processes on jump server bound to our ports.
         set_state("step0_cleanup")
-        ssh_port = acc_cfg.get("ssh_port", 8022)
-        api_port = acc_cfg.get("api_port", 8800)
-        ports_to_clean = [ssh_port, api_port]
-        port_pattern = "|".join(str(p) for p in ports_to_clean)
-        logger.log(f"Step 0.5: 清理跳板机旧隧道进程 (端口 {port_pattern})...")
-        stdout, stderr, rc = ssh_jump(
-            f"ss -tlnp | grep -E '{port_pattern}' | grep sshd | "
-            f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; echo DONE"
-        )
-        if rc == 0:
-            logger.log(f"跳板机旧隧道已清理")
-        else:
-            logger.log(f"清理旧隧道: {stderr or '无残留'}")
-
-        if check_cancel():
-            set_state("cancelled")
+        log.log(f"Step 0.5: 清理跳板机旧隧道进程 (端口 {ssh_port}/{api_port})...")
+        _, stderr, rc = await _ssh_jump_async(_clean_tunnel_ports_cmd(ports_to_clean))
+        log.log("跳板机旧隧道已清理" if rc == 0 else f"清理: {stderr or '无残留'}")
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 1: Create claw
+        # Step 1: Create claw.
         set_state("step1_create")
-        logger.log("Step 1: 创建新 Claw...")
-        code, data = _curl_api("POST", "/open-apis/user/mimo-claw/create", body={})
+        log.log("Step 1: 创建新 Claw...")
+        code, data = await acurl(
+            "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
+        )
         if not (isinstance(data, dict) and data.get("code") == 0):
-            logger.log(f"❌ 创建 Claw 失败: {data}")
-            set_state("error")
+            log.log(f"❌ 创建 Claw 失败: {data}")
+            mark_finished("error", history_status="error")
             return
-        logger.log("Claw 创建请求已发送")
+        log.log("Claw 创建请求已发送")
 
-        # Step 2: Wait for claw to be ready
+        # Step 2: Wait until claw is AVAILABLE.
         set_state("step2_wait")
-        logger.log("Step 2: 等待 Claw 就绪...")
+        log.log("Step 2: 等待 Claw 就绪...")
         claw_ready = False
-        for i in range(24):  # max 2 minutes
-            if check_cancel():
-                set_state("cancelled")
+        for i in range(_CREATE_POLL_MAX_ITERS):
+            if cancelled():
+                mark_finished("cancelled", history_status="cancelled")
                 return
-            time.sleep(5)
-            code, data = _curl_api("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
+            await asyncio.sleep(_CREATE_POLL_INTERVAL_S)
+            code, data = await acurl(
+                "GET", "/open-apis/user/mimo-claw/status",
+                with_ph=False, cookies=cookies,
+            )
             if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-                info = data.get("data", {})
-                if info.get("status") == "AVAILABLE":
+                if (data.get("data") or {}).get("status") == "AVAILABLE":
                     claw_ready = True
                     break
-            logger.log(f"  等待中... ({(i+1)*5}s)")
-
+            log.log(f"  等待中... ({(i + 1) * _CREATE_POLL_INTERVAL_S}s)")
         if not claw_ready:
-            logger.log("❌ Claw 启动超时")
-            set_state("error")
+            log.log("❌ Claw 启动超时")
+            mark_finished("error", history_status="error")
             return
-        logger.log("✅ Claw 就绪")
-
-        if check_cancel():
-            set_state("cancelled")
-            return
-
-        # Step 3: Send deploy text to claw
-        set_state("step3_send")
-        session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
+        log.log("✅ Claw 就绪")
 
         if not deploy_text:
-            logger.log("❌ 未配置部署文案，请在面板中填写")
-            set_state("error")
+            log.log("❌ 未配置部署文案，请在面板中填写")
+            mark_finished("error", history_status="error")
             return
 
-        logger.log(f"Step 3: 发送部署文案到 Claw ({len(deploy_text)} 字符)...")
-        reply3 = _claw_chat(deploy_text, session_key)
-        logger.log(f"Claw 回复: {reply3[:200]}...")
+        # Step 3: Send deploy text. Before sending, upload the canonical
+        # api-proxy.py to MiMo's Galaxy FDS so the deploy_text can reference
+        # it as an attachment — that avoids stuffing a 22KB Python source
+        # into the WS message (MiMo's WS gateway drops messages > ~8KB) and
+        # guarantees Claw saves a byte-for-byte copy of our fixed script
+        # rather than re-implementing from a bullet spec.
+        attachments: list[dict] = []
+        if api_proxy_path.exists():
+            try:
+                script_bytes = api_proxy_path.read_bytes()
+                log.log(
+                    f"Step 3a: 上传 api-proxy.py ({len(script_bytes):,} bytes) 到 FDS..."
+                )
+                # Unique filename so concurrent deploys don't collide on FDS.
+                fname = f"api-proxy-{uuid.uuid4().hex}.py"
+                attachment, up_err = await upload_to_claw_fds(
+                    fname, script_bytes, cookies=cookies, file_type="txt",
+                )
+                if up_err:
+                    log.log(f"⚠️ FDS 上传失败 ({up_err}) — 退回纯文本投递")
+                else:
+                    # Use the natural name in the prompt so Claw saves it correctly.
+                    attachment["name"] = "api-proxy.py"
+                    attachments = [attachment]
+                    log.log("Step 3a: FDS 上传成功，附件已就绪")
+            except OSError as e:
+                log.log(f"⚠️ 读 claw/payload/api-proxy.py 失败 ({e}) — 退回纯文本投递")
+        else:
+            log.log(f"⚠️ claw/payload/api-proxy.py 不存在 ({api_proxy_path}) — 退回纯文本投递")
 
-        if check_cancel():
-            set_state("cancelled")
+        # Step 3: Send deploy text. ``claw_ws_chat`` returns ``(reply, err)`` —
+        # if err is set, do NOT continue with the reply (#6 fix).
+        set_state("step3_send")
+        session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
+        # Prepend an imperative preamble so Claw treats the markdown body as a
+        # task spec to execute, not as a Q&A context to summarise. Without
+        # this, the default ``<mimo-files>`` prompt ("先下载再回答") makes
+        # Claw download the attachment then explain the upload mechanism
+        # instead of running the deploy.
+        if attachments:
+            framed_message = (
+                "你的任务：完整执行下面这份部署文档里的全部步骤（1 → 11），"
+                "**不要解释、不要总结**，只在每个步骤产生输出时简短报告进度。"
+                "文档中第 5 步需要保存的 `api-proxy.py` 已作为附件提供给你，"
+                "请直接下载到 `/root/.openclaw/workspace/scripts/api-proxy.py`（**原封不动**）。"
+                "完成后把生成的 SSH 公钥（ssh-ed25519 开头）回给我。\n\n"
+                + deploy_text
+            )
+        else:
+            framed_message = deploy_text
+        log.log(
+            f"Step 3: 发送部署文案到 Claw ({len(framed_message)} 字符"
+            f"{', 附 1 个文件' if attachments else ''})..."
+        )
+        reply3, err3 = await claw_ws_chat(
+            framed_message, session_key, cookies=cookies,
+            attachments=attachments or None,
+        )
+        if err3:
+            log.log(f"❌ Claw 通信失败: {err3}")
+            mark_finished("error", history_status="error")
+            return
+        log.log(f"Claw 回复: {reply3[:200]}...")
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 4: Capture SSH key from reply
+        # Step 4: Capture SSH public key. Retry with a fresh session if the
+        # first reply doesn't contain a key (#7 fix).
         set_state("step4_capture")
-        logger.log("Step 4: 从回复中提取 SSH 公钥...")
-
+        log.log("Step 4: 从回复中提取 SSH 公钥...")
         public_key = _parse_ssh_key(reply3)
         if not public_key:
-            # Ask claw for the key
-            logger.log("未找到 SSH key，再次询问...")
-            reply5 = _claw_chat("请把你的 SSH 公钥发给我，格式为 ssh-ed25519 或 ssh-rsa 开头的完整公钥。", session_key)
-            logger.log(f"Claw 回复: {reply5[:200]}...")
-            public_key = _parse_ssh_key(reply5)
-
+            log.log("未找到 SSH key，换新会话再问一次...")
+            retry_session = f"agent:main:auto-{account_filename}-retry-{uuid.uuid4().hex[:8]}"
+            reply_retry, err_retry = await claw_ws_chat(
+                "请把你的 SSH 公钥发给我，格式为 ssh-ed25519 或 ssh-rsa 开头的完整公钥。",
+                retry_session, cookies=cookies,
+            )
+            if err_retry:
+                log.log(f"❌ 重试 Claw 通信失败: {err_retry}")
+                mark_finished("error", history_status="error")
+                return
+            log.log(f"Claw 回复: {reply_retry[:200]}...")
+            public_key = _parse_ssh_key(reply_retry)
         if not public_key:
-            logger.log("❌ 无法从 Claw 回复中提取 SSH 公钥")
-            set_state("error")
+            log.log("❌ 无法从 Claw 回复中提取 SSH 公钥")
+            mark_finished("error", history_status="error")
             return
-        logger.log(f"✅ 提取到 SSH 公钥: {public_key[:50]}...")
-
-        if check_cancel():
-            set_state("cancelled")
+        log.log(f"✅ 提取到 SSH 公钥: {public_key[:50]}...")
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 5: Add SSH key on jump server
+        # Step 5: Add key on jump server.
         set_state("step5_deploy_key")
-        logger.log("Step 6: 在跳板机上添加 SSH 公钥...")
-        key_ok, key_msg = _deploy_ssh_key(public_key, logger)
+        log.log("Step 5: 在跳板机上添加 SSH 公钥...")
+        key_ok, key_msg = await _deploy_ssh_key(public_key, log)
         if not key_ok:
-            logger.log(f"❌ 部署公钥失败: {key_msg}")
-            set_state("error")
+            log.log(f"❌ 部署公钥失败: {key_msg}")
+            mark_finished("error", history_status="error")
             return
-        logger.log(f"✅ 公钥部署成功: {key_msg}")
-
-        if check_cancel():
-            set_state("cancelled")
+        log.log(f"✅ 公钥部署成功: {key_msg}")
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 6: Reply to claw that key is added
-        # Clean up tunnel ports AGAIN right before telling claw to build tunnel,
-        # because keepalive scripts from previous deploys may have restarted them.
+        # Step 6: Second cleanup right before telling claw to build the tunnel.
+        # Previous deploys' keepalive cron may have restarted the old sshd
+        # tunnel between Step 0.5 and now — kill them so claw's new tunnel
+        # can bind. Then notify claw.
         set_state("step6_confirm")
-        logger.log("Step 6: 再次清理跳板机隧道端口...")
-        stdout2, stderr2, rc2 = ssh_jump(
-            f"ss -tlnp | grep -E '{port_pattern}' | grep sshd | "
-            f"grep -oP 'pid=\\K[0-9]+' | sort -u | xargs -r kill 2>/dev/null; echo DONE"
+        log.log("Step 6: 再次清理跳板机隧道端口...")
+        _, stderr2, rc2 = await _ssh_jump_async(_clean_tunnel_ports_cmd(ports_to_clean))
+        log.log("端口再次清理完成" if rc2 == 0 else f"再次清理: {stderr2 or '无残留'}")
+
+        log.log("Step 6: 通知 Claw 公钥已添加...")
+        reply6, err6 = await claw_ws_chat(
+            "我已经把公钥添加到跳板机", session_key, cookies=cookies,
         )
-        if rc2 == 0:
-            logger.log(f"端口再次清理完成")
+        if err6:
+            log.log(f"⚠️ 通知 Claw 失败 (不阻断): {err6}")
         else:
-            logger.log(f"再次清理: {stderr2 or '无残留'}")
-
-        logger.log("Step 6: 通知 Claw 公钥已添加...")
-        confirm_msg = f"我已经把公钥添加到跳板机"
-        reply7 = _claw_chat(confirm_msg, session_key)
-        logger.log(f"Claw 回复: {reply7[:200]}...")
-
-        if check_cancel():
-            set_state("cancelled")
+            log.log(f"Claw 回复: {reply6[:200]}...")
+        if cancelled():
+            mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 7: Done
-        set_state("done")
-        logger.log("=== ✅ 部署完成，进入静默模式 ===")
-        _save_run_history(account_filename, "done", logger.lines[:])
+        # Step 8: Verify the API endpoint is up on the jump server. The
+        # tunnel may take a few seconds to come up; poll for ~60s.
+        set_state("step8_verify")
+        log.log(f"Step 8: 验证 API 端点 http://{JUMP_SERVER}:{api_port}/ ...")
+        endpoint_ok = False
+        last_reason = ""
+        for i in range(_PROBE_API_MAX_ITERS):
+            if cancelled():
+                mark_finished("cancelled", history_status="cancelled")
+                return
+            await asyncio.sleep(_PROBE_API_INTERVAL_S)
+            ok, reason = await _probe_api_endpoint(JUMP_SERVER, api_port)
+            last_reason = reason
+            if ok:
+                endpoint_ok = True
+                log.log(f"✅ API 端点已就绪: {reason}")
+                break
+            log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
 
+        if endpoint_ok:
+            log.log("=== ✅ 部署完成 ===")
+            mark_finished("done", history_status="done")
+        else:
+            log.log(f"⚠️ 端点验证超时 (最后状态: {last_reason})，Claw 已就绪但隧道可能尚未生效")
+            mark_finished("error", history_status="error")
+
+    except asyncio.CancelledError:
+        log.log("⚠️ 部署被取消 (CancelledError)")
+        mark_finished("cancelled", history_status="cancelled")
+        raise
     except Exception as e:
-        logger.log(f"❌ 部署异常: {e}")
-        set_state("error")
-        _save_run_history(account_filename, "error", logger.lines[:])
-    finally:
-        # Keep status for 5 minutes, then clean up
-        def cleanup():
-            time.sleep(300)
-            if account_filename in _active_deploys:
-                del _active_deploys[account_filename]
-        threading.Thread(target=cleanup, daemon=True).start()
+        log.log(f"❌ 部署异常: {type(e).__name__}: {e}")
+        mark_finished("error", history_status="error")
+
+
+def _run_deploy_thread(account_filename: str, force: bool) -> None:
+    try:
+        asyncio.run(run_deploy_async(account_filename, force=force))
+    except Exception as e:
+        # asyncio.run may raise on cancellation — log and move on.
+        logger_module.exception("Deploy thread crashed for %s: %s", account_filename, e)
+
+
+def run_deploy(account_filename: str, force: bool = False) -> None:
+    """Synchronous wrapper kept for any external caller; runs to completion."""
+    _run_deploy_thread(account_filename, force)
 
 
 def trigger_deploy(account_filename: str) -> dict:
-    """Manually trigger deployment for an account."""
-    if account_filename in _active_deploys and _active_deploys[account_filename]["state"] not in ("done", "error", "cancelled", "idle"):
+    """Manually start a deployment (returns immediately; runs in a thread)."""
+    _gc_active_deploys()
+    cur = _active_deploys.get(account_filename)
+    if cur and cur.get("state") not in ("done", "error", "cancelled", "idle"):
         return {"success": False, "error": "该账号正在部署中"}
-
-    t = threading.Thread(target=run_deploy, args=(account_filename,), daemon=True)
+    t = threading.Thread(
+        target=_run_deploy_thread, args=(account_filename, False), daemon=True,
+    )
     t.start()
     return {"success": True, "message": f"已启动 {account_filename} 的部署"}
 
 
 def cancel_deploy(account_filename: str) -> dict:
-    """Cancel an active deployment."""
     d = _active_deploys.get(account_filename)
-    if d and d["state"] not in ("done", "error", "cancelled"):
+    if d and d.get("state") not in ("done", "error", "cancelled"):
         d["cancel"].set()
         d["state"] = "cancelling"
         return {"success": True, "message": "正在取消..."}
@@ -476,7 +670,11 @@ def cancel_deploy(account_filename: str) -> dict:
 # ─── Scheduler ───
 
 def _scheduler_loop():
-    """Background loop that checks every minute if any account needs deployment."""
+    """Run every minute: for each enabled account, fire when:
+      * cron has crossed a fire boundary within the last 2 min, AND
+      * we haven't already triggered for that fire (last_run < prev_fire), AND
+      * no active deploy is in flight.
+    """
     global _scheduler_running
     _scheduler_running = True
     print("[scheduler] 启动自动部署调度器", flush=True)
@@ -489,36 +687,32 @@ def _scheduler_loop():
             for acc_filename, acc_cfg in accounts.items():
                 if not acc_cfg.get("enabled", False):
                     continue
-
                 cron_expr = acc_cfg.get("cron", "0 3 * * *")
-                last_run = acc_cfg.get("last_run", 0)
-
+                last_run = acc_cfg.get("last_run", 0) or 0
                 now = datetime.now()
-
-                # Parse cron expression
                 try:
                     cron = croniter(cron_expr, now)
                 except (ValueError, KeyError):
                     continue
-
-                # Get previous fire time (when this cron should have last fired)
                 prev_fire = cron.get_prev(datetime)
-                next_fire = cron.get_next(datetime)
-
-                # Check if we should run: prev_fire is within last 2 minutes and we haven't run since then
-                diff = abs((now - prev_fire).total_seconds())
-                if diff <= 120:
-                    if acc_filename not in _active_deploys or _active_deploys[acc_filename]["state"] in ("done", "error", "cancelled"):
-                        print(f"[scheduler] 触发 {acc_filename} 的部署", flush=True)
-                        # Update last_run
-                        cfg["accounts"][acc_filename]["last_run"] = now.timestamp()
-                        save_config(cfg)
-                        trigger_deploy(acc_filename)
-
+                diff = (now - prev_fire).total_seconds()
+                if not (0 <= diff <= 120):
+                    continue
+                if last_run >= prev_fire.timestamp():
+                    # Already triggered for this fire boundary; skip even if
+                    # the previous run finished quickly (issue #5 fix).
+                    continue
+                cur = _active_deploys.get(acc_filename)
+                if cur and cur.get("state") not in ("done", "error", "cancelled"):
+                    continue
+                print(f"[scheduler] 触发 {acc_filename} 的部署", flush=True)
+                cfg["accounts"][acc_filename]["last_run"] = now.timestamp()
+                save_config(cfg)
+                trigger_deploy(acc_filename)
         except Exception as e:
             print(f"[scheduler] 错误: {e}", flush=True)
 
-        time.sleep(60)  # Check every minute
+        time.sleep(60)
 
 
 def start_scheduler():
@@ -544,21 +738,24 @@ def get_scheduler_status() -> dict:
         if not acc_cfg.get("enabled", False):
             schedule_info[acc_filename] = {"enabled": False}
             continue
-
         cron_expr = acc_cfg.get("cron", "0 3 * * *")
         last_run = acc_cfg.get("last_run", 0)
-
         try:
             cron = croniter(cron_expr, now)
             next_run = cron.get_next(datetime)
         except (ValueError, KeyError):
-            schedule_info[acc_filename] = {"enabled": True, "cron": cron_expr, "error": "Cron 表达式格式错误"}
+            schedule_info[acc_filename] = {
+                "enabled": True, "cron": cron_expr,
+                "error": "Cron 表达式格式错误",
+            }
             continue
-
         schedule_info[acc_filename] = {
             "enabled": True,
             "cron": cron_expr,
-            "last_run": datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M") if last_run else "从未运行",
+            "last_run": (
+                datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M")
+                if last_run else "从未运行"
+            ),
             "next_run": next_run.strftime("%Y-%m-%d %H:%M"),
         }
 

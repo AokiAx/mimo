@@ -73,8 +73,8 @@ class Router:
             if b.backend_id in exclude:
                 excluded[b.backend_id] = "excluded by caller"
                 continue
-            if b.model != model and model not in (b.metadata.get("aliases") or "").split(","):
-                excluded[b.backend_id] = f"serves {b.model!r}, not {model!r}"
+            if not b.serves(model):
+                excluded[b.backend_id] = f"serves {b.models!r}, not {model!r}"
                 continue
             if not b.is_selectable(now):
                 if b.is_open(now):

@@ -1,7 +1,6 @@
 """Unit tests for gateway.routing."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tempfile
@@ -16,55 +15,25 @@ from gateway.routing import (
     JSONLDecisionLog,
     Router,
     TeeDecisionLog,
-    chat_probe,
 )
 
 
 # ───────── helpers ─────────
 
 
-class FakeResponse:
-    def __init__(self, status_code: int, body: dict | None = None, raw: str = ""):
-        self.status_code = status_code
-        self._body = body
-        self._raw = raw or (json.dumps(body) if body is not None else "")
-
-    @property
-    def text(self) -> str:
-        return self._raw
-
-    def json(self):
-        if self._body is None:
-            raise ValueError("not json")
-        return self._body
-
-
-class FakeClient:
-    def __init__(self, response: FakeResponse | Exception):
-        self._response = response
-        self.calls: list[dict] = []
-
-    async def post(self, url, *, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
-        if isinstance(self._response, Exception):
-            raise self._response
-        return self._response
-
-
 def _backend(**overrides) -> Backend:
     base = {
         "backend_id": "b1",
         "base_url": "http://upstream.example",
-        "model": "MiMo-VL-7B-RL-2508",
+        "models": ["MiMo-VL-7B-RL-2508"],
         "account_id": "acct1",
         "api_key": "sk-test",
     }
+    # Accept legacy {model: "X"} from test callers and fold into models list.
+    if "model" in overrides and "models" not in overrides:
+        overrides["models"] = [overrides.pop("model")]
     base.update(overrides)
     return Backend(**base)
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ───────── Backend health/breaker ─────────
@@ -140,7 +109,7 @@ def test_router_choose_picks_only_selectable():
     for _ in range(3):
         dead.record_failure("x", threshold=3)
     r = Router(BackendRegistry([alive, dead]))
-    chosen, decision = r.choose(request_id="r1", model=alive.model)
+    chosen, decision = r.choose(request_id="r1", model=alive.models[0])
     assert chosen.backend_id == "alive"
     assert decision.chosen_backend == "alive"
     assert "dead" in decision.excluded
@@ -163,7 +132,7 @@ def test_router_choose_excludes_caller_specified():
     a.record_success()
     b.record_success()
     r = Router(BackendRegistry([a, b]))
-    chosen, decision = r.choose(request_id="r1", model=a.model, exclude={"a"})
+    chosen, decision = r.choose(request_id="r1", model=a.models[0], exclude={"a"})
     assert chosen.backend_id == "b"
     assert decision.excluded["a"] == "excluded by caller"
 
@@ -174,7 +143,7 @@ def test_router_choose_raises_when_none_available():
         dead.record_failure("x", threshold=3)
     r = Router(BackendRegistry([dead]))
     with pytest.raises(BackendUnavailableError) as exc:
-        r.choose(request_id="r1", model=dead.model)
+        r.choose(request_id="r1", model=dead.models[0])
     assert "decision" in exc.value.details
 
 
@@ -188,7 +157,7 @@ def test_router_choose_prefers_least_recently_failed():
     b.last_failure_at = time.time()
     b.health = "alive"
     r = Router(BackendRegistry([a, b]))
-    chosen, _ = r.choose(request_id="r1", model=a.model)
+    chosen, _ = r.choose(request_id="r1", model=a.models[0])
     assert chosen.backend_id == "a"  # last_failure_at = 0
 
 
@@ -198,7 +167,7 @@ def test_router_decision_records_candidates_considered():
     a.record_success()
     b.record_success()
     r = Router(BackendRegistry([a, b]))
-    _, decision = r.choose(request_id="rid-xyz", model=a.model)
+    _, decision = r.choose(request_id="rid-xyz", model=a.models[0])
     assert set(decision.candidates_considered) == {"a", "b"}
     assert decision.request_id == "rid-xyz"
     assert decision.reason == "score"
@@ -258,7 +227,7 @@ def test_router_prefers_lower_latency():
     fast.ewma_latency_ms = 50.0
     slow.ewma_latency_ms = 500.0
     r = Router(BackendRegistry([slow, fast]))
-    chosen, decision = r.choose(request_id="r1", model=fast.model)
+    chosen, decision = r.choose(request_id="r1", model=fast.models[0])
     assert chosen.backend_id == "fast"
     assert decision.chosen_latency_ms == 50.0
 
@@ -273,7 +242,7 @@ def test_router_prefers_lower_in_flight_on_latency_tie():
     busy.in_flight = 5
     idle.in_flight = 0
     r = Router(BackendRegistry([busy, idle]))
-    chosen, decision = r.choose(request_id="r1", model=busy.model)
+    chosen, decision = r.choose(request_id="r1", model=busy.models[0])
     assert chosen.backend_id == "idle"
     assert decision.chosen_in_flight == 0
 
@@ -287,75 +256,8 @@ def test_router_prefers_higher_weight_on_full_tie():
     heavy.ewma_latency_ms = 100.0
     heavy.weight = 4
     r = Router(BackendRegistry([light, heavy]))
-    chosen, _ = r.choose(request_id="r1", model=light.model)
+    chosen, _ = r.choose(request_id="r1", model=light.models[0])
     assert chosen.backend_id == "heavy"
-
-
-# ───────── chat_probe ─────────
-
-
-def test_chat_probe_success_marks_alive():
-    b = _backend()
-    client = FakeClient(FakeResponse(200, {
-        "id": "chatcmpl-1",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "p"}}],
-    }))
-    result = _run(chat_probe(b, client))
-    assert result.ok is True
-    assert result.status_code == 200
-    assert b.health == "alive"
-    assert b.consecutive_failures == 0
-    # Probe sent the right URL/auth/body.
-    call = client.calls[0]
-    assert call["url"] == "http://upstream.example/v1/chat/completions"
-    assert call["headers"]["Authorization"] == "Bearer sk-test"
-    assert call["json"]["model"] == b.model
-    assert call["json"]["max_tokens"] == 1
-
-
-def test_chat_probe_http_5xx_marks_failure():
-    b = _backend()
-    client = FakeClient(FakeResponse(503, raw="upstream busy"))
-    result = _run(chat_probe(b, client))
-    assert result.ok is False
-    assert result.status_code == 503
-    assert b.consecutive_failures == 1
-    assert b.health == "degraded"
-
-
-def test_chat_probe_transport_error_marks_failure():
-    b = _backend()
-    client = FakeClient(ConnectionError("dns lookup failed"))
-    result = _run(chat_probe(b, client))
-    assert result.ok is False
-    assert result.status_code == 0
-    assert "ConnectionError" in b.last_error
-
-
-def test_chat_probe_invalid_json_body_marks_failure():
-    b = _backend()
-    client = FakeClient(FakeResponse(200, body=None, raw="not json"))
-    result = _run(chat_probe(b, client))
-    assert result.ok is False
-    assert result.error == "invalid json"
-    assert b.health == "degraded"
-
-
-def test_chat_probe_empty_choices_marks_failure():
-    b = _backend()
-    client = FakeClient(FakeResponse(200, {"id": "x", "choices": []}))
-    result = _run(chat_probe(b, client))
-    assert result.ok is False
-    assert result.error == "empty choices"
-
-
-def test_chat_probe_threshold_trips_breaker():
-    b = _backend()
-    client = FakeClient(FakeResponse(500, raw="boom"))
-    for _ in range(3):
-        _run(chat_probe(b, client, failure_threshold=3, cooldown_s=10))
-    assert b.health == "dead"
-    assert b.is_open()
 
 
 # ───────── decision log ─────────

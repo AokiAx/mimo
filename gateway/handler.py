@@ -28,11 +28,22 @@ from gateway.core import (
     AdapterError,
     GatewayError,
     InternalEvent,
+    ModelNotFoundError,
     RequestContext,
     UpstreamError,
 )
 from gateway.routing import Router
 from gateway.transport import UpstreamTransport
+
+
+# Map the adapter name (``ctx.src_protocol``) to the short tag stored in
+# model-mapping ``protocols`` lists. OpenAI Chat / OpenAI Responses both
+# count as ``openai``; only Anthropic Messages counts as ``anthropic``.
+_PROTOCOL_TAG = {
+    "openai_chat": "openai",
+    "openai_responses": "openai",
+    "anthropic": "anthropic",
+}
 
 
 class DecisionLogWriter(Protocol):
@@ -99,6 +110,21 @@ class GatewayHandler:
         req = adapter.parse_request(body)
         ctx.model = req.model
         ctx.is_stream = req.stream
+
+        # Resolve the client-facing model name to a native upstream model via
+        # the model-mapping store. No match → ModelNotFoundError (404).
+        from gateway.model_groups_store import resolve as _resolve_mapping
+        proto_tag = _PROTOCOL_TAG.get(adapter.name, adapter.name)
+        native = _resolve_mapping(req.model, proto_tag)
+        if native is None:
+            raise ModelNotFoundError(
+                f"Model {req.model!r} is not configured for protocol {proto_tag!r}",
+                details={"requested_model": req.model, "protocol": proto_tag},
+            )
+        if native != req.model:
+            # Rewrite so the upstream sees the native name, not the client-facing alias.
+            req.model = native
+            ctx.model = native
 
         backend, decision = self._router.choose(
             request_id=ctx.request_id, model=req.model,
@@ -232,7 +258,25 @@ class GatewayHandler:
         backend.record_success()
 
         ies_events = self._codec.parse_upstream_stream(raw_iter)
-        client_bytes = adapter.serialize_response_stream(ies_events)
+        # Tee usage out of the IES stream while it flows to the serializer.
+        # Upstream usage typically arrives in the final MessageEnd event,
+        # so we only know real numbers after the stream finishes.
+        captured = {"prompt": 0, "completion": 0}
+
+        async def _tee_usage(src):
+            async for ev in src:
+                u = getattr(ev, "usage", None)
+                if u is not None:
+                    p = int(getattr(u, "input_tokens", 0)
+                            or getattr(u, "prompt_tokens", 0) or 0)
+                    c = int(getattr(u, "output_tokens", 0)
+                            or getattr(u, "completion_tokens", 0) or 0)
+                    if p or c:
+                        captured["prompt"] = p
+                        captured["completion"] = c
+                yield ev
+
+        client_bytes = adapter.serialize_response_stream(_tee_usage(ies_events))
         recorder = self._metrics
         bid = backend.backend_id
 
@@ -250,6 +294,8 @@ class GatewayHandler:
                         recorder.record(
                             ctx=ctx, backend_id=bid, status_code=status,
                             latency_ms=latency_ms,
+                            prompt_tokens=captured["prompt"],
+                            completion_tokens=captured["completion"],
                         )
                     except Exception:
                         pass
@@ -284,9 +330,9 @@ def _content_type_for(adapter: ProtocolAdapter, *, stream: bool) -> str:
 def _extract_token_counts(events) -> tuple[int, int]:
     """Pull (prompt_tokens, completion_tokens) from a non-stream IES event list.
 
-    Returns (0, 0) if the upstream didn't include usage. We probe lightly
-    so we don't depend on a particular event type — any object with a
-    ``usage`` attribute or dict matching the OpenAI shape works.
+    Returns (0, 0) if the upstream didn't include usage. The IES Usage
+    dataclass uses Anthropic-style naming (input_tokens/output_tokens) but
+    we also accept OpenAI-style dicts as a fallback.
     """
     for ev in events:
         usage = getattr(ev, "usage", None)
@@ -296,12 +342,14 @@ def _extract_token_counts(events) -> tuple[int, int]:
             try:
                 if isinstance(usage, dict):
                     return (
-                        int(usage.get("prompt_tokens") or 0),
-                        int(usage.get("completion_tokens") or 0),
+                        int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+                        int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
                     )
                 return (
-                    int(getattr(usage, "prompt_tokens", 0) or 0),
-                    int(getattr(usage, "completion_tokens", 0) or 0),
+                    int(getattr(usage, "input_tokens", 0)
+                        or getattr(usage, "prompt_tokens", 0) or 0),
+                    int(getattr(usage, "output_tokens", 0)
+                        or getattr(usage, "completion_tokens", 0) or 0),
                 )
             except (TypeError, ValueError):
                 pass

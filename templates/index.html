@@ -99,6 +99,22 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 .page{display:none}
 .page.active{display:block}
 
+/* Account cards */
+.acc-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}
+.acc-card.current{border-color:var(--accent);box-shadow:0 0 0 1px rgba(59,130,246,.2)}
+.acc-card .head{display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;gap:12px;flex-wrap:wrap}
+.acc-card .name{font-weight:700;font-size:1.02rem;color:var(--text)}
+.acc-card .badges{display:flex;gap:6px;flex-wrap:wrap}
+.acc-card .meta-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px 16px;font-size:0.82rem;color:var(--text2);margin-bottom:10px}
+.acc-card .meta-row .k{color:var(--text3);font-size:0.74rem;display:block;margin-bottom:1px}
+.acc-card .meta-row .v{color:var(--text);word-break:break-all}
+.acc-card .actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+
+/* Add-account tabs */
+.addtab{padding:6px 12px;font-size:0.82rem}
+.addtab.active{background:rgba(59,130,246,.1);color:var(--accent);border:1px solid var(--accent)}
+.addtab-pane{padding-top:6px}
+
 /* Tables */
 .data-table{width:100%;border-collapse:collapse;font-size:0.85rem}
 .data-table th{text-align:left;padding:8px 10px;color:var(--text2);border-bottom:1px solid var(--border);font-weight:500;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.5px}
@@ -141,21 +157,33 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 .status-bar-row .bar .fill.warn{background:var(--yellow)}
 .status-bar-row .count{width:64px;text-align:right;color:var(--text)}
 
-/* VPS page */
-.vps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
-.vps-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
-.vps-card .name{font-weight:600;color:var(--text);margin-bottom:4px}
-.vps-card .meta{font-size:0.75rem;color:var(--text3);margin-bottom:10px}
-.vps-card .row{display:flex;justify-content:space-between;align-items:center;font-size:0.82rem;margin-top:4px}
-.vps-card .row .label{color:var(--text2)}
+/* VPS page (probe-agent style) */
+.vps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.vps-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;position:relative}
+.vps-card .name{font-weight:600;color:var(--text);font-size:1rem}
+.vps-card .meta{font-size:0.72rem;color:var(--text3);margin-top:2px}
 .vps-card .pill{padding:2px 8px;border-radius:99px;font-size:0.7rem;font-weight:600}
 .vps-card .pill.up{background:#052e16;color:var(--green)}
 .vps-card .pill.down{background:#2d0a0a;color:var(--red)}
 .vps-card .pill.unknown{background:#2d1f05;color:var(--yellow)}
-.vps-spark{display:flex;gap:2px;margin-top:8px;height:18px}
-.vps-spark .pt{flex:1;background:#1a2233;border-radius:1px}
-.vps-spark .pt.ok{background:var(--green)}
-.vps-spark .pt.bad{background:var(--red)}
+.vps-bar-row{margin-top:10px}
+.vps-bar-label{display:flex;justify-content:space-between;font-size:0.72rem;color:var(--text2);margin-bottom:3px}
+.vps-bar-label .v{font-family:ui-monospace,monospace;color:var(--text);font-weight:600}
+.vps-bar{width:100%;height:6px;background:#0d1b2a;border-radius:3px;overflow:hidden}
+.vps-bar .fill{height:100%;border-radius:3px;transition:width 0.4s ease}
+.vps-bar .fill.lo{background:var(--green)}
+.vps-bar .fill.mid{background:var(--yellow)}
+.vps-bar .fill.hi{background:var(--red)}
+.vps-net{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:0.78rem}
+.vps-net .lbl{color:var(--text3);font-size:0.7rem}
+.vps-net .val{font-family:ui-monospace,monospace;font-weight:600}
+.vps-net .rx{color:var(--green)}
+.vps-net .tx{color:var(--yellow)}
+.vps-foot{margin-top:8px;font-size:0.7rem;color:var(--text3);display:flex;justify-content:space-between;align-items:center}
+.vps-actions{display:flex;gap:6px}
+.vps-card .icon-btn{background:none;border:1px solid var(--border);color:var(--text3);border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.7rem}
+.vps-card .icon-btn:hover{color:var(--text);border-color:var(--text3)}
+.install-block{background:#0d1b2a;border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:10px;font-family:ui-monospace,monospace;font-size:0.72rem;color:var(--text);white-space:pre-wrap;word-break:break-all}
 
 /* Responsive */
 @media(max-width:768px){
@@ -182,19 +210,13 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <span class="icon">📊</span><span>概览</span>
     </div>
     <div class="nav-item" data-page="accounts" onclick="switchPage('accounts')">
-      <span class="icon">👤</span><span>账号</span>
-    </div>
-    <div class="nav-item" data-page="claw" onclick="switchPage('claw')">
-      <span class="icon">🦀</span><span>Claw</span>
+      <span class="icon">👤</span><span>账号 & Claw</span>
     </div>
     <div class="nav-item" data-page="chat" onclick="switchPage('chat')">
       <span class="icon">💬</span><span>Claw 对话</span>
     </div>
     <div class="nav-item" data-page="deploy" onclick="switchPage('deploy')">
       <span class="icon">🚀</span><span>自动部署</span>
-    </div>
-    <div class="nav-item" data-page="cookies" onclick="switchPage('cookies')">
-      <span class="icon">🍪</span><span>Cookie</span>
     </div>
   </div>
 
@@ -208,6 +230,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     </div>
     <div class="nav-item" data-page="backends" onclick="switchPage('backends')">
       <span class="icon">🖥️</span><span>后端</span>
+    </div>
+    <div class="nav-item" data-page="mappings" onclick="switchPage('mappings')">
+      <span class="icon">🔗</span><span>模型映射</span>
     </div>
     <div class="nav-item" data-page="metrics" onclick="switchPage('metrics')">
       <span class="icon">📈</span><span>指标</span>
@@ -226,6 +251,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
   <div class="topbar">
     <div class="topbar-title" id="pageTitle">概览</div>
     <div class="topbar-right">
+      <span id="curAccountLabel" style="color:var(--text);font-size:0.82rem">
+        <span style="color:var(--text3)">当前账号：</span><span id="curAccountName">--</span>
+      </span>
       <span id="gwIndicator" title="网关"><span class="indicator gray" id="indGw"></span> 网关</span>
       <span id="clock">--:--:--</span>
     </div>
@@ -236,69 +264,110 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <!-- ════ Dashboard ════ -->
     <div class="page active" id="page-dashboard">
       <div class="grid">
-        <div class="card">
-          <h2><span class="indicator gray" id="indClaw"></span> MiMo Claw</h2>
-          <div id="dashClaw"><div class="stat-row"><span class="label">状态</span><span class="value">--</span></div></div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashAccCount">--</div>
+          <div class="metric-label">账号数</div>
         </div>
-        <div class="card">
-          <h2><span class="indicator gray" id="indCookies"></span> Cookie</h2>
-          <div id="dashCookies"><div class="stat-row"><span class="label">状态</span><span class="value">--</span></div></div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashClawHealthy">--</div>
+          <div class="metric-label">Claw 在线</div>
         </div>
-        <div class="card">
-          <h2><span class="indicator gray" id="indGwCard"></span> API 网关</h2>
-          <div id="dashGateway"><div class="stat-row"><span class="label">状态</span><span class="value">--</span></div></div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashCookieValid">--</div>
+          <div class="metric-label">Cookie 有效</div>
         </div>
-        <div class="card">
-          <h2>📊 流量</h2>
-          <div id="dashTraffic"><div class="stat-row"><span class="label">请求数</span><span class="value">--</span></div></div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashGwBackends">--</div>
+          <div class="metric-label">网关后端 (健康/总)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashGwReq">--</div>
+          <div class="metric-label">网关总请求</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashGwQps">--</div>
+          <div class="metric-label">QPS</div>
         </div>
       </div>
       <div class="section">
-        <h2>快捷操作</h2>
+        <h2>账号概览</h2>
+        <table class="data-table">
+          <thead><tr><th>账号</th><th>用户</th><th>Cookie</th><th>Claw</th><th>过期</th><th>当前</th></tr></thead>
+          <tbody id="dashAccountsBody">
+            <tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
+          </tbody>
+        </table>
         <div class="btn-group">
-          <button class="btn btn-success" onclick="clawCreate()">创建 Claw</button>
-          <button class="btn btn-primary" onclick="clawCheck()">刷新 Claw</button>
+          <button class="btn btn-primary" onclick="refreshDashboard()">刷新</button>
+          <button class="btn btn-ghost" onclick="switchPage('accounts')">前往账号管理</button>
           <button class="btn btn-ghost" onclick="switchPage('chat')">打开对话</button>
-          <button class="btn btn-ghost" onclick="switchPage('deploy')">自动部署</button>
         </div>
       </div>
     </div>
 
-    <!-- ════ Accounts ════ -->
+    <!-- ════ Accounts (unified Account + Claw + Cookie + SSO) ════ -->
     <div class="page" id="page-accounts">
       <div class="section">
-        <h2>账号列表</h2>
-        <div id="accountList" style="margin-bottom:12px"></div>
-        <div class="btn-group">
-          <button class="btn btn-primary" onclick="refreshAccounts()">刷新</button>
-        </div>
-      </div>
-      <div class="section">
-        <h2>添加账号</h2>
-        <input type="text" id="newAccountName" placeholder="账号名称" style="margin-bottom:8px">
-        <textarea id="newAccountCookies" placeholder="粘贴 Cookie JSON..." rows="3" style="width:100%;font-family:monospace;font-size:0.82rem"></textarea>
-        <div class="btn-group">
-          <button class="btn btn-success" onclick="addAccount()">添加</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- ════ Claw ════ -->
-    <div class="page" id="page-claw">
-      <div class="grid">
-        <div class="section">
-          <h2>Claw 状态</h2>
-          <div id="clawDetail" style="margin-bottom:10px"></div>
-          <div class="btn-group">
-            <button class="btn btn-success" onclick="clawCreate()">创建</button>
-            <button class="btn btn-danger" onclick="clawDestroy()">销毁</button>
-            <button class="btn btn-primary" onclick="clawCheck()">刷新</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h2 style="margin:0">账号列表</h2>
+          <div class="btn-group" style="margin:0">
+            <button class="btn btn-primary" onclick="refreshAccountsFull()">全部刷新</button>
+            <button class="btn btn-ghost" onclick="toggleAddPanel()">+ 添加账号</button>
           </div>
-          <div id="clawExpire" class="meta"></div>
         </div>
-        <div class="section">
-          <h2>Claw 详情</h2>
-          <div id="clawFullInfo" style="font-size:0.88rem;color:var(--text2)">点击上方按钮查看详情。</div>
+        <div id="accountCards"></div>
+      </div>
+
+      <!-- Add account panel (hidden by default) -->
+      <div class="section" id="addAccountPanel" style="display:none">
+        <h2>添加账号</h2>
+        <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:8px">
+          <button class="btn btn-ghost addtab active" data-tab="sso" onclick="switchAddTab('sso')">小米账号登录</button>
+          <button class="btn btn-ghost addtab" data-tab="cookie" onclick="switchAddTab('cookie')">Cookie 字符串</button>
+          <button class="btn btn-ghost addtab" data-tab="json" onclick="switchAddTab('json')">Cookie JSON</button>
+        </div>
+
+        <!-- Tab: SSO login -->
+        <div id="addtab-sso" class="addtab-pane">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
+            <input type="text" id="ssoFilename" placeholder="账号文件名（自动生成或自定义）">
+            <input type="text" id="ssoEmail" placeholder="小米账号 / 邮箱" autocomplete="username">
+          </div>
+          <input type="password" id="ssoPassword" placeholder="密码" autocomplete="current-password" style="margin-bottom:8px">
+          <div class="btn-group">
+            <button class="btn btn-success" id="ssoLoginBtn" onclick="ssoLogin()">登录</button>
+            <span id="ssoStatus" style="font-size:0.82rem;color:var(--text2);align-self:center"></span>
+          </div>
+
+          <!-- 2FA code -->
+          <div id="ssoCodePanel" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+            <div style="font-size:0.85rem;color:var(--text2);margin-bottom:8px" id="ssoCodeHint">需要验证码</div>
+            <div style="display:flex;gap:8px">
+              <input type="text" id="ssoCode" placeholder="验证码" style="max-width:200px">
+              <button class="btn btn-success" id="ssoCodeBtn" onclick="ssoSubmitCode()">提交</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Cookie string -->
+        <div id="addtab-cookie" class="addtab-pane" style="display:none">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
+            <input type="text" id="cookieAccountName" placeholder="账号名称">
+            <input type="text" id="cookieAccountEmail" placeholder="邮箱（可选）">
+          </div>
+          <textarea id="cookieAccountStr" rows="3" placeholder="粘贴 cookie 字符串（必须含 xiaomichatbot_ph）" style="font-family:monospace;font-size:0.82rem"></textarea>
+          <div class="btn-group">
+            <button class="btn btn-success" onclick="addAccountCookieString()">添加</button>
+          </div>
+        </div>
+
+        <!-- Tab: Cookie JSON -->
+        <div id="addtab-json" class="addtab-pane" style="display:none">
+          <input type="text" id="jsonAccountName" placeholder="账号名称" style="margin-bottom:8px">
+          <textarea id="jsonAccountCookies" placeholder="粘贴 Cookie JSON 数组..." rows="4" style="font-family:monospace;font-size:0.82rem"></textarea>
+          <div class="btn-group">
+            <button class="btn btn-success" onclick="addAccountJson()">添加</button>
+          </div>
         </div>
       </div>
     </div>
@@ -306,7 +375,13 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <!-- ════ Chat ════ -->
     <div class="page" id="page-chat">
       <div class="section">
-        <h2>Claw 对话</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <h2 style="margin:0">Claw 对话</h2>
+          <div style="font-size:0.82rem;color:var(--text2)">
+            账号：<b id="chatAccName" style="color:var(--accent)">--</b>
+            · Claw：<span id="chatClawState">--</span>
+          </div>
+        </div>
         <div class="chat-box">
           <textarea id="clawInput" placeholder="向 Claw 发送消息...（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
           <button class="btn btn-primary" id="clawBtn" onclick="clawSend()">发送</button>
@@ -337,18 +412,6 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <button class="btn btn-ghost" onclick="document.getElementById('historyPanel').style.display='none'" style="padding:4px 10px;font-size:0.75rem">关闭</button>
         </div>
         <div id="historyContent" style="max-height:400px;overflow-y:auto"></div>
-      </div>
-    </div>
-
-    <!-- ════ Cookies ════ -->
-    <div class="page" id="page-cookies">
-      <div class="section">
-        <h2>Cookie 状态</h2>
-        <div id="cookieDetail" style="margin-bottom:10px"></div>
-        <div class="btn-group">
-          <button class="btn btn-primary" onclick="cookieRefresh()">刷新 Cookie</button>
-          <button class="btn btn-primary" onclick="cookieCheck()">检查状态</button>
-        </div>
       </div>
     </div>
 
@@ -386,13 +449,71 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 
     <!-- ════ Backends ════ -->
     <div class="page" id="page-backends">
-      <div class="section">
-        <h2>后端服务器</h2>
-        <table class="data-table" id="backendsTable">
-          <thead><tr><th>ID</th><th>URL</th><th>状态</th><th>权重</th><th>延迟</th><th>熔断</th><th>请求数</th><th>操作</th></tr></thead>
-          <tbody id="backendsBody"><tr><td colspan="8" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
-        </table>
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <h2 style="margin:0">后端服务器</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="backendToggleAdd()">添加后端</button>
+          <button class="btn btn-ghost" onclick="backendReload()">重载</button>
+        </div>
       </div>
+
+      <!-- Add/Edit panel -->
+      <div class="section" id="backendAddPanel" style="display:none">
+        <h3 id="backendFormTitle">添加后端</h3>
+        <input type="hidden" id="backendEditId" value="">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:700px">
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">名称 *</label>
+            <input id="beName" placeholder="e.g. mimo-claw-1" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">Base URL *</label>
+            <input id="beUrl" placeholder="http://127.0.0.1:8088" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">API Key</label>
+            <input id="beKey" placeholder="(可选，留空使用 secrets.upstream_api_key)" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">权重</label>
+            <input id="beWeight" type="number" value="1" min="1" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+        </div>
+        <div style="margin-top:12px;max-width:700px">
+          <label style="font-size:.8rem;color:var(--text2)">Models 服务的原生模型 * <span style="color:var(--text3);font-weight:normal">（一个 Claw 通常服务 9 个）</span></label>
+          <div id="beModelsChips" style="min-height:42px;padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px">
+            <input id="beModelsInput" type="text" placeholder="输入模型名后按 Enter 或逗号" style="flex:1;min-width:180px;border:none;background:transparent;color:var(--text);font-size:.85rem;outline:none">
+          </div>
+          <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()">一键填充 9 个 MiMo 原生模型</button>
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beClearModels()">清空</button>
+          </div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button class="btn btn-primary" onclick="backendSave()">保存</button>
+          <button class="btn btn-ghost" onclick="backendToggleAdd()">取消</button>
+        </div>
+      </div>
+
+      <table class="data-table" id="backendsTable" style="margin-top:10px">
+        <thead><tr><th>名称</th><th>Models</th><th>URL</th><th>状态</th><th>延迟</th><th>请求数</th><th>操作</th></tr></thead>
+        <tbody id="backendsBody"><tr><td colspan="7" style="color:var(--text3);text-align:center;padding:20px">加载中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- ════ Model Mappings ════ -->
+    <div class="page" id="page-mappings">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <h2 style="margin:0">模型映射</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="mgNewGroup()">新建分组</button>
+          <button class="btn btn-ghost" onclick="mgImportBackends()">从后端导入</button>
+        </div>
+      </div>
+      <div id="mgInfo" style="color:var(--text3);font-size:.82rem;padding:6px 0 12px 0">
+        客户端用 <code>exposed_name</code> 调 <code>/v1/chat/completions</code> 或 <code>/v1/messages</code>；网关查到映射后用 <code>native_model</code> 转发上游。无匹配返回 <code>model_not_found</code>。
+      </div>
+      <div id="mgGroupsContainer"></div>
     </div>
 
     <!-- ════ Metrics ════ -->
@@ -458,7 +579,19 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <h2 style="margin:0">节点状态</h2>
           <div id="vpsSummary" style="color:var(--text3);font-size:0.8rem;margin-top:4px">加载中…</div>
         </div>
-        <button class="btn btn-primary" onclick="refreshVpsForce()">立即检测</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="vpsToggleAdd()">添加节点</button>
+          <button class="btn btn-primary" onclick="refreshVps()">刷新</button>
+        </div>
+      </div>
+      <div class="section" id="vpsAddPanel" style="display:none">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">新增 VPS 节点</h3>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <input type="text" id="vpsNewName" placeholder="节点名（如 vps-tokyo）"
+                 style="flex:1;padding:8px;background:#0d1b2a;border:1px solid var(--border);border-radius:6px;color:var(--text)">
+          <button class="btn btn-primary" onclick="vpsAddNode()">创建并生成 token</button>
+        </div>
+        <div id="vpsAddResult" style="font-size:0.78rem;color:var(--text2)"></div>
       </div>
       <div class="vps-grid" id="vpsGrid"></div>
     </div>
@@ -548,9 +681,11 @@ function formatUptime(sec) {
 // Page Navigation
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
-  dashboard: '概览', accounts: '账号管理', claw: 'Claw 控制',
-  chat: 'Claw 对话', deploy: '自动部署', cookies: 'Cookie 管理',
-  gateway: '网关状态', backends: '后端服务器', metrics: '指标与日志',
+  dashboard: '概览', accounts: '账号 & Claw',
+  chat: 'Claw 对话', deploy: '自动部署',
+  gateway: '网关状态', backends: '后端服务器',
+  mappings: '模型映射',
+  metrics: '指标与日志',
   vps: 'VPS 监控', 'api-docs': 'API 文档'
 };
 
@@ -562,172 +697,449 @@ function switchPage(name) {
   var nav = document.querySelector('.nav-item[data-page="' + name + '"]');
   if (nav) nav.classList.add('active');
   document.getElementById('pageTitle').textContent = PAGE_TITLES[name] || name;
-  // Lazy-load data for gateway pages
+  // Persist current page in URL hash so refresh stays put
+  if (location.hash !== '#' + name) {
+    history.replaceState(null, '', '#' + name);
+  }
+  if (name === 'dashboard') refreshDashboard();
+  if (name === 'accounts') refreshAccountsFull();
+  if (name === 'chat') refreshChatHeader();
+  if (name === 'deploy') refreshAccounts();
   if (name === 'gateway') refreshGateway();
   if (name === 'backends') refreshBackends();
+  if (name === 'mappings') refreshMappings();
   if (name === 'metrics') refreshMetrics();
   if (name === 'vps') refreshVps();
 }
 
-// ══════════════════════════════════════════════════════
-// Dashboard
-// ══════════════════════════════════════════════════════
-function refreshStatus() {
-  api('GET', '/api/status').then(function(d) {
-    // Claw
-    setInd('indClaw', d.claw.status === 'ok' ? 'ok' : 'error');
-    document.getElementById('dashClaw').innerHTML =
-      '<div class="stat-row"><span class="label">状态</span><span class="value">' + statusBadge(d.claw.status) + '</span></div>' +
-      (d.claw.raw_status ? '<div class="stat-row"><span class="label">API</span><span class="value">' + d.claw.raw_status + '</span></div>' : '') +
-      (d.claw.message ? '<div class="stat-row"><span class="label">信息</span><span class="value">' + d.claw.message + '</span></div>' : '');
-    // Cookies
-    setInd('indCookies', d.cookies.status === 'ok' ? 'ok' : 'error');
-    document.getElementById('dashCookies').innerHTML =
-      '<div class="stat-row"><span class="label">状态</span><span class="value">' + statusBadge(d.cookies.status) + '</span></div>' +
-      '<div class="stat-row"><span class="label">数量</span><span class="value">' + d.cookies.count + '</span></div>' +
-      '<div class="stat-row"><span class="label">PH</span><span class="value">' + (d.cookies.has_ph ? '是' : '否') + '</span></div>';
-  });
-  // Gateway overview (non-blocking)
-  api('GET', '/api/gateway/status').then(function(d) {
-    if (d.error) return;
-    setInd('indGw', 'ok'); setInd('indGwCard', 'ok');
-    document.getElementById('gwBadge').textContent = '正常';
-    document.getElementById('gwBadge').className = 'badge green';
-    document.getElementById('dashGateway').innerHTML =
-      '<div class="stat-row"><span class="label">状态</span><span class="value">运行中</span></div>' +
-      '<div class="stat-row"><span class="label">运行时长</span><span class="value">' + formatUptime(d.uptime || 0) + '</span></div>' +
-      '<div class="stat-row"><span class="label">后端</span><span class="value">' + (d.backends_total || 0) + ' (' + (d.backends_healthy || 0) + ' 健康)</span></div>';
-    document.getElementById('dashTraffic').innerHTML =
-      '<div class="stat-row"><span class="label">总数</span><span class="value">' + (d.total_requests || 0) + '</span></div>' +
-      '<div class="stat-row"><span class="label">QPS</span><span class="value">' + (d.qps || 0) + '</span></div>' +
-      '<div class="stat-row"><span class="label">平均延迟</span><span class="value">' + (d.avg_latency_ms || '--') + 'ms</span></div>';
-  }).catch(function() {
-    setInd('indGw', 'gray'); setInd('indGwCard', 'gray');
-    document.getElementById('gwBadge').textContent = '--';
-    document.getElementById('gwBadge').className = 'badge';
-    document.getElementById('dashGateway').innerHTML = '<div class="stat-row"><span class="label">状态</span><span class="value">未配置</span></div>';
-    document.getElementById('dashTraffic').innerHTML = '<div class="stat-row"><span class="label">状态</span><span class="value">--</span></div>';
-  });
+function pageFromHash() {
+  var h = (location.hash || '').replace(/^#/, '');
+  return PAGE_TITLES[h] ? h : 'dashboard';
 }
 
+window.addEventListener('hashchange', function() { switchPage(pageFromHash()); });
+
 // ══════════════════════════════════════════════════════
-// Accounts
+// Account / Claw / Cookie unified state
 // ══════════════════════════════════════════════════════
-var accounts = [];
+var accounts = [];           // raw list from /api/accounts
+var accountSummaries = {};   // filename → summary blob (cookie+claw status)
 var currentAccount = null;
 
-function refreshAccounts() {
-  api('GET', '/api/accounts').then(function(d) {
+function setCurrentAccountLabel(name) {
+  document.getElementById('curAccountName').textContent = name || '--';
+}
+
+function fetchAccounts() {
+  return api('GET', '/api/accounts').then(function(d) {
     accounts = d.accounts || [];
     currentAccount = null;
     for (var i = 0; i < accounts.length; i++) {
       if (accounts[i].is_current) { currentAccount = accounts[i]; break; }
     }
-    renderAccounts();
-    if (currentAccount) {
-      document.getElementById('topbar-right') && (document.getElementById('clock').title = 'Current: ' + (currentAccount.name || ''));
-    }
-    if (typeof loadAutoDeployConfig === 'function') loadAutoDeployConfig();
+    setCurrentAccountLabel(currentAccount ? (currentAccount.name || currentAccount.filename) : null);
+    window.accounts = accounts; // expose for auto-deploy
+    return accounts;
   });
 }
 
-function renderAccounts() {
-  var el = document.getElementById('accountList');
+function fetchAllSummaries(perAccount) {
+  // Run summaries in parallel for all accounts. If perAccount(filename, summary)
+  // is supplied, it fires as each request resolves — used for progressive UI.
+  if (accounts.length === 0) return Promise.resolve({});
+  var jobs = accounts.map(function(a) {
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function() { ctrl.abort(); }, 8000) : null;
+    var opts = ctrl ? { signal: ctrl.signal } : {};
+    return fetch('/api/account/' + encodeURIComponent(a.filename) + '/summary', opts)
+      .then(function(r) { return r.json(); })
+      .then(function(s) {
+        if (timer) clearTimeout(timer);
+        accountSummaries[a.filename] = s;
+        if (perAccount) perAccount(a.filename, s);
+        return s;
+      })
+      .catch(function() {
+        if (timer) clearTimeout(timer);
+        if (perAccount) perAccount(a.filename, null);
+        return null;
+      });
+  });
+  return Promise.all(jobs);
+}
+
+// ══════════════════════════════════════════════════════
+// Dashboard
+// ══════════════════════════════════════════════════════
+function _dashCkBadge(s) {
+  return s && s.cookie_valid
+    ? '<span class="status-text ok">有效</span>'
+    : '<span class="status-text error">失效</span>';
+}
+function _dashClawBadge(s) {
+  if (!s) return '<span class="status-text error">未知</span>';
+  if (s.claw_status === 'AVAILABLE') return '<span class="status-text ok">在线</span>';
+  if (s.claw_status === 'DESTROYED') return '<span class="status-text warning">销毁</span>';
+  return '<span class="status-text error">' + (s.claw_status || '未知') + '</span>';
+}
+function _dashRetallyCounters() {
+  var clawHealthy = 0, cookieValid = 0;
+  for (var i = 0; i < accounts.length; i++) {
+    var s = accountSummaries[accounts[i].filename];
+    if (s) {
+      if (s.claw_status === 'AVAILABLE') clawHealthy++;
+      if (s.cookie_valid) cookieValid++;
+    }
+  }
+  document.getElementById('dashClawHealthy').textContent = clawHealthy + ' / ' + accounts.length;
+  document.getElementById('dashCookieValid').textContent = cookieValid + ' / ' + accounts.length;
+}
+
+function refreshDashboard() {
+  fetchAccounts().then(function() {
+    document.getElementById('dashAccCount').textContent = accounts.length;
+    // Render skeleton rows immediately so the table doesn't sit blank.
+    var rows = '';
+    for (var i = 0; i < accounts.length; i++) {
+      var a = accounts[i];
+      var rowId = 'dashRow_' + encodeURIComponent(a.filename).replace(/%/g, '_');
+      var cached = accountSummaries[a.filename];
+      rows += '<tr id="' + rowId + '">' +
+        '<td><strong>' + escapeHtml(a.name || a.filename) + '</strong></td>' +
+        '<td class="cellUser">' + escapeHtml((cached && cached.user_name) || a.user_name || '--') +
+            '<div style="font-size:0.7rem;color:var(--text3)">' + escapeHtml((cached && cached.user_id) || a.user_id || '') + '</div></td>' +
+        '<td class="cellCk">' + (cached ? _dashCkBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
+        '<td class="cellClaw">' + (cached ? _dashClawBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
+        '<td class="cellExp" style="font-size:0.78rem;color:var(--text2)">' + escapeHtml((cached && cached.claw_expire) || '--') + '</td>' +
+        '<td>' + (a.is_current ? '<span class="status-text ok">当前</span>' : '') + '</td>' +
+        '</tr>';
+    }
+    if (rows === '') {
+      rows = '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">暂无账号，前往「账号 & Claw」添加</td></tr>';
+    }
+    document.getElementById('dashAccountsBody').innerHTML = rows;
+    _dashRetallyCounters();
+
+    // Progressive update: each summary patches its own row as it arrives.
+    fetchAllSummaries(function(filename, s) {
+      var rowId = 'dashRow_' + encodeURIComponent(filename).replace(/%/g, '_');
+      var row = document.getElementById(rowId);
+      if (!row) return;
+      var ckCell = row.querySelector('.cellCk');
+      var clawCell = row.querySelector('.cellClaw');
+      var expCell = row.querySelector('.cellExp');
+      var userCell = row.querySelector('.cellUser');
+      if (ckCell) ckCell.innerHTML = _dashCkBadge(s);
+      if (clawCell) clawCell.innerHTML = _dashClawBadge(s);
+      if (expCell) expCell.textContent = (s && s.claw_expire) || '--';
+      if (userCell && s) {
+        userCell.innerHTML = escapeHtml(s.user_name || '--') +
+          '<div style="font-size:0.7rem;color:var(--text3)">' + escapeHtml(s.user_id || '') + '</div>';
+      }
+      _dashRetallyCounters();
+    });
+  });
+
+  api('GET', '/api/gateway/status').then(function(d) {
+    if (d.error) {
+      setInd('indGw', 'gray');
+      document.getElementById('dashGwBackends').textContent = '--';
+      document.getElementById('dashGwReq').textContent = '--';
+      document.getElementById('dashGwQps').textContent = '--';
+      return;
+    }
+    setInd('indGw', 'ok');
+    document.getElementById('gwBadge').textContent = '正常';
+    document.getElementById('gwBadge').className = 'badge green';
+    document.getElementById('dashGwBackends').textContent = (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0);
+    document.getElementById('dashGwReq').textContent = d.total_requests || 0;
+    document.getElementById('dashGwQps').textContent = d.qps || 0;
+  }).catch(function() {
+    setInd('indGw', 'gray');
+  });
+}
+
+// ══════════════════════════════════════════════════════
+// Accounts page (unified card list)
+// ══════════════════════════════════════════════════════
+function refreshAccountsFull() {
+  fetchAccounts().then(function() {
+    renderAccountCards();
+    fetchAllSummaries().then(renderAccountCards);
+  });
+}
+
+function renderAccountCards() {
+  var el = document.getElementById('accountCards');
   if (accounts.length === 0) {
-    el.innerHTML = '<div style="color:var(--text3);font-size:0.85rem">暂无账号。</div>';
+    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">暂无账号。点击右上角 “+ 添加账号” 开始。</div>';
     return;
   }
-  var html = '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+  var html = '';
   for (var i = 0; i < accounts.length; i++) {
     var a = accounts[i];
-    var active = a.is_current;
-    var bg = active ? 'rgba(59,130,246,.15)' : 'var(--bg)';
-    var border = active ? 'var(--accent)' : 'var(--border)';
-    html += '<div style="background:' + bg + ';border:1px solid ' + border + ';border-radius:8px;padding:12px 16px;min-width:180px;cursor:pointer" onclick="switchAccount(\'' + a.filename + '\')">';
-    html += '<div style="font-weight:600;font-size:0.9rem">' + escapeHtml(a.name || a.filename) + '</div>';
-    html += '<div style="font-size:0.75rem;color:var(--text2)">' + (a.user_id || '--') + '</div>';
-    html += '<div style="font-size:0.72rem;color:var(--text3)">' + (active ? '当前' : '点击切换') + '</div>';
+    var s = accountSummaries[a.filename] || {};
+    var ckBadge = s.cookie_valid === true
+      ? '<span class="status-text ok">Cookie 有效</span>'
+      : (s.cookie_valid === false
+          ? '<span class="status-text error">Cookie 失效</span>'
+          : '<span class="status-text warning">Cookie 待检</span>');
+    var clawBadge = s.claw_status === 'AVAILABLE'
+      ? '<span class="status-text ok">Claw 在线</span>'
+      : (s.claw_status === 'DESTROYED'
+          ? '<span class="status-text warning">Claw 已销毁</span>'
+          : (s.claw_status
+              ? '<span class="status-text error">Claw ' + escapeHtml(s.claw_status) + '</span>'
+              : '<span class="status-text warning">Claw 待检</span>'));
+    var curBadge = a.is_current ? '<span class="status-text ok">当前账号</span>' : '';
+    var fn = a.filename;
+    html += '<div class="acc-card' + (a.is_current ? ' current' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
+    html += '<div class="head">';
+    html += '<div><div class="name">' + escapeHtml(a.name || fn) + '</div>';
+    html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:2px">' + escapeHtml(fn) + '</div></div>';
+    html += '<div class="badges">' + curBadge + ckBadge + clawBadge + '</div>';
+    html += '</div>';
+    html += '<div class="meta-row">';
+    html += '<div><span class="k">用户名</span><span class="v">' + escapeHtml(s.user_name || a.user_name || '--') + '</span></div>';
+    html += '<div><span class="k">User ID</span><span class="v">' + escapeHtml(s.user_id || a.user_id || '--') + '</span></div>';
+    html += '<div><span class="k">邮箱</span><span class="v">' + escapeHtml(a.email || '--') + '</span></div>';
+    html += '<div><span class="k">Cookie 数</span><span class="v">' + (s.cookie_count || 0) + '</span></div>';
+    html += '<div><span class="k">Claw 过期</span><span class="v">' + escapeHtml(s.claw_expire || '--') + '</span></div>';
+    html += '<div><span class="k">添加时间</span><span class="v" style="font-size:0.76rem">' + escapeHtml((a.added_at || '').replace('T',' ').slice(0,19)) + '</span></div>';
+    html += '</div>';
+    html += '<div class="actions">';
+    if (!a.is_current) html += '<button class="btn btn-primary" onclick="accSwitch(\'' + fn + '\')">切换为当前</button>';
+    html += '<button class="btn btn-success" onclick="accClawCreate(\'' + fn + '\')">创建 Claw</button>';
+    html += '<button class="btn btn-primary" onclick="accClawRefresh(\'' + fn + '\')">重建 Claw</button>';
+    html += '<button class="btn btn-danger" onclick="accClawDestroy(\'' + fn + '\')">销毁 Claw</button>';
+    html += '<button class="btn btn-ghost" onclick="accCheck(\'' + fn + '\')">检查状态</button>';
+    html += '<button class="btn btn-ghost" onclick="accRelogin(\'' + fn + '\',\'' + escapeHtml(a.email || '') + '\')">重新登录</button>';
+    html += '<button class="btn btn-danger" onclick="accDelete(\'' + fn + '\')">删除</button>';
+    html += '</div>';
     html += '</div>';
   }
-  html += '</div>';
   el.innerHTML = html;
 }
 
-function switchAccount(filename) {
-  if (currentAccount && currentAccount.filename === filename) return;
+function accSwitch(filename) {
   api('POST', '/api/accounts/switch', {name: filename}).then(function(d) {
     if (d.success) {
       toast('已切换至：' + (d.name || filename), 'success');
-      refreshAccounts(); refreshStatus(); clawCheck(); cookieCheck(); renderClawChat();
-    } else {
-      toast('切换失败：' + (d.error || ''), 'error');
-    }
+      refreshAccountsFull(); refreshChatHeader();
+    } else { toast('切换失败：' + (d.error || ''), 'error'); }
   });
 }
 
-function addAccount() {
-  var name = document.getElementById('newAccountName').value.trim();
-  var cookiesStr = document.getElementById('newAccountCookies').value.trim();
+function accCheck(filename) {
+  toast('正在检查 ' + filename + '...', '');
+  api('GET', '/api/account/' + encodeURIComponent(filename) + '/summary').then(function(s) {
+    accountSummaries[filename] = s;
+    renderAccountCards();
+    toast('已更新：' + filename, 'success');
+  });
+}
+
+function accClawCreate(filename) {
+  toast('创建 Claw 中...', '');
+  api('POST', '/api/account/' + encodeURIComponent(filename) + '/claw/create').then(function(d) {
+    toast(d.success ? 'Claw 已创建' : '失败：' + JSON.stringify(d.data || d.error), d.success ? 'success' : 'error');
+    setTimeout(function() { accCheck(filename); }, 800);
+  });
+}
+
+function accClawDestroy(filename) {
+  if (!confirm('确定销毁 ' + filename + ' 的 Claw？')) return;
+  api('POST', '/api/account/' + encodeURIComponent(filename) + '/claw/destroy').then(function(d) {
+    toast(d.success ? 'Claw 已销毁' : '失败', d.success ? 'success' : 'error');
+    setTimeout(function() { accCheck(filename); }, 600);
+  });
+}
+
+function accClawRefresh(filename) {
+  toast('重建 Claw 中（约 2-3 秒）...', '');
+  api('POST', '/api/account/' + encodeURIComponent(filename) + '/claw/refresh').then(function(d) {
+    toast(d.success ? 'Claw 已重建' : '失败：' + JSON.stringify(d.data || d.error), d.success ? 'success' : 'error');
+    setTimeout(function() { accCheck(filename); }, 800);
+  });
+}
+
+function accRelogin(filename, email) {
+  document.getElementById('addAccountPanel').style.display = '';
+  switchAddTab('sso');
+  document.getElementById('ssoFilename').value = filename;
+  if (email) document.getElementById('ssoEmail').value = email;
+  document.getElementById('ssoPassword').focus();
+  toast('请输入密码以重新登录 ' + filename, '');
+}
+
+function accDelete(filename) {
+  if (!confirm('确定删除账号 ' + filename + '？此操作不可撤销。')) return;
+  api('POST', '/api/accounts/delete', {name: filename}).then(function(d) {
+    if (d.success) { toast('已删除', 'success'); refreshAccountsFull(); }
+    else toast('失败：' + (d.error || ''), 'error');
+  });
+}
+
+// ══════════════════════════════════════════════════════
+// Add account: tabs + 3 flows
+// ══════════════════════════════════════════════════════
+function toggleAddPanel() {
+  var p = document.getElementById('addAccountPanel');
+  p.style.display = p.style.display === 'none' ? '' : 'none';
+}
+
+function switchAddTab(tab) {
+  document.querySelectorAll('.addtab').forEach(function(b) { b.classList.remove('active'); });
+  document.querySelectorAll('.addtab-pane').forEach(function(p) { p.style.display = 'none'; });
+  var btn = document.querySelector('.addtab[data-tab="' + tab + '"]');
+  if (btn) btn.classList.add('active');
+  var pane = document.getElementById('addtab-' + tab);
+  if (pane) pane.style.display = '';
+}
+
+// SSO state
+var ssoSessionId = null;
+var ssoActiveFilename = null;
+var ssoActiveEmail = null;
+
+function ssoLogin() {
+  var fname = document.getElementById('ssoFilename').value.trim();
+  var email = document.getElementById('ssoEmail').value.trim();
+  var pwd = document.getElementById('ssoPassword').value;
+  if (!email || !pwd) { toast('请输入账号和密码', 'error'); return; }
+  if (!fname) {
+    fname = email.replace(/[^a-zA-Z0-9_\-@.]/g, '_');
+    document.getElementById('ssoFilename').value = fname;
+  }
+  ssoActiveFilename = fname;
+  ssoActiveEmail = email;
+  var btn = document.getElementById('ssoLoginBtn');
+  btn.disabled = true;
+  document.getElementById('ssoStatus').textContent = '正在登录...';
+  document.getElementById('ssoCodePanel').style.display = 'none';
+
+  api('POST', '/api/account/' + encodeURIComponent(fname) + '/login', {
+    email: email, password: pwd
+  }).then(function(d) {
+    btn.disabled = false;
+    if (d.status === 'ok') {
+      document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--green)">登录成功 · ' + escapeHtml(d.user_name || '') + '</span>';
+      toast('登录成功：' + (d.user_name || fname), 'success');
+      document.getElementById('ssoPassword').value = '';
+      refreshAccountsFull();
+    } else if (d.status === 'needs_code') {
+      ssoSessionId = d.session_id;
+      var hint = d.method === 'phone' ? '已发送短信验证码到手机' : '已发送邮件验证码';
+      document.getElementById('ssoCodeHint').textContent = hint + '，请输入：';
+      document.getElementById('ssoCodePanel').style.display = '';
+      document.getElementById('ssoStatus').textContent = '等待验证码...';
+      document.getElementById('ssoCode').value = '';
+      document.getElementById('ssoCode').focus();
+    } else {
+      document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--red)">' + escapeHtml(d.error || '登录失败') + '</span>';
+      toast('登录失败：' + (d.error || ''), 'error');
+    }
+  }).catch(function(e) {
+    btn.disabled = false;
+    document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--red)">请求失败</span>';
+    toast('请求失败：' + e.message, 'error');
+  });
+}
+
+function ssoSubmitCode() {
+  var code = document.getElementById('ssoCode').value.trim();
+  if (!code || !ssoSessionId) { toast('请输入验证码', 'error'); return; }
+  var btn = document.getElementById('ssoCodeBtn');
+  btn.disabled = true;
+  document.getElementById('ssoStatus').textContent = '正在验证...';
+
+  api('POST', '/api/account/' + encodeURIComponent(ssoActiveFilename) + '/login/verify', {
+    session_id: ssoSessionId, code: code, email: ssoActiveEmail
+  }).then(function(d) {
+    btn.disabled = false;
+    if (d.status === 'ok') {
+      document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--green)">登录成功 · ' + escapeHtml(d.user_name || '') + '</span>';
+      document.getElementById('ssoCodePanel').style.display = 'none';
+      document.getElementById('ssoPassword').value = '';
+      ssoSessionId = null;
+      toast('登录成功：' + (d.user_name || ssoActiveFilename), 'success');
+      refreshAccountsFull();
+    } else if (d.status === 'needs_code') {
+      document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--yellow)">' + escapeHtml(d.error || '验证码错误') + '</span>';
+      toast(d.error || '验证码错误', 'error');
+    } else {
+      document.getElementById('ssoStatus').innerHTML = '<span style="color:var(--red)">' + escapeHtml(d.error || '验证失败') + '</span>';
+      ssoSessionId = null;
+      document.getElementById('ssoCodePanel').style.display = 'none';
+    }
+  }).catch(function(e) {
+    btn.disabled = false;
+    toast('请求失败：' + e.message, 'error');
+  });
+}
+
+function addAccountCookieString() {
+  var name = document.getElementById('cookieAccountName').value.trim();
+  var email = document.getElementById('cookieAccountEmail').value.trim();
+  var ck = document.getElementById('cookieAccountStr').value.trim();
+  if (!ck) { toast('请粘贴 Cookie 字符串', 'error'); return; }
+  api('POST', '/api/accounts/sync-cookies', {name: name || 'default', email: email, cookies: ck}).then(function(d) {
+    if (d.success) {
+      toast('已添加，用户：' + (d.user_name || ''), 'success');
+      document.getElementById('cookieAccountName').value = '';
+      document.getElementById('cookieAccountEmail').value = '';
+      document.getElementById('cookieAccountStr').value = '';
+      refreshAccountsFull();
+    } else { toast('失败：' + (d.error || ''), 'error'); }
+  });
+}
+
+function addAccountJson() {
+  var name = document.getElementById('jsonAccountName').value.trim();
+  var ckStr = document.getElementById('jsonAccountCookies').value.trim();
   if (!name) { toast('请输入账号名', 'error'); return; }
-  if (!cookiesStr) { toast('请粘贴 Cookie JSON', 'error'); return; }
+  if (!ckStr) { toast('请粘贴 Cookie JSON', 'error'); return; }
   var cookies;
-  try { cookies = JSON.parse(cookiesStr); } catch(e) { toast('Cookie JSON 格式错误', 'error'); return; }
+  try { cookies = JSON.parse(ckStr); } catch(e) { toast('Cookie JSON 格式错误', 'error'); return; }
   api('POST', '/api/accounts/add', {name: name, cookies: cookies}).then(function(d) {
     if (d.success) {
       toast('账号已添加：' + name, 'success');
-      document.getElementById('newAccountName').value = '';
-      document.getElementById('newAccountCookies').value = '';
-      refreshAccounts();
-    } else {
-      toast('失败：' + (d.error || JSON.stringify(d)), 'error');
-    }
+      document.getElementById('jsonAccountName').value = '';
+      document.getElementById('jsonAccountCookies').value = '';
+      refreshAccountsFull();
+    } else { toast('失败：' + (d.error || JSON.stringify(d)), 'error'); }
   });
 }
 
+// Backward-compat: auto-deploy panel calls these
+function refreshAccounts() { return fetchAccounts().then(function() {
+  if (typeof loadAutoDeployConfig === 'function') loadAutoDeployConfig();
+}); }
+
 // ══════════════════════════════════════════════════════
-// Claw Management
+// Chat header (current account info)
 // ══════════════════════════════════════════════════════
-function clawCreate() {
-  toast('创建 Claw 中...', '');
-  api('POST', '/api/claw/create').then(function(d) {
-    toast(d.success ? 'Claw 已创建！' : '失败：' + JSON.stringify(d.data), d.success ? 'success' : 'error');
-    if (d.success) setTimeout(clawCheck, 1000);
-  });
-}
-function clawDestroy() {
-  if (!confirm('确定销毁当前 Claw？')) return;
-  api('POST', '/api/claw/destroy').then(function(d) {
-    toast(d.success ? 'Claw 已销毁' : '失败：' + JSON.stringify(d.data), d.success ? 'success' : 'error');
-    clawCheck();
-  });
-}
-var clawExpireTimer = null;
-function clawCheck() {
-  api('GET', '/api/claw/status').then(function(d) {
+function refreshChatHeader() {
+  if (!currentAccount) {
+    fetchAccounts().then(refreshChatHeader);
+    return;
+  }
+  document.getElementById('chatAccName').textContent = currentAccount.name || currentAccount.filename;
+  api('GET', '/api/account/' + encodeURIComponent(currentAccount.filename) + '/claw/status').then(function(d) {
     if (d.success) {
-      var info = d.data;
-      document.getElementById('clawDetail').innerHTML =
-        '<div class="stat-row"><span class="label">状态</span><span class="value">' + statusBadge(info.status === 'AVAILABLE' ? 'ok' : info.status) + '</span></div>' +
-        '<div class="stat-row"><span class="label">信息</span><span class="value">' + (info.message || '--') + '</span></div>' +
-        '<div class="stat-row"><span class="label">过期时间</span><span class="value">' + (info.expireStr || '--') + '</span></div>';
-      if (info.expireTime > 0) startExpireCountdown(info.expireTime);
+      var s = (d.data || {}).status;
+      var label = s === 'AVAILABLE'
+        ? '<span style="color:var(--green)">在线</span>'
+        : '<span style="color:var(--red)">' + escapeHtml(s || '离线') + '</span>';
+      document.getElementById('chatClawState').innerHTML = label;
     } else {
-      document.getElementById('clawDetail').innerHTML = '<div class="stat-row"><span class="label">错误</span><span class="value">' + JSON.stringify(d.data) + '</span></div>';
+      document.getElementById('chatClawState').innerHTML = '<span style="color:var(--red)">不可用</span>';
     }
   });
 }
-function startExpireCountdown(ms) {
-  if (clawExpireTimer) clearInterval(clawExpireTimer);
-  clawExpireTimer = setInterval(function() {
-    var diff = ms - Date.now();
-    if (diff <= 0) { document.getElementById('clawExpire').textContent = '已过期'; clearInterval(clawExpireTimer); return; }
-    var h = Math.floor(diff/3600000), m = Math.floor((diff%3600000)/60000), s = Math.floor((diff%60000)/1000);
-    document.getElementById('clawExpire').textContent = '剩余 ' + h + '时 ' + m + '分 ' + s + '秒';
-  }, 1000);
-}
 
 // ══════════════════════════════════════════════════════
-// Chat
+// Chat (uses current account via /api/account/{fn}/chat)
 // ══════════════════════════════════════════════════════
 var clawMessages = [];
 
@@ -756,13 +1168,18 @@ function clawSend() {
   var input = document.getElementById('clawInput');
   var msg = input.value.trim();
   if (!msg) return;
+  if (!currentAccount) {
+    toast('请先添加并切换到账号', 'error');
+    return;
+  }
   input.value = '';
   clawMessages.push({ role: 'user', content: msg });
   clawMessages.push({ role: 'assistant', content: '<span class="loading"></span> 思考中...' });
   renderClawChat();
   document.getElementById('clawBtn').disabled = true;
 
-  api('POST', '/api/claw/chat', { message: msg }).then(function(d) {
+  var fn = currentAccount.filename;
+  api('POST', '/api/account/' + encodeURIComponent(fn) + '/chat', { message: msg }).then(function(d) {
     if (d.success) clawMessages[clawMessages.length - 1].content = d.reply || '（无回复）';
     else clawMessages[clawMessages.length - 1].content = '[错误：' + (d.error || 'unknown') + ']';
     renderClawChat();
@@ -914,27 +1331,6 @@ function pollDeployLog() {
 }
 
 // ══════════════════════════════════════════════════════
-// Cookies
-// ══════════════════════════════════════════════════════
-function cookieRefresh() {
-  toast('刷新 Cookie 中...', '');
-  api('POST', '/api/cookie/refresh').then(function(d) {
-    toast(d.success ? 'Cookie 已刷新！' : '失败：' + (d.error || ''), d.success ? 'success' : 'error');
-    refreshStatus();
-  });
-}
-function cookieCheck() {
-  api('GET', '/api/cookie/status').then(function(d) {
-    document.getElementById('cookieDetail').innerHTML =
-      '<div class="stat-row"><span class="label">有效</span><span class="value">' + (d.valid ? '是' : '否') + '</span></div>' +
-      '<div class="stat-row"><span class="label">数量</span><span class="value">' + d.count + '</span></div>' +
-      '<div class="stat-row"><span class="label">PH</span><span class="value">' + (d.has_ph ? '是' : '否') + '</span></div>' +
-      '<div class="stat-row"><span class="label">状态码</span><span class="value">' + d.test_code + '</span></div>' +
-      (d.user_id ? '<div class="stat-row"><span class="label">用户 ID</span><span class="value">' + d.user_id + '</span></div>' : '');
-  });
-}
-
-// ══════════════════════════════════════════════════════
 // Gateway
 // ══════════════════════════════════════════════════════
 function refreshGateway() {
@@ -964,35 +1360,409 @@ function refreshBackends() {
   api('GET', '/api/gateway/backends').then(function(d) {
     var el = document.getElementById('backendsBody');
     if (!d.backends || d.backends.length === 0) {
-      el.innerHTML = '<tr><td colspan="8" style="color:var(--text3);text-align:center;padding:20px">未配置后端</td></tr>';
+      el.innerHTML = '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:20px">未配置后端，请点击"添加后端"</td></tr>';
       return;
     }
     var html = '';
     for (var i = 0; i < d.backends.length; i++) {
       var b = d.backends[i];
-      var statusCls = b.healthy ? 'ok' : 'error';
-      var circuitColor = b.circuit === 'closed' ? 'var(--green)' : b.circuit === 'open' ? 'var(--red)' : 'var(--yellow)';
-      html += '<tr>';
-      html += '<td><strong>' + escapeHtml(b.id) + '</strong></td>';
-      html += '<td style="font-family:monospace;font-size:0.82rem">' + escapeHtml(b.url) + '</td>';
-      html += '<td>' + statusBadge(b.healthy ? 'ok' : 'error') + '</td>';
-      html += '<td>' + (b.weight || 1) + '</td>';
+      var enabled = b.enabled !== false;
+      var statusStr = !enabled ? '已禁用' : (b.healthy ? '在线' : '离线');
+      var statusColor = !enabled ? 'var(--text3)' : (b.healthy ? 'var(--green)' : 'var(--red)');
+      var models = b.models || [];
+      var modelsHtml = '';
+      for (var j = 0; j < models.length; j++) {
+        modelsHtml += '<span style="display:inline-block;background:#0d1b2a;border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:.7rem;margin:1px 2px 1px 0;color:var(--text2)">' + escapeHtml(models[j]) + '</span>';
+      }
+      html += '<tr style="opacity:' + (enabled ? '1' : '0.5') + '">';
+      html += '<td><strong>' + escapeHtml(b.name || b.id) + '</strong></td>';
+      html += '<td>' + (modelsHtml || '<span style="color:var(--text3)">--</span>') + '</td>';
+      html += '<td style="font-family:monospace;font-size:0.82rem">' + escapeHtml(b.url || '') + '</td>';
+      html += '<td style="color:' + statusColor + '">' + statusStr + '</td>';
       html += '<td>' + (b.avg_latency_ms ? b.avg_latency_ms + 'ms' : '--') + '</td>';
-      html += '<td style="color:' + circuitColor + '">' + (b.circuit || 'closed') + '</td>';
       html += '<td>' + (b.total_requests || 0) + '</td>';
-      html += '<td><button class="btn btn-ghost" style="padding:3px 8px;font-size:0.75rem" onclick="toggleBackend(\'' + b.id + '\')">' + (b.enabled !== false ? '禁用' : '启用') + '</button></td>';
+      html += '<td style="white-space:nowrap">';
+      html += '  <button class="btn btn-ghost" style="padding:3px 8px;font-size:.75rem" onclick="backendToggle(\'' + b.id + '\')">' + (enabled ? '禁用' : '启用') + '</button>';
+      html += '  <button class="btn btn-ghost" style="padding:3px 8px;font-size:.75rem" onclick="backendEdit(\'' + b.id + '\')">编辑</button>';
+      html += '  <button class="btn btn-ghost" style="padding:3px 8px;font-size:.75rem;color:var(--red)" onclick="backendDelete(\'' + b.id + '\',\'' + escapeHtml(b.name || b.id) + '\')">删除</button>';
+      html += '</td>';
       html += '</tr>';
     }
     el.innerHTML = html;
   }).catch(function() {
-    document.getElementById('backendsBody').innerHTML = '<tr><td colspan="8" style="color:var(--text3);text-align:center;padding:20px">网关无法访问</td></tr>';
+    document.getElementById('backendsBody').innerHTML = '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:20px">网关无法访问</td></tr>';
   });
 }
 
-function toggleBackend(id) {
+// ── Multi-model tag input for backend form ──
+var MIMO_NATIVE_MODELS = [
+  'mimo-v2-flash', 'mimo-v2-omni', 'mimo-v2-pro', 'mimo-v2-tts',
+  'mimo-v2.5', 'mimo-v2.5-pro', 'mimo-v2.5-tts',
+  'mimo-v2.5-tts-voiceclone', 'mimo-v2.5-tts-voicedesign'
+];
+var beModels = [];  // current list in the form
+
+function beRenderChips() {
+  var box = document.getElementById('beModelsChips');
+  var input = document.getElementById('beModelsInput');
+  // wipe everything except the input
+  Array.prototype.slice.call(box.querySelectorAll('.chip')).forEach(function(c) { c.remove(); });
+  for (var i = 0; i < beModels.length; i++) {
+    var span = document.createElement('span');
+    span.className = 'chip';
+    span.style.cssText = 'background:#1a3a5f;color:#9cd2ff;padding:3px 8px;border-radius:12px;font-size:.78rem;display:inline-flex;align-items:center;gap:4px';
+    span.textContent = beModels[i];
+    var x = document.createElement('span');
+    x.style.cssText = 'cursor:pointer;color:#cce7ff;font-weight:bold';
+    x.textContent = '×';
+    (function(name) {
+      x.onclick = function() { beRemoveModel(name); };
+    })(beModels[i]);
+    span.appendChild(x);
+    box.insertBefore(span, input);
+  }
+}
+function beAddModel(name) {
+  name = (name || '').trim();
+  if (!name) return;
+  if (beModels.indexOf(name) === -1) {
+    beModels.push(name);
+    beRenderChips();
+  }
+}
+function beRemoveModel(name) {
+  beModels = beModels.filter(function(m) { return m !== name; });
+  beRenderChips();
+}
+function beFillMimoNative() {
+  for (var i = 0; i < MIMO_NATIVE_MODELS.length; i++) beAddModel(MIMO_NATIVE_MODELS[i]);
+}
+function beClearModels() {
+  beModels = [];
+  beRenderChips();
+}
+function beInitInput() {
+  var input = document.getElementById('beModelsInput');
+  if (!input || input.dataset.bound) return;
+  input.dataset.bound = '1';
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      beAddModel(input.value);
+      input.value = '';
+    } else if (e.key === 'Backspace' && !input.value && beModels.length) {
+      beRemoveModel(beModels[beModels.length - 1]);
+    }
+  });
+  input.addEventListener('blur', function() {
+    if (input.value.trim()) { beAddModel(input.value); input.value = ''; }
+  });
+}
+
+function backendToggleAdd() {
+  var p = document.getElementById('backendAddPanel');
+  var visible = p.style.display !== 'none';
+  p.style.display = visible ? 'none' : 'block';
+  if (!visible) {
+    document.getElementById('backendFormTitle').textContent = '添加后端';
+    document.getElementById('backendEditId').value = '';
+    document.getElementById('beName').value = '';
+    document.getElementById('beUrl').value = '';
+    document.getElementById('beKey').value = '';
+    document.getElementById('beWeight').value = '1';
+    beModels = [];
+    beRenderChips();
+    beInitInput();
+  }
+}
+
+function backendEdit(id) {
+  api('GET', '/api/gateway/backends').then(function(d) {
+    var found = null;
+    for (var i = 0; i < (d.backends || []).length; i++) {
+      if (d.backends[i].id === id) { found = d.backends[i]; break; }
+    }
+    if (!found) { toast('后端未找到', 'error'); return; }
+    document.getElementById('backendFormTitle').textContent = '编辑后端';
+    document.getElementById('backendEditId').value = id;
+    document.getElementById('beName').value = found.name || found.id;
+    document.getElementById('beUrl').value = found.url || '';
+    document.getElementById('beKey').value = '';
+    document.getElementById('beWeight').value = found.weight || 1;
+    beModels = (found.models || []).slice();
+    beRenderChips();
+    beInitInput();
+    document.getElementById('backendAddPanel').style.display = 'block';
+  });
+}
+
+function backendSave() {
+  // flush pending input
+  var pending = document.getElementById('beModelsInput').value.trim();
+  if (pending) { beAddModel(pending); document.getElementById('beModelsInput').value = ''; }
+  var editId = document.getElementById('backendEditId').value;
+  var payload = {
+    name: document.getElementById('beName').value.trim(),
+    base_url: document.getElementById('beUrl').value.trim(),
+    models: beModels.slice(),
+    api_key: document.getElementById('beKey').value.trim(),
+    weight: parseInt(document.getElementById('beWeight').value) || 1
+  };
+  if (!payload.name || !payload.base_url || payload.models.length === 0) {
+    toast('名称、URL、至少一个模型为必填', 'error'); return;
+  }
+  var url = editId ? '/api/gateway/backends/' + editId + '/update' : '/api/gateway/backends/add';
+  api('POST', url, payload).then(function(d) {
+    if (d.success) {
+      toast(editId ? '已更新' : '已添加', 'success');
+      document.getElementById('backendAddPanel').style.display = 'none';
+      refreshBackends();
+    } else {
+      toast(d.error || '操作失败', 'error');
+    }
+  });
+}
+
+function backendToggle(id) {
   api('POST', '/api/gateway/backends/' + id + '/toggle').then(function(d) {
     toast(d.message || '已更新', d.success ? 'success' : 'error');
     refreshBackends();
+  });
+}
+
+function backendDelete(id, name) {
+  if (!confirm('确定删除后端 "' + name + '"？')) return;
+  api('POST', '/api/gateway/backends/' + id + '/delete').then(function(d) {
+    if (d.success) { toast('已删除', 'success'); refreshBackends(); }
+    else { toast(d.error || '删除失败', 'error'); }
+  });
+}
+
+function backendReload() {
+  api('POST', '/api/gateway/backends/reload').then(function(d) {
+    toast('已重载 ' + (d.backends || 0) + ' 个后端', 'success');
+    refreshBackends();
+  });
+}
+
+// ══════════════════════════════════════════════════════
+// Model Mappings (groups of exposed_name → native_model)
+// ══════════════════════════════════════════════════════
+var mgGroups = [];
+var mgEditingMapping = null;  // {groupId, mappingId} or null
+var mgKnownNatives = [];      // union of all backend.models[]
+
+function mgLoadNatives() {
+  return api('GET', '/api/gateway/backends').then(function(d) {
+    var seen = {};
+    mgKnownNatives = [];
+    (d.backends || []).forEach(function(b) {
+      (b.models || []).forEach(function(m) {
+        if (m && !seen[m]) { seen[m] = 1; mgKnownNatives.push(m); }
+      });
+    });
+  }).catch(function() { mgKnownNatives = []; });
+}
+
+function refreshMappings() {
+  mgLoadNatives().then(function() {
+    return api('GET', '/api/model-groups');
+  }).then(function(d) {
+    mgGroups = d.groups || [];
+    renderMappings();
+  });
+}
+
+function renderMappings() {
+  var c = document.getElementById('mgGroupsContainer');
+  if (!mgGroups.length) {
+    c.innerHTML = '<div class="section" style="color:var(--text3);text-align:center;padding:30px">还没有分组。点击「从后端导入」一键创建，或「新建分组」手动添加。</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < mgGroups.length; i++) {
+    var g = mgGroups[i];
+    html += mgRenderGroup(g);
+  }
+  c.innerHTML = html;
+}
+
+function mgRenderGroup(g) {
+  var rows = '';
+  var maps = g.mappings || [];
+  for (var i = 0; i < maps.length; i++) {
+    var m = maps[i];
+    var proto = m.protocols || [];
+    var pOpenai = proto.indexOf('openai') !== -1;
+    var pAnth = proto.indexOf('anthropic') !== -1;
+    rows += '<tr>' +
+      '<td style="font-family:monospace;font-size:.82rem">' + escapeHtml(m.exposed_name) + '</td>' +
+      '<td style="color:var(--text2)">→</td>' +
+      '<td style="font-family:monospace;font-size:.82rem">' + escapeHtml(m.native_model) + '</td>' +
+      '<td style="text-align:center;color:' + (pOpenai ? 'var(--green)' : 'var(--text3)') + '">' + (pOpenai ? '✓' : '—') + '</td>' +
+      '<td style="text-align:center;color:' + (pAnth ? 'var(--green)' : 'var(--text3)') + '">' + (pAnth ? '✓' : '—') + '</td>' +
+      '<td style="white-space:nowrap">' +
+        '<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="mgEditMapping(\'' + g.id + '\',\'' + m.id + '\')">编辑</button>' +
+        '<button class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem;color:var(--red)" onclick="mgDeleteMapping(\'' + g.id + '\',\'' + m.id + '\')">删除</button>' +
+      '</td>' +
+      '</tr>';
+  }
+  if (!rows) rows = '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">该分组暂无映射，点击下方"新增映射"添加</td></tr>';
+
+  return '<div class="section" style="margin-bottom:14px">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+      '<div><strong style="font-size:1.05rem">' + escapeHtml(g.name || g.id) + '</strong>' +
+        '<span style="color:var(--text3);font-size:.78rem;margin-left:8px">id=' + escapeHtml(g.id) + ' · ' + (g.mappings || []).length + ' 条</span>' +
+        (g.description ? '<div style="color:var(--text3);font-size:.78rem;margin-top:2px">' + escapeHtml(g.description) + '</div>' : '') +
+      '</div>' +
+      '<div style="display:flex;gap:6px">' +
+        '<button class="btn btn-ghost" style="padding:3px 10px;font-size:.78rem" onclick="mgRenameGroup(\'' + g.id + '\')">改名</button>' +
+        '<button class="btn btn-ghost" style="padding:3px 10px;font-size:.78rem;color:var(--red)" onclick="mgDeleteGroup(\'' + g.id + '\')">删除分组</button>' +
+      '</div>' +
+    '</div>' +
+    '<table class="data-table" style="margin-top:6px">' +
+      '<thead><tr><th style="width:30%">exposed_name</th><th style="width:24px"></th><th style="width:30%">native_model</th><th style="width:70px;text-align:center">OpenAI</th><th style="width:90px;text-align:center">Anthropic</th><th>操作</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+    '</table>' +
+    '<div style="margin-top:8px"><button class="btn btn-primary" style="padding:4px 14px;font-size:.82rem" onclick="mgAddMapping(\'' + g.id + '\')">+ 新增映射</button></div>' +
+    '</div>';
+}
+
+function mgFindGroup(gid) { for (var i = 0; i < mgGroups.length; i++) if (mgGroups[i].id === gid) return mgGroups[i]; return null; }
+function mgFindMapping(g, mid) { var maps = g.mappings || []; for (var i = 0; i < maps.length; i++) if (maps[i].id === mid) return maps[i]; return null; }
+
+function mgNewGroup() {
+  var id = prompt('分组 ID（短 slug，如 mimo / pro / lite，字母数字 -_.，≤32 字符）：');
+  if (!id) return;
+  var name = prompt('分组显示名（可中文）：', id);
+  if (name === null) return;
+  api('POST', '/api/model-groups', { id: id.trim(), name: name.trim(), description: '' }).then(function(d) {
+    if (d.success) { toast('已创建分组', 'success'); refreshMappings(); }
+    else toast(d.error || '创建失败', 'error');
+  });
+}
+
+function mgRenameGroup(gid) {
+  var g = mgFindGroup(gid); if (!g) return;
+  var name = prompt('新名称：', g.name || g.id);
+  if (name === null) return;
+  api('POST', '/api/model-groups/' + encodeURIComponent(gid) + '/update', { name: name.trim() }).then(function(d) {
+    if (d.success) { toast('已更新', 'success'); refreshMappings(); }
+    else toast(d.error || '更新失败', 'error');
+  });
+}
+
+function mgDeleteGroup(gid) {
+  var g = mgFindGroup(gid); if (!g) return;
+  if (!confirm('确定删除分组 "' + (g.name || gid) + '" 及其所有映射？')) return;
+  api('POST', '/api/model-groups/' + encodeURIComponent(gid) + '/delete').then(function(d) {
+    if (d.success) { toast('已删除', 'success'); refreshMappings(); }
+    else toast(d.error || '删除失败', 'error');
+  });
+}
+
+function mgImportBackends() {
+  api('POST', '/api/model-groups/import-from-backends', {}).then(function(d) {
+    if (d.success) {
+      toast('已导入 ' + d.added + ' 条新映射 (跳过 ' + d.skipped + ' 条已存在)', 'success');
+      refreshMappings();
+    } else toast(d.error || '导入失败', 'error');
+  });
+}
+
+function mgAddMapping(gid) {
+  mgEditingMapping = { groupId: gid, mappingId: null };
+  mgOpenMappingDialog({});
+}
+
+function mgEditMapping(gid, mid) {
+  var g = mgFindGroup(gid); if (!g) return;
+  var m = mgFindMapping(g, mid); if (!m) return;
+  mgEditingMapping = { groupId: gid, mappingId: mid };
+  mgOpenMappingDialog(m);
+}
+
+function mgDeleteMapping(gid, mid) {
+  if (!confirm('确定删除这条映射？')) return;
+  api('POST', '/api/model-groups/' + encodeURIComponent(gid) + '/mappings/' + encodeURIComponent(mid) + '/delete').then(function(d) {
+    if (d.success) { toast('已删除', 'success'); refreshMappings(); }
+    else toast(d.error || '删除失败', 'error');
+  });
+}
+
+function mgOpenMappingDialog(m) {
+  // Reusable inline-modal — built once, populated each call.
+  var dlg = document.getElementById('mgMappingDialog');
+  if (!dlg) {
+    dlg = document.createElement('div');
+    dlg.id = 'mgMappingDialog';
+    dlg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:none;align-items:center;justify-content:center';
+    dlg.innerHTML = '<div style="background:#111827;border:1px solid var(--border);border-radius:10px;padding:22px;width:460px;max-width:92vw">' +
+      '<h3 id="mgDlgTitle" style="margin:0 0 14px 0;color:var(--accent)">编辑映射</h3>' +
+      '<div style="display:flex;flex-direction:column;gap:10px">' +
+        '<div><label style="font-size:.8rem;color:var(--text2)">exposed_name *（客户端调用时填的模型名）</label>' +
+          '<input id="mgDlgExposed" type="text" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;margin-top:4px" placeholder="e.g. mimo-v2.5-pro 或 claude-3-5-sonnet"></div>' +
+        '<div><label style="font-size:.8rem;color:var(--text2)">native_model *（转发给上游的真实模型名）</label>' +
+          '<input id="mgDlgNative" list="mgDlgNativeList" type="text" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;margin-top:4px" placeholder="选择或填写">' +
+          '<datalist id="mgDlgNativeList"></datalist></div>' +
+        '<div><label style="font-size:.8rem;color:var(--text2)">协议</label><br>' +
+          '<label style="margin-right:14px;font-size:.85rem"><input id="mgDlgProtoOpenai" type="checkbox"> OpenAI (/v1/chat/completions)</label>' +
+          '<label style="font-size:.85rem"><input id="mgDlgProtoAnth" type="checkbox"> Anthropic (/v1/messages)</label></div>' +
+      '</div>' +
+      '<div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">' +
+        '<button class="btn btn-ghost" onclick="mgCloseMappingDialog()">取消</button>' +
+        '<button class="btn btn-primary" onclick="mgSaveMappingDialog()">保存</button>' +
+      '</div></div>';
+    document.body.appendChild(dlg);
+  }
+  document.getElementById('mgDlgTitle').textContent = mgEditingMapping && mgEditingMapping.mappingId ? '编辑映射' : '新增映射';
+  document.getElementById('mgDlgExposed').value = m.exposed_name || '';
+  document.getElementById('mgDlgNative').value = m.native_model || '';
+  var proto = m.protocols || ['openai', 'anthropic'];
+  document.getElementById('mgDlgProtoOpenai').checked = proto.indexOf('openai') !== -1;
+  document.getElementById('mgDlgProtoAnth').checked = proto.indexOf('anthropic') !== -1;
+  var dl = document.getElementById('mgDlgNativeList');
+  dl.innerHTML = '';
+  for (var i = 0; i < mgKnownNatives.length; i++) {
+    var o = document.createElement('option');
+    o.value = mgKnownNatives[i];
+    dl.appendChild(o);
+  }
+  dlg.style.display = 'flex';
+}
+
+function mgCloseMappingDialog() {
+  var dlg = document.getElementById('mgMappingDialog');
+  if (dlg) dlg.style.display = 'none';
+  mgEditingMapping = null;
+}
+
+function mgSaveMappingDialog() {
+  if (!mgEditingMapping) return;
+  var payload = {
+    exposed_name: document.getElementById('mgDlgExposed').value.trim(),
+    native_model: document.getElementById('mgDlgNative').value.trim(),
+    protocols: []
+  };
+  if (document.getElementById('mgDlgProtoOpenai').checked) payload.protocols.push('openai');
+  if (document.getElementById('mgDlgProtoAnth').checked) payload.protocols.push('anthropic');
+  if (!payload.exposed_name || !payload.native_model) {
+    toast('exposed_name 和 native_model 必填', 'error'); return;
+  }
+  if (payload.protocols.length === 0) {
+    toast('至少勾选一个协议', 'error'); return;
+  }
+  var gid = mgEditingMapping.groupId;
+  var mid = mgEditingMapping.mappingId;
+  var url = mid
+    ? '/api/model-groups/' + encodeURIComponent(gid) + '/mappings/' + encodeURIComponent(mid) + '/update'
+    : '/api/model-groups/' + encodeURIComponent(gid) + '/mappings';
+  api('POST', url, payload).then(function(d) {
+    if (d.success) {
+      toast(mid ? '已更新' : '已添加', 'success');
+      mgCloseMappingDialog();
+      refreshMappings();
+    } else toast(d.error || '保存失败', 'error');
   });
 }
 
@@ -1121,47 +1891,132 @@ function refreshMetrics() {
   }).catch(function() {});
 }
 
+function _fmtBytes(b) {
+  if (!b) return '0 B';
+  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+function _fmtSpeed(bps) {
+  if (!bps) return '0 B/s';
+  if (bps >= 1e6) return (bps/1e6).toFixed(2) + ' MB/s';
+  if (bps >= 1e3) return (bps/1e3).toFixed(1) + ' KB/s';
+  return bps + ' B/s';
+}
+function _fmtUptime(sec) {
+  if (!sec) return '0m';
+  var d = Math.floor(sec / 86400);
+  var h = Math.floor((sec % 86400) / 3600);
+  var m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+function _barFill(pct) {
+  pct = Math.max(0, Math.min(100, pct || 0));
+  var cls = pct > 85 ? 'hi' : pct > 60 ? 'mid' : 'lo';
+  return '<div class="vps-bar"><div class="fill ' + cls + '" style="width:' + pct + '%"></div></div>';
+}
+function _barRow(label, value, pct) {
+  return '<div class="vps-bar-row">' +
+    '<div class="vps-bar-label"><span>' + label + '</span><span class="v">' + value + '</span></div>' +
+    _barFill(pct) +
+    '</div>';
+}
+
+function _installCmd(token) {
+  var origin = location.origin;
+  return 'curl -fsSL ' + origin + '/probe/install.sh/' + token + ' | sudo bash';
+}
+
 function refreshVps() {
-  api('GET', '/api/gateway/vps').then(function(d) {
-    var summary = d.summary || {};
+  Promise.all([
+    api('GET', '/api/gateway/vps'),
+    api('GET', '/api/probe/nodes'),
+  ]).then(function(results) {
+    var status = results[0], reg = results[1];
+    var summary = status.summary || {};
     document.getElementById('vpsSummary').textContent =
       '共 ' + (summary.total || 0) + ' 个 · 在线 ' + (summary.up || 0) +
       ' · 离线 ' + (summary.down || 0) +
-      (summary.unknown ? ' · 未知 ' + summary.unknown : '');
+      '（' + (summary.offline_after_s || 30) + 's 无上报判离线）';
+
+    // Merge: tokens come from /api/probe/nodes; samples from /api/gateway/vps
+    var tokenById = {};
+    (reg.nodes || []).forEach(function(n) { tokenById[n.id] = n.token; });
+
     var grid = document.getElementById('vpsGrid');
-    var targets = d.targets || [];
-    if (targets.length === 0) {
-      grid.innerHTML = '<div style="color:var(--text3);font-size:0.82rem;padding:20px;text-align:center">' +
-        '暂无探针目标。启用账号后会自动出现。</div>';
+    var nodes = status.nodes || [];
+    if (nodes.length === 0) {
+      grid.innerHTML = '<div style="color:var(--text3);font-size:0.82rem;padding:20px;text-align:center;grid-column:1/-1">' +
+        '暂无 VPS 节点。点击右上角"添加节点"开始。</div>';
       return;
     }
     var html = '';
-    for (var i = 0; i < targets.length; i++) {
-      var t = targets[i];
-      var pillCls = t.state === 'up' ? 'up' : t.state === 'down' ? 'down' : 'unknown';
-      var pillText = t.state === 'up' ? '在线' : t.state === 'down' ? '离线' : '未知';
-      var lastOk = t.last_ok_ts
-        ? new Date(t.last_ok_ts * 1000).toLocaleString('zh-CN', {hour12: false})
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var s = n.sample;
+      var pillCls = n.online ? 'up' : 'down';
+      var pillText = n.online ? '在线' : '离线';
+      var lastSeen = n.last_seen
+        ? new Date(n.last_seen * 1000).toLocaleTimeString('zh-CN', {hour12: false})
         : '从未';
-      var spark = '';
-      var hist = t.history || [];
-      for (var j = 0; j < hist.length; j++) {
-        spark += '<div class="pt ' + (hist[j].ok ? 'ok' : 'bad') + '" title="' +
-          (hist[j].ok ? hist[j].latency_ms + 'ms' : 'down') + '"></div>';
+
+      var body = '';
+      if (n.online && s) {
+        var memUsed = (s.memory && s.memory.used_mb) ? s.memory.used_mb * 1048576 : 0;
+        var memTotal = (s.memory && s.memory.total_mb) ? s.memory.total_mb * 1048576 : 0;
+        var diskUsed = (s.disk && s.disk.used_gb) ? s.disk.used_gb * 1073741824 : 0;
+        var diskTotal = (s.disk && s.disk.total_gb) ? s.disk.total_gb * 1073741824 : 0;
+        body =
+          _barRow('CPU', (s.cpu_percent || 0).toFixed(1) + '%', s.cpu_percent || 0) +
+          _barRow('内存 (' + _fmtBytes(memUsed) + ' / ' + _fmtBytes(memTotal) + ')',
+                  ((s.memory && s.memory.percent) || 0).toFixed(1) + '%',
+                  (s.memory && s.memory.percent) || 0) +
+          _barRow('磁盘 (' + _fmtBytes(diskUsed) + ' / ' + _fmtBytes(diskTotal) + ')',
+                  ((s.disk && s.disk.percent) || 0).toFixed(1) + '%',
+                  (s.disk && s.disk.percent) || 0) +
+          '<div class="vps-net">' +
+            '<div><div class="lbl">↓ 下载</div><div class="val rx">' +
+              _fmtSpeed((s.network && s.network.rx_speed_bps) || 0) + '</div></div>' +
+            '<div><div class="lbl">↑ 上传</div><div class="val tx">' +
+              _fmtSpeed((s.network && s.network.tx_speed_bps) || 0) + '</div></div>' +
+          '</div>';
+        if (s.load && s.load.length) {
+          body += '<div class="vps-foot"><span>Load ' +
+            s.load.map(function(x){return x.toFixed(2)}).join(' / ') + '</span>' +
+            '<span>up ' + _fmtUptime(s.uptime_seconds) + '</span></div>';
+        }
+      } else {
+        body = '<div style="padding:14px;text-align:center;color:var(--text3);font-size:0.82rem">' +
+          '探针未上报' + (n.last_seen ? '（最后 ' + lastSeen + '）' : '') +
+          '<div class="install-block">' + escapeHtml(_installCmd(tokenById[n.id] || '<token>')) + '</div>' +
+          '</div>';
       }
+
+      var hostname = (s && s.os && s.os.hostname) ? s.os.hostname : '';
+      var distro = (s && s.os && s.os.distro) ? s.os.distro : '';
       html += '<div class="vps-card">' +
-        '<div style="display:flex;justify-content:space-between;align-items:start">' +
-          '<div>' +
-            '<div class="name">' + escapeHtml(t.name) + '</div>' +
-            '<div class="meta">' + escapeHtml(t.host) + ':' + t.port + '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:start;gap:8px">' +
+          '<div style="min-width:0;flex:1">' +
+            '<div class="name">' + escapeHtml(n.name) + '</div>' +
+            '<div class="meta">' + escapeHtml(hostname) +
+              (distro ? ' · ' + escapeHtml(distro) : '') + '</div>' +
           '</div>' +
           '<span class="pill ' + pillCls + '">' + pillText + '</span>' +
         '</div>' +
-        '<div class="row"><span class="label">延迟</span><span>' +
-          (t.state === 'up' ? t.latency_ms + ' ms' : '—') + '</span></div>' +
-        '<div class="row"><span class="label">最近在线</span><span style="font-size:0.78rem">' + lastOk + '</span></div>' +
-        (t.last_error ? '<div class="row"><span class="label">最近错误</span><span style="color:var(--red);font-size:0.78rem">' + escapeHtml(t.last_error) + '</span></div>' : '') +
-        '<div class="vps-spark">' + spark + '</div>' +
+        body +
+        '<div class="vps-foot">' +
+          '<span>上次上报 ' + lastSeen + '</span>' +
+          '<div class="vps-actions">' +
+            '<button class="icon-btn" onclick="vpsShowInstall(\'' + n.id + '\',\'' +
+              escapeHtml(tokenById[n.id] || '') + '\')">安装命令</button>' +
+            '<button class="icon-btn" onclick="vpsRegenToken(\'' + n.id + '\')">换 token</button>' +
+            '<button class="icon-btn" onclick="vpsDeleteNode(\'' + n.id + '\',\'' +
+              escapeHtml(n.name) + '\')">删除</button>' +
+          '</div>' +
+        '</div>' +
       '</div>';
     }
     grid.innerHTML = html;
@@ -1171,16 +2026,58 @@ function refreshVps() {
   });
 }
 
-function refreshVpsForce() {
-  api('POST', '/api/gateway/vps/refresh').then(function() {
-    toast('已刷新', 'success');
-    refreshVps();
-  }).catch(function() {
-    toast('刷新失败', 'error');
-  });
+function vpsToggleAdd() {
+  var p = document.getElementById('vpsAddPanel');
+  p.style.display = p.style.display === 'none' ? '' : 'none';
 }
+
+function vpsAddNode() {
+  var name = (document.getElementById('vpsNewName').value || '').trim();
+  if (!name) { toast('请填写节点名', 'error'); return; }
+  api('POST', '/api/probe/nodes/add', {name: name}).then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
+    document.getElementById('vpsNewName').value = '';
+    document.getElementById('vpsAddResult').innerHTML =
+      '已创建。SSH 到 VPS 执行：<div class="install-block">' +
+      escapeHtml(_installCmd(d.token)) + '</div>' +
+      '<div style="margin-top:6px;color:var(--text3)">需要 root 权限和 python3。脚本会自动写 systemd unit 并启动。</div>';
+    toast('节点已添加', 'success');
+    refreshVps();
+  }).catch(function() { toast('添加失败', 'error'); });
+}
+
+function vpsShowInstall(id, token) {
+  if (!token) { toast('无 token', 'error'); return; }
+  document.getElementById('vpsAddPanel').style.display = '';
+  document.getElementById('vpsAddResult').innerHTML =
+    '安装命令：<div class="install-block">' + escapeHtml(_installCmd(token)) + '</div>';
+}
+
+function vpsRegenToken(id) {
+  if (!confirm('换 token 后旧探针会失效，确定？')) return;
+  api('POST', '/api/probe/nodes/' + id + '/regen-token').then(function(d) {
+    if (d.token) {
+      vpsShowInstall(id, d.token);
+      toast('token 已更新', 'success');
+      refreshVps();
+    } else { toast('失败', 'error'); }
+  }).catch(function() { toast('失败', 'error'); });
+}
+
+function vpsDeleteNode(id, name) {
+  if (!confirm('删除节点 ' + name + '？')) return;
+  api('POST', '/api/probe/nodes/' + id + '/delete').then(function() {
+    toast('已删除', 'success');
+    refreshVps();
+  }).catch(function() { toast('删除失败', 'error'); });
+}
+
 window.refreshVps = refreshVps;
-window.refreshVpsForce = refreshVpsForce;
+window.vpsToggleAdd = vpsToggleAdd;
+window.vpsAddNode = vpsAddNode;
+window.vpsShowInstall = vpsShowInstall;
+window.vpsRegenToken = vpsRegenToken;
+window.vpsDeleteNode = vpsDeleteNode;
 
 // ══════════════════════════════════════════════════════
 // Clock & Init
@@ -1191,15 +2088,25 @@ function updateClock() {
 updateClock();
 setInterval(updateClock, 1000);
 
-refreshStatus();
-refreshAccounts();
-clawCheck();
-cookieCheck();
-renderClawChat();
-setInterval(refreshStatus, 10000);
+// Initial load: respect URL hash (so refresh stays on the same page)
+switchPage(pageFromHash());
+// Refresh dashboard summary every 30s (claw status changes are slow)
+setInterval(refreshDashboard, 30000);
+// Refresh top bar gateway light every 10s
+setInterval(function() {
+  api('GET', '/api/gateway/status').then(function(d) {
+    setInd('indGw', d && !d.error ? 'ok' : 'gray');
+  }).catch(function() { setInd('indGw', 'gray'); });
+}, 10000);
 
 document.getElementById('clawInput').addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); clawSend(); }
+});
+document.getElementById('ssoCode').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); ssoSubmitCode(); }
+});
+document.getElementById('ssoPassword').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); ssoLogin(); }
 });
 </script>
 </body>

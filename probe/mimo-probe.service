@@ -1,0 +1,20 @@
+[Unit]
+Description=MiMo VPS Probe Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PROBE_URL=https://your-panel.example/api/probe/report
+Environment=PROBE_TOKEN=replace-me
+Environment=PROBE_NAME=
+Environment=PROBE_INTERVAL=10
+ExecStart=/usr/bin/python3 /opt/mimo-probe/agent.py
+Restart=always
+RestartSec=5
+User=nobody
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
