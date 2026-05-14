@@ -232,7 +232,6 @@ async def handle_proxy(request: web.Request):
                         "Content-Type": ct,
                         "Access-Control-Allow-Origin": "*",
                         "Cache-Control": "no-cache",
-                        "Connection": "close",
                     },
                 )
                 await response.prepare(request)
@@ -260,7 +259,7 @@ async def handle_proxy(request: web.Request):
                     status=resp.status,
                     body=resp_body,
                     content_type=ct,
-                    headers={"Access-Control-Allow-Origin": "*", "Connection": "close"},
+                    headers={"Access-Control-Allow-Origin": "*"},
                 )
 
     except asyncio.TimeoutError:

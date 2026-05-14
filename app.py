@@ -138,6 +138,16 @@ async def shutdown_event():
     if _sync_http_client is not None:
         _sync_http_client.close()
         _sync_http_client = None
+    try:
+        from gateway.runtime import shutdown as shutdown_gateway_runtime
+        await shutdown_gateway_runtime()
+    except Exception as e:
+        print(f"[shutdown] Failed to close gateway runtime: {e}")
+    try:
+        from gateway.auth import close_key_store
+        close_key_store()
+    except Exception as e:
+        print(f"[shutdown] Failed to close gateway auth store: {e}")
 
 # ──────────── Account management helpers ────────────
 
@@ -391,11 +401,13 @@ async def api_status():
     # Cookie status
     cookies = load_cookies()
     ph_found = any(c["name"] == "xiaomichatbot_ph" for c in cookies)
+    current_name = _get_current_account_name()
+    current_file = (ACCOUNTS_DIR / f"{current_name}.json") if current_name else None
     result["cookies"] = {
         "status": "ok" if ph_found and cookies else "error",
         "count": len(cookies),
         "has_ph": ph_found,
-        "file_exists": COOKIE_FILE.exists(),
+        "file_exists": bool(current_file and current_file.exists()),
     }
 
     # Claw status
@@ -1214,18 +1226,9 @@ def switch_to_account(account_filename: str) -> bool:
         cookies = data.get("cookies", [])
         if not cookies:
             return False
-        # Write to cookie file
-        cookie_list = []
-        for c in cookies:
-            cookie_list.append({
-                "name": c.get("name", ""),
-                "value": c.get("value", ""),
-                "domain": c.get("domain", ".xiaomimimo.com"),
-                "path": c.get("path", "/"),
-            })
-        COOKIE_FILE.write_text(json.dumps(cookie_list, indent=2, ensure_ascii=False), encoding="utf-8")
-        # Update current account
-        CURRENT_ACCOUNT_FILE.write_text(json.dumps({"current": account_filename}, ensure_ascii=False), encoding="utf-8")
+        # Update current account. Cookies are now stored per account under
+        # accounts/<name>.json; avoid writing the removed legacy COOKIE_FILE.
+        _set_current_account(account_filename)
         return True
     except Exception as e:
         print(f"[switch_to_account] Error: {e}")
@@ -1778,110 +1781,9 @@ async def public_stats_page():
 
 # ──────────── Gateway Proxy Routes ────────────
 
-_GATEWAY_PATHS = {"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/models"}
+from gateway.routes import register_gateway_routes
 
-
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def gateway_proxy(request: Request, path: str):
-    """Proxy OpenAI-compatible requests through the gateway router."""
-    full_path = f"/v1/{path}"
-
-    # /v1/models — return exposed model names from configured mappings (openai protocol).
-    # Falls back to backend.models[] if no mappings exist yet, so the gateway
-    # still answers something useful pre-config.
-    if full_path == "/v1/models" and request.method == "GET":
-        try:
-            from gateway.model_groups_store import list_exposed_names, ensure_default_initialized
-            ensure_default_initialized()
-            names = list_exposed_names("openai")
-            if not names:
-                from gateway.runtime import get_all_backends
-                seen: set[str] = set()
-                for b in get_all_backends():
-                    for m in b.get("models") or []:
-                        if m and m not in seen:
-                            seen.add(m)
-                            names.append(m)
-            if not names:
-                names = ["mimo-v2.5-pro"]
-            return {
-                "object": "list",
-                "data": [{"id": m, "object": "model", "owned_by": "mimo"} for m in names],
-            }
-        except ImportError:
-            return {"object": "list", "data": [
-                {"id": "mimo-v2.5-pro", "object": "model", "owned_by": "mimo"},
-            ]}
-
-    if full_path not in _GATEWAY_PATHS:
-        return JSONResponse({"error": {"message": f"Unknown path: {full_path}"}}, status_code=404)
-
-    # Auth: accept Bearer token or panel cookie
-    auth = request.headers.get("Authorization", "")
-    is_api_auth = auth.startswith("Bearer ") and auth[7:].strip() == AUTH_TOKEN
-    is_panel_auth = request.cookies.get(AUTH_COOKIE) == AUTH_TOKEN
-    if not is_api_auth and not is_panel_auth:
-        return JSONResponse(
-            {"error": {"message": "Missing or invalid Authorization", "type": "auth_error"}},
-            status_code=401,
-        )
-
-    # Read body
-    body = await request.body()
-    headers = dict(request.headers)
-
-    # Map source path → adapter name (the new pipeline does protocol
-    # encoding/decoding bidirectionally — including streaming SSE frames).
-    adapter_name = "openai_chat"
-    if full_path == "/v1/messages":
-        adapter_name = "anthropic"
-    elif full_path == "/v1/responses":
-        adapter_name = "openai_responses"
-
-    try:
-        from gateway.runtime import dispatch
-        return await dispatch(adapter_name, request)
-    except ImportError:
-        return JSONResponse(
-            {"error": {"message": "Gateway module not installed"}},
-            status_code=503,
-        )
-
-
-@app.options("/v1/{path:path}")
-async def gateway_cors_preflight(path: str):
-    """Handle CORS preflight for gateway routes."""
-    return HTMLResponse(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Max-Age": "86400",
-            "Content-Length": "0",
-        },
-    )
-
-
-@app.get("/health")
-async def gateway_health():
-    """Public health endpoint for the gateway."""
-    try:
-        from gateway.runtime import get_router_status
-        status = get_router_status()
-        return {"status": "ok", **status}
-    except ImportError:
-        return {"status": "ok", "note": "Gateway module not installed"}
-
-
-@app.get("/gateway/status")
-async def gateway_status_page():
-    """Public gateway status (no auth required, for monitoring)."""
-    try:
-        from gateway.runtime import get_router_status
-        return get_router_status()
-    except ImportError:
-        return {"error": "Gateway module not installed"}
+register_gateway_routes(app, auth_cookie=AUTH_COOKIE)
 
 
 if __name__ == "__main__":

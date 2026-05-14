@@ -26,6 +26,7 @@ from typing import Any, Protocol
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.core import (
     AdapterError,
+    AuthError,
     GatewayError,
     InternalEvent,
     ModelNotFoundError,
@@ -110,6 +111,15 @@ class GatewayHandler:
         req = adapter.parse_request(body)
         ctx.model = req.model
         ctx.is_stream = req.stream
+        requested_model = req.model
+
+        principal = getattr(ctx, "principal", None)
+        allowed_models = tuple(getattr(principal, "allowed_models", ()) or ())
+        if allowed_models and requested_model not in allowed_models:
+            raise AuthError(
+                f"API key is not allowed to access model {requested_model!r}",
+                details={"model": requested_model},
+            )
 
         # Resolve the client-facing model name to a native upstream model via
         # the model-mapping store. No match → ModelNotFoundError (404).
@@ -126,8 +136,20 @@ class GatewayHandler:
             req.model = native
             ctx.model = native
 
+        upstream_body = self._codec.serialize_to_upstream(req)
+
+        if req.stream:
+            backend = self._choose_backend(ctx, req.model)
+            return await self._handle_stream(
+                ctx, adapter, backend, upstream_body, self._headers_for(backend),
+            )
+        return await self._handle_non_stream_with_retries(
+            ctx, adapter, req.model, upstream_body,
+        )
+
+    def _choose_backend(self, ctx: RequestContext, model: str, *, exclude: set[str] | None = None):
         backend, decision = self._router.choose(
-            request_id=ctx.request_id, model=req.model,
+            request_id=ctx.request_id, model=model, exclude=exclude,
         )
         ctx.target_backend_id = backend.backend_id
         ctx.upstream_url = backend.base_url.rstrip("/") + self._upstream_path
@@ -137,19 +159,49 @@ class GatewayHandler:
                 self._decision_log.write(decision)
             except Exception:
                 pass  # best-effort
+        return backend
 
-        upstream_body = self._codec.serialize_to_upstream(req)
+    @staticmethod
+    def _headers_for(backend) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if backend.api_key:
             headers["Authorization"] = f"Bearer {backend.api_key}"
+        return headers
 
-        if req.stream:
-            return await self._handle_stream(
-                ctx, adapter, backend, upstream_body, headers,
-            )
-        return await self._handle_non_stream(
-            ctx, adapter, backend, upstream_body, headers,
-        )
+    async def _handle_non_stream_with_retries(
+        self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        tried: set[str] = set()
+        last_error: GatewayError | None = None
+        # Keep retries deliberately small: one retry is enough to mask transient
+        # backend failures without multiplying upstream cost.
+        for _attempt in range(2):
+            try:
+                backend = self._choose_backend(ctx, model, exclude=tried)
+            except GatewayError:
+                if last_error is not None:
+                    raise last_error
+                raise
+            tried.add(backend.backend_id)
+            try:
+                return await self._handle_non_stream(
+                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                )
+            except GatewayError as e:
+                last_error = e
+                if not self._is_retryable_non_stream(e):
+                    raise
+                ctx.decide(f"retry_after:{backend.backend_id}:{e.error_code}")
+                continue
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _is_retryable_non_stream(err: GatewayError) -> bool:
+        status = err.details.get("status") if getattr(err, "details", None) else None
+        if isinstance(status, int):
+            return status >= 500
+        return getattr(err, "http_status", 500) in (502, 503, 504)
 
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
@@ -253,10 +305,6 @@ class GatewayHandler:
                 details={"status": status},
             )
 
-        # Mark success at stream start; mid-stream failures still surface
-        # via the IES StreamError event.
-        backend.record_success()
-
         ies_events = self._codec.parse_upstream_stream(raw_iter)
         # Tee usage out of the IES stream while it flows to the serializer.
         # Upstream usage typically arrives in the final MessageEnd event,
@@ -281,21 +329,31 @@ class GatewayHandler:
         bid = backend.backend_id
 
         async def counted_chunks() -> AsyncIterator[bytes]:
+            error = ""
+            completed = False
             try:
                 async for chunk in client_bytes:
                     ctx.response_chunks += 1
                     yield chunk
+                completed = True
+            except Exception as e:
+                error = f"stream: {type(e).__name__}: {e}"
+                backend.record_failure(error)
+                raise
             finally:
                 latency_ms = (time.monotonic() - started) * 1000
-                backend.record_latency(latency_ms)
+                if completed:
+                    backend.record_success()
+                    backend.record_latency(latency_ms)
                 backend.dec_in_flight()
                 if recorder is not None:
                     try:
                         recorder.record(
-                            ctx=ctx, backend_id=bid, status_code=status,
+                            ctx=ctx, backend_id=bid, status_code=status if completed else 0,
                             latency_ms=latency_ms,
                             prompt_tokens=captured["prompt"],
                             completion_tokens=captured["completion"],
+                            error=error,
                         )
                     except Exception:
                         pass

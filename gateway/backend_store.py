@@ -12,6 +12,7 @@ BackendRegistry from it on startup and after every mutation.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 from pathlib import Path
@@ -81,10 +82,13 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DATA_PATH.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    tmp_path = DATA_PATH.with_name(f"{DATA_PATH.name}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, DATA_PATH)
 
 
 def list_backends() -> list[dict[str, Any]]:

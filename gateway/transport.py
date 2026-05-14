@@ -94,11 +94,6 @@ class HttpxTransport:
         except httpx.HTTPError as e:
             raise UpstreamError(f"Upstream transport error: {e}") from e
 
-        if resp.status_code >= 500:
-            raise UpstreamError(
-                f"Upstream HTTP {resp.status_code}: {resp.text[:200]}",
-                details={"status": resp.status_code},
-            )
         return resp.status_code, resp.content
 
     async def post_stream(
@@ -125,13 +120,6 @@ class HttpxTransport:
             raise UpstreamError(f"Upstream transport error: {e}") from e
 
         status = response.status_code
-        if status >= 500:
-            text = (await response.aread()).decode("utf-8", errors="replace")[:200]
-            await ctx_mgr.__aexit__(None, None, None)
-            raise UpstreamError(
-                f"Upstream HTTP {status}: {text}",
-                details={"status": status},
-            )
 
         async def iter_bytes() -> AsyncIterator[bytes]:
             try:

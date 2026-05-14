@@ -16,6 +16,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from gateway.reasoning_cache import lookup_reasoning, remember_reasoning
 from gateway.core import (
     AdapterError,
     BadRequestError,
@@ -30,6 +31,7 @@ from gateway.core import (
     InternalTool,
     MessageEnd,
     MessageStart,
+    ReasoningDelta,
     StreamError,
     TextDelta,
     ToolCallDelta,
@@ -189,7 +191,12 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     tool_name=fn.get("name", ""),
                     tool_input=tool_input or {},
                 ))
-            return InternalMessage(role="assistant", content=content_blocks)
+            reasoning = m.get("reasoning_content")
+            return InternalMessage(
+                role="assistant",
+                content=content_blocks,
+                reasoning_content=reasoning if isinstance(reasoning, str) else None,
+            )
 
         # user / system: string OR list of content blocks
         raw = m.get("content", "")
@@ -275,6 +282,16 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 "role": "assistant",
                 "content": "".join(text_parts) if text_parts else None,
             }
+            if m.reasoning_content is not None:
+                out["reasoning_content"] = m.reasoning_content
+            elif tool_uses:
+                # MiMo requires reasoning_content to be present in later
+                # thinking-mode tool-call turns. Rehydrate from the gateway
+                # cache when clients dropped this non-standard field; fall
+                # back to an empty string so the field is at least present.
+                out["reasoning_content"] = (
+                    lookup_reasoning(t.tool_id for t in tool_uses) or ""
+                )
             if tool_uses:
                 out["tool_calls"] = [
                     {
@@ -335,6 +352,13 @@ class OpenAIChatAdapter(ProtocolAdapter):
         events: list[InternalEvent] = [MessageStart(message_id=message_id, model=model)]
         next_idx = 0
 
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            events.append(ReasoningDelta(text=reasoning))
+
+        tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
+        remember_reasoning(reasoning, tool_call_ids)
+
         text = msg.get("content")
         if isinstance(text, str) and text:
             events.append(ContentBlockStart(index=next_idx, block_type="text"))
@@ -378,6 +402,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         text_idx: int | None = None
         tool_idx_map: dict[int, int] = {}        # OpenAI idx → IES idx
         tool_id_by_idx: dict[int, str] = {}      # IES idx → tool_id
+        reasoning_parts: list[str] = []
         next_block = 0
         finish_reason: str | None = None
         usage = Usage()
@@ -415,6 +440,11 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     model=last_model,
                 )
                 message_started = True
+
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+                yield ReasoningDelta(text=reasoning)
 
             content = delta.get("content")
             if isinstance(content, str) and content:
@@ -464,6 +494,8 @@ class OpenAIChatAdapter(ProtocolAdapter):
         for ies_idx in sorted(tool_idx_map.values()):
             yield ContentBlockEnd(index=ies_idx)
 
+        remember_reasoning("".join(reasoning_parts), tool_id_by_idx.values())
+
         yield MessageEnd(finish_reason=_map_finish(finish_reason), usage=usage)
 
     # ============ Client serialization (IES → OpenAI Chat output) ============
@@ -502,6 +534,16 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     "choices": [{
                         "index": 0,
                         "delta": {"content": ev.text},
+                        "finish_reason": None,
+                    }],
+                })
+            elif isinstance(ev, ReasoningDelta):
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": ev.text},
                         "finish_reason": None,
                     }],
                 })
@@ -577,6 +619,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         message_id = ""
         model = ""
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls_by_idx: dict[int, dict[str, Any]] = {}
         finish: FinishReason = "stop"
         usage = Usage()
@@ -593,6 +636,8 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 }
             elif isinstance(ev, TextDelta):
                 text_parts.append(ev.text)
+            elif isinstance(ev, ReasoningDelta):
+                reasoning_parts.append(ev.text)
             elif isinstance(ev, ToolCallDelta):
                 if ev.index in tool_calls_by_idx:
                     tool_calls_by_idx[ev.index]["function"]["arguments"] += ev.arguments_delta
@@ -604,6 +649,8 @@ class OpenAIChatAdapter(ProtocolAdapter):
             "role": "assistant",
             "content": "".join(text_parts) if text_parts else None,
         }
+        if reasoning_parts:
+            msg["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls_by_idx:
             msg["tool_calls"] = [tool_calls_by_idx[i] for i in sorted(tool_calls_by_idx)]
 

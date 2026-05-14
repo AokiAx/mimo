@@ -35,6 +35,7 @@ _PROBE_INTERVAL_S = 60.0
 _PROBE_TIMEOUT_S = 5.0
 _PROBE_FAILURE_THRESHOLD = 3
 _PROBE_COOLDOWN_S = 30.0
+_PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 
 # ────────────── singleton state ──────────────
@@ -102,8 +103,8 @@ def _ensure_initialized() -> None:
 
 def _make_metrics_recorder():
     try:
-        from gateway.metrics import SQLiteMetricsRecorder
-        return SQLiteMetricsRecorder()
+        from gateway.metrics import QueuedSQLiteMetricsRecorder
+        return QueuedSQLiteMetricsRecorder()
     except Exception:
         return None
 
@@ -228,38 +229,45 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
 
 
 async def _probe_loop() -> None:
-    """Lightweight HTTP GET /health probe — no tokens wasted."""
+    """Lightweight concurrent HTTP GET /v1/models probe — no tokens wasted."""
     _ensure_initialized()
     assert _registry is not None and _transport is not None
     client = _transport._client  # noqa: SLF001
-    while True:
-        try:
-            for b in _registry.all():
-                if not b.enabled:
-                    continue
-                try:
-                    started = time.monotonic()
-                    resp = await client.get(
-                        b.base_url.rstrip("/") + "/v1/models",
-                        headers={"Authorization": f"Bearer {b.api_key}"} if b.api_key else {},
-                        timeout=_PROBE_TIMEOUT_S,
-                    )
-                    latency = (time.monotonic() - started) * 1000
-                    if 200 <= resp.status_code < 400:
-                        b.record_success()
-                        b.record_latency(latency)
-                    else:
-                        b.record_failure(
-                            f"http {resp.status_code}",
-                            cooldown_s=_PROBE_COOLDOWN_S,
-                            threshold=_PROBE_FAILURE_THRESHOLD,
-                        )
-                except Exception as e:
-                    b.record_failure(
-                        f"{type(e).__name__}: {e}",
+
+    async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
+        async with semaphore:
+            try:
+                started = time.monotonic()
+                resp = await client.get(
+                    backend.base_url.rstrip("/") + "/v1/models",
+                    headers={"Authorization": f"Bearer {backend.api_key}"} if backend.api_key else {},
+                    timeout=_PROBE_TIMEOUT_S,
+                )
+                latency = (time.monotonic() - started) * 1000
+                if 200 <= resp.status_code < 400:
+                    backend.record_success()
+                    backend.record_latency(latency)
+                else:
+                    backend.record_failure(
+                        f"http {resp.status_code}",
                         cooldown_s=_PROBE_COOLDOWN_S,
                         threshold=_PROBE_FAILURE_THRESHOLD,
                     )
+            except Exception as e:
+                backend.record_failure(
+                    f"{type(e).__name__}: {e}",
+                    cooldown_s=_PROBE_COOLDOWN_S,
+                    threshold=_PROBE_FAILURE_THRESHOLD,
+                )
+
+    while True:
+        try:
+            enabled_backends = [b for b in _registry.all() if b.enabled]
+            semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
+            await asyncio.gather(
+                *(_probe_one(b, semaphore) for b in enabled_backends),
+                return_exceptions=True,
+            )
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(_PROBE_INTERVAL_S)
@@ -278,15 +286,37 @@ def start_probe() -> None:
     _probe_task = loop.create_task(_probe_loop())
 
 
+async def shutdown() -> None:
+    """Close runtime-owned background resources."""
+    global _probe_task
+    if _probe_task is not None:
+        _probe_task.cancel()
+        try:
+            await _probe_task
+        except asyncio.CancelledError:
+            pass
+        _probe_task = None
+    if _transport is not None:
+        await _transport.close()
+    if _handler is not None:
+        metrics = getattr(_handler, "_metrics", None)
+        close = getattr(metrics, "close", None)
+        if close is not None:
+            close()
+
+
 # ────────────── helpers ──────────────
 
 
 def _ctx_from_request(request: Request, adapter: ProtocolAdapter) -> RequestContext:
     headers = {k.lower(): v for k, v in request.headers.items()}
+    principal = getattr(request.state, "gateway_principal", None)
     return RequestContext(
         client_ip=request.client.host if request.client else "",
         user_agent=headers.get("user-agent", ""),
         headers=headers,
+        api_key_id=getattr(principal, "key_id", None),
+        principal=principal,
         src_protocol=adapter.name,
         src_path=str(request.url.path),
         src_method=request.method,
@@ -322,4 +352,5 @@ __all__ = [
     "get_all_backends",
     "toggle_backend",
     "start_probe",
+    "shutdown",
 ]

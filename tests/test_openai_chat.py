@@ -36,6 +36,7 @@ from gateway.core import (
     InternalTool,
     MessageEnd,
     MessageStart,
+    ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     Usage,
@@ -140,6 +141,25 @@ def test_parse_request_simple_text():
     assert req.messages[0].content[0].text == "be helpful"
     assert req.messages[1].role == "user"
     assert req.messages[1].content[0].text == "hi"
+
+
+def test_parse_request_preserves_assistant_reasoning_content_with_tool_calls():
+    req = _adapter().parse_request({
+        "model": "m",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "I should call the tool.",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "search", "arguments": "{\"q\":\"x\"}"},
+            }],
+        }],
+    })
+    msg = req.messages[0]
+    assert msg.role == "assistant"
+    assert msg.reasoning_content == "I should call the tool."
+    assert msg.content[0].tool_id == "call_1"
 
 
 def test_parse_request_missing_model_raises():
@@ -363,10 +383,27 @@ def test_serialize_to_upstream_assistant_with_tool_use_renders_tool_calls():
     msgs = body["messages"]
     assert msgs[1]["role"] == "assistant"
     assert msgs[1]["content"] == "ok"
+    assert msgs[1]["reasoning_content"] == ""
     assert msgs[1]["tool_calls"][0]["id"] == "t1"
     assert msgs[1]["tool_calls"][0]["function"]["name"] == "search"
     assert json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]) == {"q": "weather"}
     assert msgs[2] == {"role": "tool", "tool_call_id": "t1", "content": "sunny"}
+
+
+def test_serialize_to_upstream_preserves_assistant_reasoning_content():
+    req = InternalRequest(
+        model="m", max_tokens=128,
+        messages=[InternalMessage(
+            role="assistant",
+            reasoning_content="hidden chain",
+            content=[InternalContent(
+                type="tool_use", tool_id="t1", tool_name="search", tool_input={"q": "x"},
+            )],
+        )],
+    )
+    msg = _adapter().serialize_to_upstream(req)["messages"][0]
+    assert msg["reasoning_content"] == "hidden chain"
+    assert msg["tool_calls"][0]["id"] == "t1"
 
 
 def test_serialize_to_upstream_image_block_kept_as_blocks():
@@ -455,6 +492,28 @@ def test_parse_upstream_response_with_tool_calls():
     assert deltas[1].arguments_delta == '{"y":2}'
     end = events[-1]
     assert isinstance(end, MessageEnd) and end.finish_reason == "tool_calls"
+
+
+def test_parse_upstream_response_preserves_reasoning_content():
+    payload = json.dumps({
+        "id": "chatcmpl-r",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "thinking",
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode()
+    events = _adapter().parse_upstream_response(payload)
+    assert any(isinstance(e, ReasoningDelta) and e.text == "thinking" for e in events)
 
 
 # ───────── parse_upstream_stream ─────────
@@ -569,6 +628,24 @@ def test_parse_upstream_stream_function_call_legacy_mapped_to_tool_calls():
     assert end.finish_reason == "tool_calls"
 
 
+def test_parse_upstream_stream_preserves_reasoning_content_delta():
+    chunks_payloads = [
+        {"id": "x1", "model": "m",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"reasoning_content": "think"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+
+    events = _run(run())
+    assert any(isinstance(e, ReasoningDelta) and e.text == "think" for e in events)
+    assert "answer" == "".join(e.text for e in events if isinstance(e, TextDelta))
+
+
 # ───────── serialize_response_stream (IES → OpenAI SSE) ─────────
 
 
@@ -605,6 +682,21 @@ def test_serialize_response_stream_round_trip_text():
     assert final["usage"]["prompt_tokens"] == 1
     assert final["usage"]["completion_tokens"] == 2
     assert final["usage"]["total_tokens"] == 3
+
+
+def test_serialize_response_stream_emits_reasoning_content_delta():
+    async def feed() -> AsyncIterator[InternalEvent]:
+        yield MessageStart(message_id="x", model="m")
+        yield ReasoningDelta(text="think")
+        yield MessageEnd(finish_reason="stop", usage=Usage())
+
+    raw = _run(_drain(_adapter().serialize_response_stream(feed())))
+    payloads = [
+        json.loads(c[6:].decode())
+        for c in raw.split(b"\n\n")
+        if c and c != b"data: [DONE]" and c.startswith(b"data: ")
+    ]
+    assert {"reasoning_content": "think"} in [p["choices"][0]["delta"] for p in payloads]
 
 
 def test_serialize_response_stream_tool_call_delta():
@@ -662,6 +754,16 @@ def test_serialize_response_collects_text():
     assert body["usage"]["total_tokens"] == 4
 
 
+def test_serialize_response_collects_reasoning_content():
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-r", model="m"),
+        ReasoningDelta(text="hidden"),
+        MessageEnd(finish_reason="stop", usage=Usage()),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    assert body["choices"][0]["message"]["reasoning_content"] == "hidden"
+
+
 def test_serialize_response_collects_tool_calls():
     events: list[InternalEvent] = [
         MessageStart(message_id="chatcmpl-2", model="m"),
@@ -709,3 +811,60 @@ def test_error_envelope_openai_shape():
             "code": "invalid_request",
         }
     }
+
+
+def test_reasoning_cache_rehydrates_missing_assistant_reasoning_content():
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+    _adapter().parse_upstream_response(json.dumps({
+        "id": "chatcmpl-r",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "cached reasoning",
+                "tool_calls": [{
+                    "id": "call_cached", "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode())
+
+    req = _adapter().parse_request({
+        "model": "m",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_cached", "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }],
+        }],
+    })
+    msg = _adapter().serialize_to_upstream(req)["messages"][0]
+    assert msg["reasoning_content"] == "cached reasoning"
+
+
+def test_missing_uncached_assistant_tool_call_gets_reasoning_content_field():
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+    req = _adapter().parse_request({
+        "model": "m",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "unknown", "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }],
+        }],
+    })
+    msg = _adapter().serialize_to_upstream(req)["messages"][0]
+    assert "reasoning_content" in msg
+    assert msg["reasoning_content"] == ""
