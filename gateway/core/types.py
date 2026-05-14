@@ -52,6 +52,9 @@ Role = Literal["system", "user", "assistant", "tool"]
 class InternalMessage:
     role: Role
     content: list[InternalContent]
+    # MiMo/OpenAI-style hidden reasoning that must round-trip when assistant
+    # history contains tool calls in thinking mode.
+    reasoning_content: str | None = None
 
 
 # ────────────── Tool definitions (request-side) ──────────────
@@ -126,6 +129,12 @@ class ContentBlockStart(InternalEvent):
 class TextDelta(InternalEvent):
     """Incremental text inside the current text content block."""
     index: int
+    text: str
+
+
+@dataclass
+class ReasoningDelta(InternalEvent):
+    """Incremental hidden reasoning_content for the assistant message."""
     text: str
 
 
