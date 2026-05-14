@@ -200,3 +200,19 @@ def test_init_migrates_legacy_schema(tmp_path):
     cols = {r[1] for r in fresh.execute("PRAGMA table_info(requests)").fetchall()}
     assert {"prompt_tokens", "completion_tokens", "model", "request_id"} <= cols
     fresh.close()
+
+
+def test_queued_sqlite_recorder_writes_in_background(metrics_module):
+    m = metrics_module
+    rec = m.QueuedSQLiteMetricsRecorder(batch_size=10, flush_interval_s=0.01)
+    ctx = _Ctx()
+    rec.record(
+        ctx=ctx, backend_id="queued", status_code=200,
+        latency_ms=12.3, prompt_tokens=3, completion_tokens=4,
+    )
+    rec.close()
+    s = m.get_metrics_summary()
+    assert s["total_24h"] == 1
+    assert s["recent"][0]["backend"] == "queued"
+    assert s["recent"][0]["prompt_tokens"] == 3
+    assert s["recent"][0]["completion_tokens"] == 4

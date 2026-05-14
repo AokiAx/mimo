@@ -14,6 +14,7 @@ total-tokens page without re-reading raw payloads.
 """
 from __future__ import annotations
 
+import queue
 import sqlite3
 import threading
 import time
@@ -80,6 +81,60 @@ _init_db(_get_conn())
 # ───────── writers ─────────
 
 
+def _insert_records(records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    conn = _get_thread_conn()
+    conn.executemany(
+        "INSERT INTO requests (ts, method, path, backend_id, status_code, "
+        "latency_ms, source_format, is_stream, error, prompt_tokens, "
+        "completion_tokens, model, request_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                r["ts"], r["method"], r["path"], r["backend_id"], r["status_code"],
+                r["latency_ms"], r["source_format"], int(r["is_stream"]), r["error"],
+                int(r["prompt_tokens"]), int(r["completion_tokens"]),
+                r["model"], r["request_id"],
+            )
+            for r in records
+        ],
+    )
+    conn.commit()
+
+
+def _request_record(
+    method: str,
+    path: str,
+    backend_id: str = "",
+    status_code: int = 0,
+    latency_ms: float = 0,
+    source_format: str = "",
+    is_stream: bool = False,
+    error: str = "",
+    *,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    model: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "ts": time.time(),
+        "method": method,
+        "path": path,
+        "backend_id": backend_id,
+        "status_code": status_code,
+        "latency_ms": latency_ms,
+        "source_format": source_format,
+        "is_stream": is_stream,
+        "error": error,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "model": model,
+        "request_id": request_id,
+    }
+
+
 def record_request(
     method: str,
     path: str,
@@ -95,21 +150,16 @@ def record_request(
     model: str = "",
     request_id: str = "",
 ) -> None:
-    """Record a request to SQLite. Failures are swallowed."""
+    """Record a request to SQLite synchronously. Failures are swallowed."""
     try:
-        conn = _get_thread_conn()
-        conn.execute(
-            "INSERT INTO requests (ts, method, path, backend_id, status_code, "
-            "latency_ms, source_format, is_stream, error, prompt_tokens, "
-            "completion_tokens, model, request_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                time.time(), method, path, backend_id, status_code,
-                latency_ms, source_format, int(is_stream), error,
-                int(prompt_tokens), int(completion_tokens), model, request_id,
-            ),
-        )
-        conn.commit()
+        _insert_records([
+            _request_record(
+                method, path, backend_id, status_code, latency_ms, source_format,
+                is_stream, error, prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens, model=model,
+                request_id=request_id,
+            )
+        ])
     except Exception:
         pass
 
@@ -147,6 +197,134 @@ class SQLiteMetricsRecorder:
             model=getattr(ctx, "model", "") or "",
             request_id=getattr(ctx, "request_id", "") or "",
         )
+
+
+class QueuedSQLiteMetricsRecorder:
+    """Non-blocking metrics recorder for the request path.
+
+    ``record`` extracts primitive values from the RequestContext and enqueues a
+    row for a daemon worker. The worker batches inserts so SQLite commits no
+    longer sit directly on the gateway hot path. If the queue is full, metrics
+    are dropped rather than delaying user requests.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_queue: int = 10_000,
+        batch_size: int = 100,
+        flush_interval_s: float = 0.25,
+    ):
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=max_queue)
+        self._batch_size = max(1, int(batch_size))
+        self._flush_interval_s = max(0.01, float(flush_interval_s))
+        self._dropped = 0
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._worker, name="mimo-metrics-writer", daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    def record(
+        self,
+        *,
+        ctx: Any,
+        backend_id: str,
+        status_code: int,
+        latency_ms: float,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        error: str = "",
+    ) -> None:
+        if self._closed:
+            return
+        row = _request_record(
+            method=getattr(ctx, "src_method", "POST") or "POST",
+            path=getattr(ctx, "src_path", "") or "",
+            backend_id=backend_id,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            source_format=getattr(ctx, "src_protocol", "") or "",
+            is_stream=bool(getattr(ctx, "is_stream", False)),
+            error=error,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=getattr(ctx, "model", "") or "",
+            request_id=getattr(ctx, "request_id", "") or "",
+        )
+        try:
+            self._queue.put_nowait(row)
+        except queue.Full:
+            self._dropped += 1
+
+    def flush(self, timeout_s: float = 2.0) -> None:
+        """Block until queued rows are written or timeout elapses."""
+        deadline = time.monotonic() + timeout_s
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Make room for the sentinel by dropping one pending row.
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                pass
+            self._queue.put_nowait(None)
+        self._thread.join(timeout=2.0)
+
+    def _worker(self) -> None:
+        batch: list[dict[str, Any]] = []
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                if batch:
+                    self._write_batch(batch)
+                    batch = []
+                break
+            batch.append(item)
+            self._queue.task_done()
+
+            # Drain more rows without waiting so bursts become one SQLite commit.
+            while len(batch) < self._batch_size:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._queue.task_done()
+                    self._write_batch(batch)
+                    return
+                batch.append(item)
+                self._queue.task_done()
+
+            if len(batch) >= self._batch_size:
+                self._write_batch(batch)
+                batch = []
+            else:
+                # Bound the flush delay for low-QPS deployments.
+                time.sleep(self._flush_interval_s)
+                if batch:
+                    self._write_batch(batch)
+                    batch = []
+
+    @staticmethod
+    def _write_batch(batch: list[dict[str, Any]]) -> None:
+        try:
+            _insert_records(batch)
+        except Exception:
+            pass
 
 
 # ───────── readers ─────────

@@ -103,8 +103,8 @@ def _ensure_initialized() -> None:
 
 def _make_metrics_recorder():
     try:
-        from gateway.metrics import SQLiteMetricsRecorder
-        return SQLiteMetricsRecorder()
+        from gateway.metrics import QueuedSQLiteMetricsRecorder
+        return QueuedSQLiteMetricsRecorder()
     except Exception:
         return None
 
@@ -286,15 +286,37 @@ def start_probe() -> None:
     _probe_task = loop.create_task(_probe_loop())
 
 
+async def shutdown() -> None:
+    """Close runtime-owned background resources."""
+    global _probe_task
+    if _probe_task is not None:
+        _probe_task.cancel()
+        try:
+            await _probe_task
+        except asyncio.CancelledError:
+            pass
+        _probe_task = None
+    if _transport is not None:
+        await _transport.close()
+    if _handler is not None:
+        metrics = getattr(_handler, "_metrics", None)
+        close = getattr(metrics, "close", None)
+        if close is not None:
+            close()
+
+
 # ────────────── helpers ──────────────
 
 
 def _ctx_from_request(request: Request, adapter: ProtocolAdapter) -> RequestContext:
     headers = {k.lower(): v for k, v in request.headers.items()}
+    principal = getattr(request.state, "gateway_principal", None)
     return RequestContext(
         client_ip=request.client.host if request.client else "",
         user_agent=headers.get("user-agent", ""),
         headers=headers,
+        api_key_id=getattr(principal, "key_id", None),
+        principal=principal,
         src_protocol=adapter.name,
         src_path=str(request.url.path),
         src_method=request.method,
@@ -330,4 +352,5 @@ __all__ = [
     "get_all_backends",
     "toggle_backend",
     "start_probe",
+    "shutdown",
 ]
