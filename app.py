@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -17,6 +18,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+
+from gateway.logging_setup import list_log_files, read_log_tail, setup_logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
@@ -31,6 +34,9 @@ MIMO_BASE = "https://aistudio.xiaomimimo.com"
 
 app = FastAPI(title="MiMo Manager")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+LOG_DIR = setup_logging(BASE_DIR)
+logger = logging.getLogger(__name__)
 
 # ── Credentials (from data/secrets.json, no hardcoded values) ──
 from gateway.secrets_store import secrets as _secrets
@@ -87,6 +93,16 @@ async def do_login(request: Request):
     return RedirectResponse("/login?err=1", status_code=302)
 
 @app.middleware("http")
+async def error_logging_middleware(request: Request, call_next):
+    """Log unhandled request exceptions to rotated error logs."""
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception("Unhandled request error: %s %s", request.method, request.url.path)
+        raise
+
+
+@app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path in ("/login", "/do_login") or path.startswith("/static"):
@@ -114,18 +130,18 @@ async def startup_event():
     # (e.g. when first deploying to a new host — operators usually want to
     # verify accounts / cookies before letting cron fire real Claw deploys).
     if os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
-        print("[startup] DISABLE_SCHEDULER set — auto-deploy scheduler not started", flush=True)
+        logger.info("[startup] DISABLE_SCHEDULER set — auto-deploy scheduler not started")
     else:
         try:
             from claw.auto_deploy import start_scheduler
             start_scheduler()
         except Exception as e:
-            print(f"[startup] Failed to start scheduler: {e}")
+            logger.exception("[startup] Failed to start scheduler")
     try:
         from gateway.runtime import start_probe as start_router_probe
         start_router_probe()
     except Exception as e:
-        print(f"[startup] Failed to start gateway probe: {e}")
+        logger.exception("[startup] Failed to start gateway probe")
 
 
 @app.on_event("shutdown")
@@ -142,12 +158,12 @@ async def shutdown_event():
         from gateway.runtime import shutdown as shutdown_gateway_runtime
         await shutdown_gateway_runtime()
     except Exception as e:
-        print(f"[shutdown] Failed to close gateway runtime: {e}")
+        logger.exception("[shutdown] Failed to close gateway runtime")
     try:
         from gateway.auth import close_key_store
         close_key_store()
     except Exception as e:
-        print(f"[shutdown] Failed to close gateway auth store: {e}")
+        logger.exception("[shutdown] Failed to close gateway auth store")
 
 # ──────────── Account management helpers ────────────
 
@@ -391,6 +407,34 @@ async def acurl(method, path, body=None, with_ph=True, cookies=None):
 async def index():
     html_file = BASE_DIR / "templates" / "index.html"
     return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
+
+
+def _log_retention_days() -> int:
+    try:
+        return max(1, int(os.environ.get("MIMO_LOG_RETENTION_DAYS", "14")))
+    except ValueError:
+        return 14
+
+
+@app.get("/api/logs")
+async def api_logs_list():
+    """List application log files available to the authenticated panel."""
+    return {
+        "log_dir": str(LOG_DIR),
+        "files": list_log_files(LOG_DIR),
+        "retention_days": _log_retention_days(),
+    }
+
+
+@app.get("/api/logs/tail")
+async def api_logs_tail(file: str = "error.log", lines: int = 300):
+    """Return the tail of a selected log file for troubleshooting."""
+    try:
+        return {"success": True, "file": file, "content": read_log_tail(LOG_DIR, file, lines=lines)}
+    except FileNotFoundError:
+        return JSONResponse({"success": False, "error": "Log file not found"}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
 
 # ──────────── Status overview ────────────
 
@@ -1231,7 +1275,7 @@ def switch_to_account(account_filename: str) -> bool:
         _set_current_account(account_filename)
         return True
     except Exception as e:
-        print(f"[switch_to_account] Error: {e}")
+        logger.exception("[switch_to_account] Error")
         return False
 
 

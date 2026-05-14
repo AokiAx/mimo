@@ -58,3 +58,6 @@ gateway.yaml
 
 # Scratch
 .scratch_*
+
+# Application log files
+logs/

@@ -95,6 +95,16 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 @keyframes spin{to{transform:rotate(360deg)}}
 .meta{font-size:0.78rem;color:var(--text3);margin-top:6px}
 
+/* Logs */
+.log-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.log-toolbar select{max-width:260px}
+.log-toolbar input{max-width:120px}
+.log-viewer{background:#050914;border:1px solid var(--border);border-radius:8px;padding:14px;min-height:420px;max-height:65vh;overflow:auto;color:#b9c7d9;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:0.78rem;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+.log-meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px}
+.log-meta-card{background:#0d1b2a;border:1px solid var(--border);border-radius:8px;padding:10px}
+.log-meta-card .k{font-size:0.72rem;color:var(--text3);margin-bottom:4px}
+.log-meta-card .v{font-size:0.84rem;color:var(--text);word-break:break-all}
+
 /* Page visibility */
 .page{display:none}
 .page.active{display:block}
@@ -217,6 +227,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     </div>
     <div class="nav-item" data-page="deploy" onclick="switchPage('deploy')">
       <span class="icon">🚀</span><span>自动部署</span>
+    </div>
+    <div class="nav-item" data-page="logs" onclick="switchPage('logs')">
+      <span class="icon">🧾</span><span>系统日志</span>
     </div>
   </div>
 
@@ -412,6 +425,31 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <button class="btn btn-ghost" onclick="document.getElementById('historyPanel').style.display='none'" style="padding:4px 10px;font-size:0.75rem">关闭</button>
         </div>
         <div id="historyContent" style="max-height:400px;overflow-y:auto"></div>
+      </div>
+    </div>
+
+    <!-- ════ System Logs ════ -->
+    <div class="page" id="page-logs">
+      <div class="section">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+          <h2 style="margin:0">系统日志</h2>
+          <div class="btn-group" style="margin:0">
+            <button class="btn btn-primary" onclick="refreshLogs()">刷新</button>
+            <button class="btn btn-ghost" onclick="toggleLogAutoRefresh()" id="logAutoBtn">自动刷新：关</button>
+          </div>
+        </div>
+        <div class="log-meta-grid">
+          <div class="log-meta-card"><div class="k">日志目录</div><div class="v" id="logDir">—</div></div>
+          <div class="log-meta-card"><div class="k">保留天数</div><div class="v" id="logRetention">—</div></div>
+          <div class="log-meta-card"><div class="k">最近更新时间</div><div class="v" id="logUpdatedAt">—</div></div>
+        </div>
+        <div class="log-toolbar">
+          <select id="logFileSelect" onchange="loadSelectedLog()"></select>
+          <input type="number" id="logLines" min="50" max="5000" value="300" title="读取最后 N 行">
+          <button class="btn btn-ghost" onclick="loadSelectedLog()">读取尾部</button>
+          <span class="meta">app.log 记录运行信息，error.log 仅记录 ERROR 及以上级别；日志按天分割并自动删除过期历史。</span>
+        </div>
+        <pre class="log-viewer" id="logViewer">选择日志后点击刷新。</pre>
       </div>
     </div>
 
@@ -682,7 +720,7 @@ function formatUptime(sec) {
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
   dashboard: '概览', accounts: '账号 & Claw',
-  chat: 'Claw 对话', deploy: '自动部署',
+  chat: 'Claw 对话', deploy: '自动部署', logs: '系统日志',
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
@@ -705,6 +743,7 @@ function switchPage(name) {
   if (name === 'accounts') refreshAccountsFull();
   if (name === 'chat') refreshChatHeader();
   if (name === 'deploy') refreshAccounts();
+  if (name === 'logs') refreshLogs();
   if (name === 'gateway') refreshGateway();
   if (name === 'backends') refreshBackends();
   if (name === 'mappings') refreshMappings();
@@ -2087,6 +2126,62 @@ function updateClock() {
 }
 updateClock();
 setInterval(updateClock, 1000);
+
+// System logs
+var logAutoTimer = null;
+function formatBytes(n) {
+  n = Number(n || 0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+function refreshLogs() {
+  return api('GET', '/api/logs').then(function(d) {
+    document.getElementById('logDir').textContent = d.log_dir || '—';
+    document.getElementById('logRetention').textContent = (d.retention_days || '—') + ' 天';
+    document.getElementById('logUpdatedAt').textContent = new Date().toLocaleString();
+    var sel = document.getElementById('logFileSelect');
+    var old = sel.value || 'error.log';
+    var files = d.files || [];
+    sel.innerHTML = files.map(function(f) {
+      var label = f.name + ' · ' + formatBytes(f.size) + (f.active ? ' · 当前' : '');
+      return '<option value="' + escapeHtml(f.name) + '">' + escapeHtml(label) + '</option>';
+    }).join('');
+    if (!files.length) {
+      sel.innerHTML = '<option value="error.log">暂无日志文件</option>';
+      document.getElementById('logViewer').textContent = '暂无日志文件。';
+      return;
+    }
+    sel.value = files.some(function(f) { return f.name === old; }) ? old : (files.some(function(f) { return f.name === 'error.log'; }) ? 'error.log' : files[0].name);
+    return loadSelectedLog();
+  }).catch(function(e) {
+    document.getElementById('logViewer').textContent = '加载日志列表失败：' + e;
+  });
+}
+function loadSelectedLog() {
+  var sel = document.getElementById('logFileSelect');
+  var file = sel.value || 'error.log';
+  var lines = Math.max(50, Math.min(5000, Number(document.getElementById('logLines').value || 300)));
+  return api('GET', '/api/logs/tail?file=' + encodeURIComponent(file) + '&lines=' + lines).then(function(d) {
+    var viewer = document.getElementById('logViewer');
+    viewer.textContent = d.success ? (d.content || '（空日志）') : (d.error || '读取失败');
+    viewer.scrollTop = viewer.scrollHeight;
+  }).catch(function(e) {
+    document.getElementById('logViewer').textContent = '读取日志失败：' + e;
+  });
+}
+function toggleLogAutoRefresh() {
+  var btn = document.getElementById('logAutoBtn');
+  if (logAutoTimer) {
+    clearInterval(logAutoTimer);
+    logAutoTimer = null;
+    btn.textContent = '自动刷新：关';
+  } else {
+    logAutoTimer = setInterval(loadSelectedLog, 5000);
+    btn.textContent = '自动刷新：开';
+    loadSelectedLog();
+  }
+}
 
 // Initial load: respect URL hash (so refresh stays on the same page)
 switchPage(pageFromHash());
