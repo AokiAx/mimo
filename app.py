@@ -1400,6 +1400,16 @@ async def gateway_backend_toggle(backend_id: str):
         return {"success": False, "error": "Gateway module not installed"}
 
 
+@app.post("/api/gateway/backends/{backend_id}/activate")
+async def gateway_backend_activate(backend_id: str):
+    """Hard-switch traffic to a backend and drain peers serving the same models."""
+    try:
+        from gateway.runtime import activate_backend
+        return activate_backend(backend_id)
+    except ImportError:
+        return {"success": False, "error": "Gateway module not installed"}
+
+
 @app.post("/api/gateway/backends/reload")
 async def gateway_backends_reload():
     """Re-read backends.json and rebuild the backend registry."""

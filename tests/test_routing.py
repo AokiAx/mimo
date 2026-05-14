@@ -209,11 +209,11 @@ def test_backend_routing_score_combines_latency_and_load():
     assert b.routing_score() == pytest.approx(100.0)
 
 
-def test_backend_routing_score_unobserved_treats_latency_as_one():
-    """Fresh backends shouldn't be penalised by their lack of history."""
+def test_backend_routing_score_unobserved_uses_conservative_latency():
+    """Fresh active backends should not look faster than warmed peers."""
     b = _backend()
     assert b.ewma_latency_ms == 0.0
-    assert b.routing_score() == pytest.approx(1.0)
+    assert b.routing_score() == pytest.approx(250.0)
 
 
 # ───────── Router score-based selection ─────────

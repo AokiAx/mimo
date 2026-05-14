@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+import pytest
+
+from gateway.routing import Backend, BackendRegistry, Router
+from gateway.core import BackendUnavailableError
+import gateway.backend_store as backend_store
+import gateway.runtime as runtime
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime(monkeypatch, tmp_path):
+    path = tmp_path / "backends.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"backends": []}), encoding="utf-8")
+    monkeypatch.setattr(backend_store, "DATA_PATH", path)
+    for name in ("_registry", "_router", "_transport", "_handler", "_decision_log"):
+        monkeypatch.setattr(runtime, name, None)
+    monkeypatch.setattr(runtime, "_adapters", {})
+    yield
+
+
+def _backend(backend_id: str, *, lifecycle: str = "active") -> Backend:
+    b = Backend(
+        backend_id=backend_id,
+        base_url=f"http://{backend_id}.example",
+        models=["mimo-v2.5-pro"],
+        account_id=backend_id,
+        lifecycle=lifecycle,
+    )
+    b.record_success()
+    return b
+
+
+def test_router_excludes_warming_and_draining_backends():
+    active = _backend("active")
+    warming = _backend("warming", lifecycle="warming")
+    draining = _backend("draining", lifecycle="draining")
+    router = Router(BackendRegistry([warming, draining, active]))
+
+    chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
+
+    assert chosen.backend_id == "active"
+    assert decision.excluded["warming"] == "lifecycle=warming"
+    assert decision.excluded["draining"] == "lifecycle=draining"
+
+
+def test_router_raises_when_only_warming_backend_exists():
+    router = Router(BackendRegistry([_backend("warming", lifecycle="warming")]))
+
+    with pytest.raises(BackendUnavailableError):
+        router.choose(request_id="r1", model="mimo-v2.5-pro")
+
+
+def test_activate_backend_hard_switches_and_drains_active_peer(monkeypatch):
+    old = _backend("old")
+    old.active_since = 100.0
+    new = _backend("new", lifecycle="warming")
+    reg = BackendRegistry([old, new])
+    monkeypatch.setattr(runtime, "_registry", reg)
+
+    result = runtime.activate_backend("new")
+
+    assert result["success"] is True
+    assert new.lifecycle == "active"
+    assert old.lifecycle == "draining"
+    assert old.drain_deadline > old.draining_since
+
+
+def test_reap_drained_keeps_in_flight_until_deadline(monkeypatch):
+    b = _backend("old", lifecycle="draining")
+    b.in_flight = 1
+    b.draining_since = 100.0
+    b.drain_deadline = 200.0
+    reg = BackendRegistry([b])
+    monkeypatch.setattr(runtime, "_registry", reg)
+
+    runtime._reap_drained(now=150.0)
+    assert reg.get("old") is b
+
+    runtime._reap_drained(now=250.0)
+    assert reg.get("old") is None
+
+
+class FakeTransport:
+    def __init__(self):
+        self.json_bodies = []
+        self.stream_bodies = []
+
+    async def post_json(self, url, body, *, headers=None, timeout_s=60.0):
+        self.json_bodies.append(body)
+        if body.get("tools"):
+            return 200, b'{"choices":[{"message":{"tool_calls":[]}}]}'
+        return 200, b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    async def post_stream(self, url, body, *, headers=None, timeout_s=600.0):
+        self.stream_bodies.append(body)
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield b'data: {"choices":[{"delta":{"content":"o"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+        return 200, chunks()
+
+
+def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
+    fake = FakeTransport()
+    monkeypatch.setattr(runtime, "_transport", fake)
+    backend = _backend("candidate", lifecycle="warming")
+
+    ok, reason, latency_ms = asyncio.run(runtime._run_readiness_checks(backend))
+
+    assert ok is True
+    assert reason == "ready"
+    assert latency_ms >= 0
+    assert len(fake.json_bodies) == 2
+    assert len(fake.stream_bodies) == 1
+    assert fake.json_bodies[0]["stream"] is False
+    assert fake.stream_bodies[0]["stream"] is True
+    assert fake.json_bodies[1]["tools"][0]["function"]["name"] == "gateway_readiness_ping"
+    assert fake.json_bodies[1]["tool_choice"]["function"]["name"] == "gateway_readiness_ping"

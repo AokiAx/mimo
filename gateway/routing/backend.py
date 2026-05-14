@@ -7,6 +7,7 @@ from typing import Literal
 
 
 HealthState = Literal["alive", "degraded", "dead", "unknown"]
+LifecycleState = Literal["standby", "warming", "active", "draining", "failed", "disabled"]
 
 
 @dataclass
@@ -15,20 +16,13 @@ class Backend:
 
     Identity comes from ``backend_id``; ``base_url`` is the URL the gateway
     POSTs ``/v1/chat/completions`` to. ``account_id`` lets the auto-deploy
-    pipeline (untouched by this refactor) tie a backend back to the Studio
-    account that produced it.
+    pipeline tie a backend back to the Studio account that produced it.
 
-    ``models`` lists every native model name this Claw serves (a single MiMo
-    Claw usually exposes ~9 native models). The router matches a request if
-    ``req.model in b.models`` — no notion of "primary".
-
-    Health/breaker fields are intentionally simple — no rolling windows,
-    no failure-rate math. We trust the chat probe to be the source of
-    truth and use consecutive_failures as the only suppression signal.
-
-    Routing fields (``in_flight``, ``ewma_latency_ms``) feed the router's
-    score = latency * (1 + in_flight) / weight; mutations are non-atomic
-    but safe under asyncio (cooperative single-thread).
+    ``lifecycle`` controls traffic during account rotation:
+    ``standby`` backends are eligible for the next rotation, ``warming``
+    backends are being readiness-checked, ``active`` backends can receive new
+    requests, and ``draining`` backends keep existing requests alive while the
+    router stops assigning fresh traffic to them.
     """
 
     backend_id: str
@@ -47,6 +41,18 @@ class Backend:
 
     # Enable/disable (user-controlled, persisted in backends.json)
     enabled: bool = True
+
+    # Lifecycle / rotation
+    lifecycle: LifecycleState = "active"
+    generation_id: str = ""
+    ready_at: float = 0.0
+    active_since: float = 0.0
+    draining_since: float = 0.0
+    drain_deadline: float = 0.0
+    readiness_successes: int = 0
+    readiness_failures: int = 0
+    rotation_failures: int = 0
+    disabled_until: float = 0.0
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
@@ -73,6 +79,65 @@ class Backend:
 
     def reset_breaker(self) -> None:
         self.open_until = 0.0
+
+    # ───── lifecycle helpers ─────
+
+    def is_temporarily_disabled(self, now: float | None = None) -> bool:
+        return (now or time.time()) < self.disabled_until
+
+    def mark_standby(self) -> None:
+        self.lifecycle = "standby"
+        self.draining_since = 0.0
+        self.drain_deadline = 0.0
+        self.readiness_successes = 0
+        self.readiness_failures = 0
+
+    def mark_warming(self, *, now: float | None = None) -> None:
+        self.lifecycle = "warming"
+        self.draining_since = 0.0
+        self.drain_deadline = 0.0
+        self.ready_at = 0.0
+        self.readiness_successes = 0
+        self.readiness_failures = 0
+        self.last_probe_at = now or time.time()
+
+    def mark_active(self, *, now: float | None = None) -> None:
+        n = now or time.time()
+        self.lifecycle = "active"
+        self.ready_at = self.ready_at or n
+        self.active_since = n
+        self.draining_since = 0.0
+        self.drain_deadline = 0.0
+        self.disabled_until = 0.0
+        self.readiness_successes = 0
+        self.readiness_failures = 0
+        self.reset_breaker()
+        if self.health in ("unknown", "dead"):
+            self.health = "alive"
+
+    def mark_draining(self, *, drain_timeout_s: float, now: float | None = None) -> None:
+        n = now or time.time()
+        self.lifecycle = "draining"
+        self.draining_since = n
+        self.drain_deadline = n + drain_timeout_s
+
+    def mark_failed_rotation(
+        self,
+        error: str,
+        *,
+        disable_after: int,
+        disabled_for_s: float,
+        now: float | None = None,
+    ) -> None:
+        n = now or time.time()
+        self.lifecycle = "failed"
+        self.readiness_failures += 1
+        self.rotation_failures += 1
+        self.record_failure(error, now=n)
+        if self.rotation_failures >= disable_after:
+            self.lifecycle = "disabled"
+            self.enabled = False
+            self.disabled_until = n + disabled_for_s
 
     # ───── health helpers ─────
 
@@ -108,6 +173,10 @@ class Backend:
     def is_selectable(self, now: float | None = None) -> bool:
         if not self.enabled:
             return False
+        if self.lifecycle != "active":
+            return False
+        if self.is_temporarily_disabled(now):
+            return False
         if self.is_open(now):
             return False
         if self.health == "dead":
@@ -135,9 +204,8 @@ class Backend:
     def routing_score(self) -> float:
         """Lower is better. Combines latency, current load, and weight.
 
-        Unobserved latency is treated as 1ms so fresh backends compete
-        fairly with established ones (and any in-flight load still
-        differentiates them once requests start landing).
+        Unobserved latency is deliberately conservative so a newly promoted
+        backend does not steal all traffic before readiness probes seed EWMA.
         """
-        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 1.0
+        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 250.0
         return base * (1 + self.in_flight) / max(self.weight, 1)

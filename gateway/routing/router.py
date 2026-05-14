@@ -77,7 +77,15 @@ class Router:
                 excluded[b.backend_id] = f"serves {b.models!r}, not {model!r}"
                 continue
             if not b.is_selectable(now):
-                if b.is_open(now):
+                if not b.enabled:
+                    excluded[b.backend_id] = "disabled"
+                elif getattr(b, "lifecycle", "active") != "active":
+                    excluded[b.backend_id] = f"lifecycle={b.lifecycle}"
+                elif b.is_temporarily_disabled(now):
+                    excluded[b.backend_id] = (
+                        f"temporarily disabled for {b.disabled_until - now:.1f}s"
+                    )
+                elif b.is_open(now):
                     excluded[b.backend_id] = (
                         f"breaker open until {b.open_until - now:.1f}s"
                     )

@@ -137,6 +137,7 @@ def add_backend(
         "weight": max(1, int(weight)),
         "account_id": account_id,
         "enabled": True,
+        "lifecycle": "warming",
     }
     with _lock:
         data = _load()
@@ -150,7 +151,8 @@ def add_backend(
 
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
     allowed = {"name", "base_url", "models", "api_key", "weight",
-               "account_id", "enabled"}
+               "account_id", "enabled", "lifecycle", "generation_id",
+               "rotation_failures", "disabled_until"}
     # Legacy: caller passes {model, aliases} — fold into models.
     if "model" in fields or "aliases" in fields:
         legacy = []
