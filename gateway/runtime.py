@@ -527,7 +527,7 @@ async def _probe_loop() -> None:
 
     async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
-            if backend.lifecycle in ("disabled", "failed"):
+            if backend.lifecycle == "disabled":
                 return
             try:
                 started = time.monotonic()
@@ -540,6 +540,14 @@ async def _probe_loop() -> None:
                 if 200 <= resp.status_code < 400:
                     backend.record_success()
                     backend.record_latency(latency)
+                    # Recovery: a failed backend that passes liveness check
+                    # goes back to standby so the rotation loop can re-warm it.
+                    if backend.lifecycle == "failed":
+                        backend.mark_standby()
+                        logger.info(
+                            "Backend %s recovered from failed → standby",
+                            backend.backend_id,
+                        )
                 else:
                     backend.record_failure(
                         f"http {resp.status_code}",

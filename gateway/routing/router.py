@@ -89,6 +89,10 @@ class Router:
                     excluded[b.backend_id] = (
                         f"breaker open until {b.open_until - now:.1f}s"
                     )
+                elif b.max_in_flight and b.in_flight >= b.max_in_flight:
+                    excluded[b.backend_id] = (
+                        f"saturated: in_flight={b.in_flight} >= max={b.max_in_flight}"
+                    )
                 else:
                     excluded[b.backend_id] = f"health={b.health}"
                 continue

@@ -61,6 +61,7 @@ class Backend:
 
     # Routing / load balancing
     in_flight: int = 0                       # current concurrent requests
+    max_in_flight: int = 50                  # reject new routing when saturated
     ewma_latency_ms: float = 0.0             # exponential moving average
     latency_alpha: float = 0.3               # EWMA smoothing factor
     total_requests: int = 0                  # lifetime success counter
@@ -180,6 +181,8 @@ class Backend:
         if self.is_open(now):
             return False
         if self.health == "dead":
+            return False
+        if self.max_in_flight and self.in_flight >= self.max_in_flight:
             return False
         return True
 
