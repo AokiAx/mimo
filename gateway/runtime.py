@@ -788,7 +788,7 @@ def _readiness_non_stream_body(backend: Backend) -> dict[str, Any]:
     return {
         "model": _readiness_model(backend),
         "messages": [{"role": "user", "content": _READINESS_PROMPT}],
-        "max_tokens": 1,
+        "max_tokens": 256,
         "stream": False,
     }
 
