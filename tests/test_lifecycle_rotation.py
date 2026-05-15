@@ -201,3 +201,69 @@ def test_concurrent_warm_and_manual_activate_keeps_single_active(monkeypatch):
     active = [b.backend_id for b in reg.all() if b.lifecycle == "active"]
     assert len(active) == 1
     assert active[0] in {"warm-a", "warm-b"}
+
+
+def test_prepare_account_deploy_drains_active_backend_when_peer_can_serve(monkeypatch):
+    old = _backend("old")
+    old.account_id = "alice"
+    old.in_flight = 0
+    peer = _backend("peer")
+    peer.account_id = "bob"
+    reg = BackendRegistry([old, peer])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.prepare_account_deploy("alice.json")
+
+    assert result["drained"] == ["old"]
+    assert result["blocked"] == []
+    assert old.lifecycle == "draining"
+    assert peer.lifecycle == "active"
+
+
+def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
+    only = _backend("only")
+    only.account_id = "alice"
+    reg = BackendRegistry([only])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.prepare_account_deploy("alice")
+
+    assert result["drained"] == []
+    assert result["blocked"] == ["only"]
+    assert only.lifecycle == "active"
+
+
+def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch):
+    old = _backend("old", lifecycle="draining")
+    old.account_id = "alice"
+    peer = _backend("peer")
+    peer.account_id = "bob"
+    reg = BackendRegistry([old, peer])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "reload_backends", lambda: len(reg.all()))
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.complete_account_deploy("alice")
+
+    assert result["warmed"] == ["old"]
+    assert result["activated"] == []
+    assert old.lifecycle == "warming"
+    assert old.last_probe_at == 0.0
+    assert peer.lifecycle == "active"
+
+
+def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
+    only = _backend("only", lifecycle="draining")
+    only.account_id = "alice"
+    reg = BackendRegistry([only])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "reload_backends", lambda: len(reg.all()))
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.complete_account_deploy("alice")
+
+    assert result["warmed"] == []
+    assert result["activated"] == ["only"]
+    assert only.lifecycle == "active"

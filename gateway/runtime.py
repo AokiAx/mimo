@@ -63,6 +63,7 @@ _ROTATION_INTERVAL_S = 50 * 60.0
 _READINESS_INTERVAL_S = 10.0
 _READINESS_REQUIRED_SUCCESSES = 1
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
+_DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 _ROTATION_DISABLE_AFTER = 3
 _ROTATION_DISABLED_FOR_S = _env_float("GATEWAY_ROTATION_DISABLED_FOR_S", 30 * 60.0)
 _ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
@@ -373,6 +374,146 @@ def activate_backend(backend_id: str) -> dict[str, Any]:
         return {"success": False, "error": f"Backend {backend_id!r} not found"}
     _activate_backend(b, reason="manual")
     return {"success": True, "backend": backend_id}
+
+
+def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
+    """Move traffic away from backends that are about to have their Claw destroyed.
+
+    Auto-deploy recreates a Claw in-place behind the same jump-server port. If
+    the gateway keeps routing new requests to that active backend while Step 0
+    destroys the old Claw/tunnel, clients see avoidable 5xxs until the next
+    manual reload or health-probe cycle. This helper is intentionally sync so
+    the deploy thread can call it before touching the old Claw: active matching
+    backends are drained only when another active peer can serve their models.
+    """
+    _ensure_initialized()
+    assert _registry is not None
+    targets = _matching_account_backends(account_id, api_port=api_port)
+    drained: list[str] = []
+    blocked: list[str] = []
+    for backend in targets:
+        if backend.lifecycle != "active":
+            continue
+        if not _has_active_peer(backend):
+            blocked.append(backend.backend_id)
+            continue
+        backend.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S)
+        _persist_backend_runtime_state(backend)
+        drained.append(backend.backend_id)
+    _reap_drained()
+    return {
+        "success": True,
+        "account": account_id,
+        "matched": [b.backend_id for b in targets],
+        "drained": drained,
+        "blocked": blocked,
+    }
+
+
+def wait_for_account_drain(
+    account_id: str,
+    *,
+    api_port: int | None = None,
+    timeout_s: float | None = None,
+    poll_s: float = 0.25,
+) -> dict[str, Any]:
+    """Block briefly until matching draining backends have no in-flight requests."""
+    _ensure_initialized()
+    deadline = time.monotonic() + (timeout_s if timeout_s is not None else _DEPLOY_DRAIN_GRACE_S)
+    pending: list[str] = []
+    while True:
+        targets = [b for b in _matching_account_backends(account_id, api_port=api_port) if b.lifecycle == "draining"]
+        pending = [f"{b.backend_id}:{b.in_flight}" for b in targets if b.in_flight > 0]
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.05, poll_s))
+    return {"success": not pending, "pending": pending}
+
+
+def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
+    """Reload and warm/activate backends that belong to a freshly deployed Claw."""
+    reload_backends()
+    assert _registry is not None
+    now = time.time()
+    targets = _matching_account_backends(account_id, api_port=api_port)
+    warmed: list[str] = []
+    activated: list[str] = []
+    for backend in targets:
+        backend.enabled = True
+        backend.disabled_until = 0.0
+        backend.reset_breaker()
+        backend.health = "alive"
+        backend.consecutive_failures = 0
+        backend.last_error = ""
+        if _has_active_peer(backend):
+            backend.mark_warming(now=now)
+            backend.last_probe_at = 0.0
+            warmed.append(backend.backend_id)
+        else:
+            # The deploy flow has already verified the endpoint. If no peer is
+            # carrying traffic, restore service immediately instead of waiting
+            # for the background rotation loop.
+            backend.mark_active(now=now)
+            activated.append(backend.backend_id)
+        _persist_backend_runtime_state(backend)
+    return {
+        "success": True,
+        "account": account_id,
+        "matched": [b.backend_id for b in targets],
+        "warmed": warmed,
+        "activated": activated,
+    }
+
+
+def fail_account_deploy(account_id: str, *, api_port: int | None = None, error: str = "deploy failed") -> dict[str, Any]:
+    """Keep failed redeploy targets out of routing until an operator fixes them."""
+    _ensure_initialized()
+    assert _registry is not None
+    targets = _matching_account_backends(account_id, api_port=api_port)
+    failed: list[str] = []
+    for backend in targets:
+        if backend.lifecycle == "active" and not _has_active_peer(backend):
+            # Single-backend installs have no failover target; leave the backend
+            # visible so the router can recover if the old tunnel is still alive.
+            continue
+        backend.mark_failed_rotation(
+            error,
+            disable_after=_ROTATION_DISABLE_AFTER,
+            disabled_for_s=_ROTATION_DISABLED_FOR_S,
+        )
+        _persist_backend_runtime_state(backend)
+        failed.append(backend.backend_id)
+    return {"success": True, "account": account_id, "matched": [b.backend_id for b in targets], "failed": failed}
+
+
+def _matching_account_backends(account_id: str, *, api_port: int | None = None) -> list[Backend]:
+    assert _registry is not None
+    keys = _account_match_keys(account_id)
+    return [
+        b for b in _registry.all()
+        if (b.account_id and b.account_id in keys)
+        or (api_port is not None and _base_url_port(b.base_url) == api_port)
+    ]
+
+
+def _account_match_keys(account_id: str) -> set[str]:
+    raw = (account_id or "").strip()
+    keys = {raw} if raw else set()
+    if raw.endswith(".json"):
+        keys.add(raw[:-5])
+    elif raw:
+        keys.add(f"{raw}.json")
+    return keys
+
+
+def _base_url_port(base_url: str) -> int | None:
+    match = re.search(r":(\d+)(?:/)?$", (base_url or "").rstrip("/"))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 # ────────────── probe / readiness / rotation loops ──────────────
@@ -821,6 +962,10 @@ __all__ = [
     "get_all_backends",
     "toggle_backend",
     "activate_backend",
+    "prepare_account_deploy",
+    "wait_for_account_drain",
+    "complete_account_deploy",
+    "fail_account_deploy",
     "start_probe",
     "shutdown",
 ]

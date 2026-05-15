@@ -61,6 +61,73 @@ def _fmt_claw_reply(reply: str) -> str:
         return reply
     return reply[:200] + "..." if len(reply) > 200 else reply
 
+
+def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "DeployLogger") -> None:
+    """Drain the soon-to-be-replaced backend before destroying its Claw."""
+    try:
+        from gateway.runtime import prepare_account_deploy
+        result = prepare_account_deploy(account_filename, api_port=api_port)
+    except Exception as e:  # noqa: BLE001
+        log.log(f"⚠️ Gateway 预切换失败，将继续部署: {type(e).__name__}: {e}")
+        logger_module.exception("Gateway deploy-start hook failed for %s", account_filename)
+        return
+    matched = result.get("matched") or []
+    drained = result.get("drained") or []
+    blocked = result.get("blocked") or []
+    if drained:
+        log.log(f"Gateway 已将待替换后端转为 draining: {', '.join(drained)}")
+        try:
+            from gateway.runtime import wait_for_account_drain
+            drain = wait_for_account_drain(account_filename, api_port=api_port)
+            pending = drain.get("pending") or []
+            if pending:
+                log.log(f"⚠️ Gateway drain 等待超时，仍有 in-flight: {', '.join(pending)}")
+            else:
+                log.log("Gateway drain 完成，开始替换 Claw")
+        except Exception as e:  # noqa: BLE001
+            log.log(f"⚠️ Gateway drain 等待失败，将继续部署: {type(e).__name__}: {e}")
+    elif matched and blocked:
+        log.log(f"⚠️ Gateway 未找到可接管的 active peer，无法预切换: {', '.join(blocked)}")
+    elif matched:
+        log.log(f"Gateway 后端已处于非 active 状态，跳过预切换: {', '.join(matched)}")
+    else:
+        log.log("⚠️ Gateway 未匹配到该账号/API 端口的后端，部署完成后可能需要检查后端配置")
+
+
+def _notify_gateway_deploy_done(account_filename: str, api_port: int, log: "DeployLogger") -> None:
+    """Reload backend state and put the freshly verified Claw into warmup."""
+    try:
+        from gateway.runtime import complete_account_deploy
+        result = complete_account_deploy(account_filename, api_port=api_port)
+    except Exception as e:  # noqa: BLE001
+        log.log(f"⚠️ Gateway 自动重载/热身失败，请手动重载: {type(e).__name__}: {e}")
+        logger_module.exception("Gateway deploy-done hook failed for %s", account_filename)
+        return
+    matched = result.get("matched") or []
+    warmed = result.get("warmed") or []
+    activated = result.get("activated") or []
+    if warmed:
+        log.log(f"Gateway 已重载并开始热身新 Claw 后端: {', '.join(warmed)}")
+    if activated:
+        log.log(f"Gateway 已重载并激活新 Claw 后端: {', '.join(activated)}")
+    if not matched:
+        log.log("⚠️ Gateway 重载完成，但未匹配到该账号/API 端口的后端")
+
+
+def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: str, log: "DeployLogger") -> None:
+    """Keep a failed replacement target out of routing when a peer exists."""
+    try:
+        from gateway.runtime import fail_account_deploy
+        result = fail_account_deploy(account_filename, api_port=api_port, error=error)
+    except Exception as e:  # noqa: BLE001
+        log.log(f"⚠️ Gateway 失败状态同步失败: {type(e).__name__}: {e}")
+        logger_module.exception("Gateway deploy-failed hook failed for %s", account_filename)
+        return
+    failed = result.get("failed") or []
+    if failed:
+        log.log(f"Gateway 已暂时移除失败的部署后端: {', '.join(failed)}")
+
+
 # Stale-deploy entries (state ∈ done/error/cancelled) older than this are
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
@@ -415,6 +482,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
 
     log = DeployLogger(account_filename)
     cancel_event = threading.Event()
+    gateway_prepared = False
 
     _active_deploys[account_filename] = {
         "thread": threading.current_thread(),
@@ -430,6 +498,8 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         _active_deploys[account_filename]["state"] = s
 
     def mark_finished(state: str, history_status: str | None = None) -> None:
+        if history_status == "error" and gateway_prepared:
+            _notify_gateway_deploy_failed(account_filename, api_port, state, log)
         set_state(state)
         _active_deploys[account_filename]["finished_ts"] = time.time()
         if history_status is not None:
@@ -458,6 +528,8 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
     try:
         log.log("=== 开始部署 ===")
         log.log(f"账号: {account_filename} · SSH 端口: {ssh_port} · API 端口: {api_port}")
+        _notify_gateway_deploy_start(account_filename, api_port, log)
+        gateway_prepared = True
 
         # Step 0: Destroy existing claw if any.
         set_state("step0_destroy")
@@ -680,6 +752,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
 
         if endpoint_ok:
+            _notify_gateway_deploy_done(account_filename, api_port, log)
             log.log("=== ✅ 部署完成 ===")
             mark_finished("done", history_status="done")
         else:
