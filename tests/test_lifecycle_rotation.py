@@ -59,7 +59,7 @@ def test_router_raises_when_only_warming_backend_exists():
         router.choose(request_id="r1", model="mimo-v2.5-pro")
 
 
-def test_activate_backend_hard_switches_and_drains_active_peer(monkeypatch):
+def test_activate_backend_joins_load_balancing_pool_without_draining_peer(monkeypatch):
     old = _backend("old")
     old.active_since = 100.0
     new = _backend("new", lifecycle="warming")
@@ -70,8 +70,8 @@ def test_activate_backend_hard_switches_and_drains_active_peer(monkeypatch):
 
     assert result["success"] is True
     assert new.lifecycle == "active"
-    assert old.lifecycle == "draining"
-    assert old.drain_deadline > old.draining_since
+    assert old.lifecycle == "active"
+    assert old.drain_deadline == 0.0
 
 
 def test_reap_drained_keeps_in_flight_until_deadline(monkeypatch, caplog):
@@ -170,7 +170,7 @@ def test_persist_backend_runtime_state_logs_failures(monkeypatch, caplog):
     assert "Failed to persist backend state for candidate" in caplog.text
 
 
-def test_concurrent_warm_and_manual_activate_keeps_single_active(monkeypatch):
+def test_concurrent_warm_and_manual_activate_keeps_all_ready_backends_active(monkeypatch):
     old = _backend("old")
     warm_a = _backend("warm-a", lifecycle="warming")
     warm_b = _backend("warm-b", lifecycle="warming")
@@ -198,9 +198,8 @@ def test_concurrent_warm_and_manual_activate_keeps_single_active(monkeypatch):
 
     asyncio.run(scenario())
 
-    active = [b.backend_id for b in reg.all() if b.lifecycle == "active"]
-    assert len(active) == 1
-    assert active[0] in {"warm-a", "warm-b"}
+    active = {b.backend_id for b in reg.all() if b.lifecycle == "active"}
+    assert active == {"old", "warm-a", "warm-b"}
 
 
 def test_prepare_account_deploy_drains_active_backend_when_peer_can_serve(monkeypatch):
@@ -233,6 +232,30 @@ def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
     assert result["drained"] == []
     assert result["blocked"] == ["only"]
     assert only.lifecycle == "active"
+
+
+def test_promote_standby_backends_to_warming_fills_load_balancing_pool(monkeypatch):
+    active = _backend("active")
+    standby = _backend("standby", lifecycle="standby")
+    reg = BackendRegistry([active, standby])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    runtime._promote_standby_backends_to_warming()
+
+    assert active.lifecycle == "active"
+    assert standby.lifecycle == "warming"
+
+
+def test_promote_standby_backend_activates_when_no_capacity_exists(monkeypatch):
+    standby = _backend("standby", lifecycle="standby")
+    reg = BackendRegistry([standby])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    runtime._promote_standby_backends_to_warming()
+
+    assert standby.lifecycle == "active"
 
 
 def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch):

@@ -247,6 +247,24 @@ def test_router_prefers_lower_in_flight_on_latency_tie():
     assert decision.chosen_in_flight == 0
 
 
+def test_router_spreads_equal_sequential_traffic_by_request_count():
+    a = _backend(backend_id="a")
+    b = _backend(backend_id="b")
+    a.record_success()
+    b.record_success()
+    a.ewma_latency_ms = 100.0
+    b.ewma_latency_ms = 100.0
+    a.total_requests = 0
+    b.total_requests = 0
+    r = Router(BackendRegistry([a, b]))
+
+    first, _ = r.choose(request_id="r1", model=a.models[0])
+    first.record_latency(100.0)
+    second, _ = r.choose(request_id="r2", model=a.models[0])
+
+    assert {first.backend_id, second.backend_id} == {"a", "b"}
+
+
 def test_router_prefers_higher_weight_on_full_tie():
     light = _backend(backend_id="light")
     heavy = _backend(backend_id="heavy")
