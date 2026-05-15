@@ -8,8 +8,8 @@ after marking a backend as failed.
 
 Selection uses ``Backend.routing_score()`` (lower is better), which
 combines EWMA latency, in-flight count, and weight. Ties (e.g. before
-any request has landed) are broken by oldest last-failure so a
-freshly-recovered backend doesn't immediately steal traffic.
+any request has landed) are broken by weighted request count, then oldest
+last-failure, so otherwise-equal active backends share traffic fairly.
 """
 from __future__ import annotations
 
@@ -113,12 +113,18 @@ class Router:
             )
 
         # Score = ewma_latency * (1 + in_flight) / weight, lower is better.
-        # Ties broken by (oldest last_failure_at, alphabetical id) so a
-        # freshly-recovered backend doesn't immediately steal everything
-        # from a quietly-healthy peer.
+        # Ties are spread by weighted request count before falling back to
+        # oldest last-failure and stable id ordering. That keeps equal active
+        # backends from pinning sequential traffic to a single backend while
+        # still avoiding a just-recovered backend stealing the whole pool.
         chosen = min(
             candidates,
-            key=lambda b: (b.routing_score(), b.last_failure_at, b.backend_id),
+            key=lambda b: (
+                b.routing_score(),
+                b.total_requests / max(b.weight, 1),
+                b.last_failure_at,
+                b.backend_id,
+            ),
         )
 
         decision = RoutingDecision(

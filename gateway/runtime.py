@@ -5,8 +5,8 @@ Credentials come from ``data/secrets.json`` (managed by ``secrets_store``).
 
 The runtime owns backend lifecycle for account rotation:
 new/reloaded backends are warmed with non-stream, stream, and tool-call probes;
-when ready, traffic hard-switches to the new backend and the old backend drains
-existing in-flight requests before removal.
+when ready, each healthy backend joins the active load-balancing pool. Backends
+only enter draining when they are removed, disabled, or being redeployed.
 """
 from __future__ import annotations
 
@@ -147,20 +147,12 @@ def _ensure_initialized() -> None:
 
 
 def _bootstrap_active_lifecycles() -> None:
-    """Seed active timers and enforce one active backend per model on startup."""
+    """Seed active timers while preserving all active backends for load balancing."""
     assert _registry is not None
     now = time.time()
-    owner_by_model: dict[str, Backend] = {}
     for b in _registry.all():
-        if b.lifecycle == "active":
-            if not b.active_since:
-                b.mark_active(now=now)
-            duplicate = any(model in owner_by_model for model in b.models)
-            if duplicate:
-                b.mark_standby()
-                continue
-            for model in b.models:
-                owner_by_model[model] = b
+        if b.lifecycle == "active" and not b.active_since:
+            b.mark_active(now=now)
         elif b.lifecycle == "draining" and not b.drain_deadline:
             b.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
 
@@ -576,17 +568,34 @@ async def _probe_loop() -> None:
 
 
 async def _rotation_loop() -> None:
-    """Warm and hard-switch backends every 50 minutes by account/backend."""
+    """Warm standby backends periodically so they can join the active pool."""
     _ensure_initialized()
     assert _registry is not None
     while True:
         try:
+            _promote_standby_backends_to_warming()
             await _warm_ready_backends()
             _rotate_expired_active_backends()
             _reap_drained()
         except Exception:  # noqa: BLE001
             logger.exception("Gateway rotation loop failed")
         await asyncio.sleep(_ROTATION_LOOP_INTERVAL_S)
+
+
+def _promote_standby_backends_to_warming() -> None:
+    """Continuously fill the load-balancing pool from enabled standby backends."""
+    assert _registry is not None
+    now = time.time()
+    for b in _registry.all():
+        if not b.enabled or b.lifecycle != "standby" or b.is_temporarily_disabled(now):
+            continue
+        if _has_active_peer(b):
+            b.mark_warming(now=now)
+        else:
+            # If this model currently has no active capacity, avoid leaving the
+            # gateway unavailable while waiting for the next readiness cycle.
+            b.mark_active(now=now)
+        _persist_backend_runtime_state(b)
 
 
 async def _warm_ready_backends() -> None:
@@ -654,18 +663,12 @@ def _next_ready_or_warm_peer(active: Backend, *, now: float) -> Backend | None:
 
 
 def _activate_backend(backend: Backend, *, reason: str) -> None:
-    assert _registry is not None
+    """Add a warmed backend to the active load-balancing pool."""
     now = time.time()
     backend.mark_active(now=now)
     shared_models = set(backend.models)
-    for other in _registry.all():
-        if other.backend_id == backend.backend_id:
-            continue
-        if other.lifecycle == "active" and shared_models.intersection(other.models):
-            other.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
-            _persist_backend_runtime_state(other)
     _persist_backend_runtime_state(backend)
-    logger.info("Activated backend %s by %s; draining peers for models=%s", backend.backend_id, reason, sorted(shared_models))
+    logger.info("Activated backend %s by %s; load-balancing models=%s", backend.backend_id, reason, sorted(shared_models))
 
 
 def _reap_drained(*, now: float | None = None) -> None:
