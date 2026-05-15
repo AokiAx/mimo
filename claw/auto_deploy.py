@@ -388,14 +388,6 @@ def _parse_ssh_key(text: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
-def _ssh_key_comment(account_filename: str) -> str:
-    """Comment tag embedded as the SSH key's third field, used by
-    ``_reclaim_old_keys`` to identify which authorized_keys entries belong
-    to this account so we can prune superseded ones after redeploy."""
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', account_filename)
-    return f"mimo-claw:{safe}"
-
-
 def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) -> Optional[str]:
     """Return a description of the conflict if another *enabled* account is
     configured to use the same api_port or ssh_port, else None.
@@ -420,28 +412,11 @@ def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) ->
     return None
 
 
-async def _deploy_ssh_key(public_key: str, account_filename: str, logger: DeployLogger) -> tuple:
-    """Deploy ECS pubkey to jump's authorized_keys, replacing the original
-    comment with ``mimo-claw:<account>`` so the operator can later
-    ``grep mimo-claw:<account> authorized_keys`` to find which entries
-    belong to which account when pruning manually.
-
-    Existence check matches on ``$2`` (key data) only — ssh authentication
-    keys on the (type, data) tuple, not the comment, so a re-deploy whose
-    pubkey happens to match a previous one shouldn't append a duplicate
-    line."""
-    parts = public_key.strip().split(None, 2)
-    if len(parts) < 2:
-        return False, f"Invalid pubkey: {public_key[:60]}"
-    key_type, key_data = parts[0], parts[1]
-    comment = _ssh_key_comment(account_filename)
-    tagged_key = f"{key_type} {key_data} {comment}"
-    quoted_tagged = shlex.quote(tagged_key)
-    quoted_data = shlex.quote(key_data)
-
+async def _deploy_ssh_key(public_key: str, logger: DeployLogger) -> tuple:
+    quoted = shlex.quote(public_key.strip())
     check_cmd = (
-        f"awk -v d={quoted_data} '$2 == d {{ found=1 }} END {{ exit !found }}' "
-        f"/root/.ssh/authorized_keys 2>/dev/null && echo EXISTS || echo NEW"
+        f'grep -qF {quoted} /root/.ssh/authorized_keys 2>/dev/null '
+        f'&& echo "EXISTS" || echo "NEW"'
     )
     stdout, stderr, rc = await _ssh_jump_async(check_cmd)
     if "EXISTS" in stdout:
@@ -449,14 +424,14 @@ async def _deploy_ssh_key(public_key: str, account_filename: str, logger: Deploy
         return True, "Key already deployed"
 
     add_cmd = (
-        f"echo {quoted_tagged} >> /root/.ssh/authorized_keys && "
-        f"chmod 600 /root/.ssh/authorized_keys && echo OK"
+        f'echo {quoted} >> /root/.ssh/authorized_keys && '
+        f'chmod 600 /root/.ssh/authorized_keys && echo "OK"'
     )
     stdout, stderr, rc = await _ssh_jump_async(add_cmd)
     if rc != 0 or "OK" not in stdout:
         logger.log(f"Failed to deploy SSH key: {stderr}")
         return False, f"Failed: {stderr}"
-    logger.log(f"SSH key deployed to jump server (tag={comment})")
+    logger.log("SSH key deployed to jump server")
     return True, "Key deployed"
 
 
@@ -742,7 +717,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Step 5: Add key on jump server.
         set_state("step5_deploy_key")
         log.log("Step 5: 在跳板机上添加 SSH 公钥...")
-        key_ok, key_msg = await _deploy_ssh_key(public_key, account_filename, log)
+        key_ok, key_msg = await _deploy_ssh_key(public_key, log)
         if not key_ok:
             log.log(f"❌ 部署公钥失败: {key_msg}")
             mark_finished("error", history_status="error")
