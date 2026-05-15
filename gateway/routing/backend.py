@@ -54,6 +54,10 @@ class Backend:
     rotation_failures: int = 0
     disabled_until: float = 0.0
 
+    # Detection zone — fast-probe quarantine for flaky backends
+    in_detection: bool = False
+    detection_entered_at: float = 0.0
+
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
     weight: int = 1                          # static weight for selection
@@ -126,8 +130,6 @@ class Backend:
         self,
         error: str,
         *,
-        disable_after: int,
-        disabled_for_s: float,
         now: float | None = None,
     ) -> None:
         n = now or time.time()
@@ -135,10 +137,19 @@ class Backend:
         self.readiness_failures += 1
         self.rotation_failures += 1
         self.record_failure(error, now=n)
-        if self.rotation_failures >= disable_after:
-            self.lifecycle = "disabled"
-            self.enabled = False
-            self.disabled_until = n + disabled_for_s
+        # No longer disable — just mark failed. The probe loop
+        # handles detection-zone quarantine separately.
+
+    def mark_detection(self, *, now: float | None = None) -> None:
+        """Enter detection zone: fast probing (10s) until one success."""
+        self.in_detection = True
+        self.detection_entered_at = now or time.time()
+
+    def exit_detection(self) -> None:
+        """Leave detection zone after a successful probe."""
+        self.in_detection = False
+        self.detection_entered_at = 0.0
+        self.consecutive_failures = 0
 
     # ───── health helpers ─────
 
@@ -176,7 +187,7 @@ class Backend:
             return False
         if self.lifecycle != "active":
             return False
-        if self.is_temporarily_disabled(now):
+        if self.in_detection:
             return False
         if self.is_open(now):
             return False
