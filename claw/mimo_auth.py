@@ -189,6 +189,16 @@ def _fetch_callback(session):
         return None
 
 
+def _device_fingerprint(email):
+    """生成每账号稳定的 deviceFingerprint (32-char hex MD5)。
+
+    Why: HAR 显示 serviceLoginAuth2 与 identity/result/check 都带
+    deviceFingerprint，浏览器侧整次会话使用同一个值。使用按账号确定的
+    哈希可以避免每次刷新都被识别为"新设备"再次触发 2FA。
+    """
+    return hashlib.md5(f"mimo-claw:{email}".encode()).hexdigest()
+
+
 def _xiaomi_get_sign(session, callback_url):
     """Step 1: 获取 _sign 和初始 cookies"""
     session.cookies.set("userId", "", domain="account.xiaomi.com")
@@ -299,7 +309,7 @@ def _verify_code(session, flag, code):
         raise Exception(f"验证码响应解析失败: {text[:200]}")
 
 
-def _identity_result_check(session, callback, user_id, sid, identity_token, sign):
+def _identity_result_check(session, callback, user_id, sid, identity_token, sign, device_fingerprint=""):
     """验证通过后调用 result/check 获取最终跳转 URL
 
     HAR 显示完整流程:
@@ -316,9 +326,11 @@ def _identity_result_check(session, callback, user_id, sid, identity_token, sign
         "userId": user_id,
         "sid": sid,
         "tokenType": "pwdLogin",
-        "identityToken": identity_token,
-        "_sign": sign,
     }
+    if device_fingerprint:
+        params["deviceFingerprint"] = device_fingerprint
+    params["identityToken"] = identity_token
+    params["_sign"] = sign
     resp = session.get(
         result_check_url,
         params=params,
@@ -328,7 +340,7 @@ def _identity_result_check(session, callback, user_id, sid, identity_token, sign
     return resp
 
 
-def _handle_verification(session, notification_url="", original_callback="", user_id_from_auth=""):
+def _handle_verification(session, notification_url="", original_callback="", user_id_from_auth="", device_fingerprint=""):
     """处理身份安全验证流程（短信/邮箱验证码）
 
     完整流程（从 HAR 逆向）:
@@ -410,7 +422,8 @@ def _handle_verification(session, notification_url="", original_callback="", use
                 )
 
                 result_resp = _identity_result_check(
-                    session, end_callback, user_id, SID, identity_token, verify_sign
+                    session, end_callback, user_id, SID, identity_token, verify_sign,
+                    device_fingerprint=device_fingerprint,
                 )
 
                 # result/check 返回 302 到 serviceLoginAuth2/end
@@ -447,7 +460,7 @@ def _handle_verification(session, notification_url="", original_callback="", use
     raise Exception("验证码错误次数过多")
 
 
-def _xiaomi_authenticate(session, email, password, sign, callback):
+def _xiaomi_authenticate(session, email, password, sign, callback, device_fingerprint=""):
     """Step 2: 提交登录表单"""
     pw_hash = hashlib.md5(password.encode()).hexdigest().upper()
     post_data = {
@@ -460,6 +473,8 @@ def _xiaomi_authenticate(session, email, password, sign, callback):
     }
     if sign:
         post_data["_sign"] = sign
+    if device_fingerprint:
+        post_data["deviceFingerprint"] = device_fingerprint
 
     resp = session.post(
         XIAOMI_AUTH,
@@ -524,8 +539,9 @@ def do_login(email, password):
         raise Exception(f"获取 _sign 失败，响应: {init_resp.text[:200]}")
 
     # Step 2: 认证
+    device_fp = _device_fingerprint(email)
     print("[login] 提交登录信息...")
-    auth_data = _xiaomi_authenticate(session, email, password, sign, callback)
+    auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp)
 
     code = auth_data.get("code", 0)
     result = auth_data.get("result", "")
@@ -538,6 +554,7 @@ def do_login(email, password):
             notification_url=auth_data.get("notificationUrl", ""),
             original_callback=callback,
             user_id_from_auth=auth_data.get("userId", ""),
+            device_fingerprint=device_fp,
         )
     elif result == "ok":
         location = auth_data.get("location", "")
@@ -763,7 +780,8 @@ def web_start_login(email, password):
         if not sign:
             return {"status": "error", "error": "获取 _sign 失败"}
 
-        auth_data = _xiaomi_authenticate(session, email, password, sign, callback)
+        device_fp = _device_fingerprint(email)
+        auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp)
 
         # Branch A — needs 2FA
         if auth_data.get("notificationUrl") and not auth_data.get("location"):
@@ -794,6 +812,7 @@ def web_start_login(email, password):
                 "flag": flag,
                 "user_id": user_id,
                 "auth_data": auth_data,
+                "device_fingerprint": device_fp,
                 "expires_at": time.time() + _PENDING_TTL,
             }
             return {
@@ -837,6 +856,7 @@ def web_submit_code(session_id, code):
         user_id = state["user_id"]
         callback = state["callback"]
         auth_data = state["auth_data"]
+        device_fp = state.get("device_fingerprint", "")
 
         verify_data = _verify_code(session, flag, code)
 
@@ -863,6 +883,7 @@ def web_submit_code(session_id, code):
             )
             result_resp = _identity_result_check(
                 session, end_callback, user_id, SID, identity_token, verify_sign,
+                device_fingerprint=device_fp,
             )
             location = result_resp.url
             if not ("sts" in location or "aistudio" in location):
