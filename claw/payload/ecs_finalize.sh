@@ -119,14 +119,15 @@ nohup "$SCRIPTS_DIR/reverse-tunnel.sh" > /tmp/tunnel.log 2>&1 &
 sleep 3
 
 # ── Crontab ──
-# Per-ECS random sleep (0-270s) before running keepalive so N accounts'
-# ECSes don't all hit the jump server at the same `*/5` minute boundary.
-# RANDOM is shell-built-in (0-32767); modulo 270 gives <5 min jitter.
+# Run every minute (not every 5) so tunnel breakage is detected within
+# ~60-90s instead of 5-10min. ECS load impact is negligible — keepalive
+# is pure local pgrep + ss now. Per-ECS random sleep (0-50s) still
+# spreads load so N accounts don't all hit the same second.
 echo "[6/6] register tunnel-keepalive cron..."
-KEEPALIVE_OFFSET=$((RANDOM % 270))
+KEEPALIVE_OFFSET=$((RANDOM % 50))
 echo "  cron offset: ${KEEPALIVE_OFFSET}s"
 (crontab -l 2>/dev/null | grep -v tunnel-keepalive; \
- echo "*/5 * * * * sleep ${KEEPALIVE_OFFSET} && $SCRIPTS_DIR/tunnel-keepalive.sh") | crontab -
+ echo "* * * * * sleep ${KEEPALIVE_OFFSET} && $SCRIPTS_DIR/tunnel-keepalive.sh") | crontab -
 
 # ── Final state ──
 echo ""

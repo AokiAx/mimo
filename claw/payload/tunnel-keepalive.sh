@@ -10,7 +10,7 @@
 # so a dead -R forward causes the local ssh process to exit within ~90s,
 # which the pgrep check below catches.
 #
-# Run from cron every 5 minutes; restarts the tunnel up to MAX_RETRIES.
+# Run from cron every minute; restarts the tunnel up to MAX_RETRIES.
 set -u
 
 LOG="/tmp/tunnel-keepalive.log"
