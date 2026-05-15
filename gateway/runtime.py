@@ -49,7 +49,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-_PROBE_INTERVAL_S = 60.0
+_PROBE_INTERVAL_S = 30.0
 _PROBE_TIMEOUT_S = 5.0
 _PROBE_FAILURE_THRESHOLD = 3
 _PROBE_COOLDOWN_S = 30.0
@@ -64,8 +64,8 @@ _READINESS_INTERVAL_S = 10.0
 _READINESS_REQUIRED_SUCCESSES = 1
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
-_ROTATION_DISABLE_AFTER = 3
-_ROTATION_DISABLED_FOR_S = _env_float("GATEWAY_ROTATION_DISABLED_FOR_S", 30 * 60.0)
+_DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
+_DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
 _ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
 
 _READINESS_MAX_STREAM_CHUNKS = 32
@@ -114,6 +114,8 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         generation_id=entry.get("generation_id") or entry.get("id") or "",
         rotation_failures=max(0, int(entry.get("rotation_failures") or 0)),
         disabled_until=float(entry.get("disabled_until") or 0.0),
+        in_detection=bool(entry.get("in_detection", False)),
+        detection_entered_at=float(entry.get("detection_entered_at") or 0.0),
     )
 
 
@@ -199,6 +201,8 @@ def reload_backends() -> int:
         existing.generation_id = fresh.generation_id
         existing.rotation_failures = fresh.rotation_failures
         existing.disabled_until = fresh.disabled_until
+        existing.in_detection = fresh.in_detection
+        existing.detection_entered_at = fresh.detection_entered_at
         if fresh.lifecycle != existing.lifecycle:
             if fresh.lifecycle == "warming":
                 existing.mark_warming(now=now)
@@ -345,6 +349,8 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
         b.health = "alive"
         b.consecutive_failures = 0
         b.disabled_until = 0.0
+        b.in_detection = False
+        b.detection_entered_at = 0.0
         if b.lifecycle in ("disabled", "failed"):
             b.mark_warming()
     else:
@@ -468,11 +474,7 @@ def fail_account_deploy(account_id: str, *, api_port: int | None = None, error: 
             # Single-backend installs have no failover target; leave the backend
             # visible so the router can recover if the old tunnel is still alive.
             continue
-        backend.mark_failed_rotation(
-            error,
-            disable_after=_ROTATION_DISABLE_AFTER,
-            disabled_for_s=_ROTATION_DISABLED_FOR_S,
-        )
+        backend.mark_failed_rotation(error)
         _persist_backend_runtime_state(backend)
         failed.append(backend.backend_id)
     return {"success": True, "account": account_id, "matched": [b.backend_id for b in targets], "failed": failed}
@@ -512,14 +514,20 @@ def _base_url_port(base_url: str) -> int | None:
 
 
 async def _probe_loop() -> None:
-    """Lightweight liveness probe plus drain reaper."""
+    """Lightweight liveness probe with detection-zone quarantine.
+
+    Normal backends are probed every ``_PROBE_INTERVAL_S`` (30 s).
+    After ``_DETECTION_ZONE_FAILURES`` (2) consecutive failures a backend
+    enters the **detection zone** where it is probed every
+    ``_DETECTION_PROBE_INTERVAL_S`` (10 s).  One success exits the zone.
+    """
     _ensure_initialized()
     assert _registry is not None and _transport is not None
     client = _transport._client  # noqa: SLF001
 
     async def _probe_one(backend: Backend, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
-            if backend.lifecycle == "disabled":
+            if not backend.enabled:
                 return
             try:
                 started = time.monotonic()
@@ -532,6 +540,13 @@ async def _probe_loop() -> None:
                 if 200 <= resp.status_code < 400:
                     backend.record_success()
                     backend.record_latency(latency)
+                    # Exit detection zone on success
+                    if backend.in_detection:
+                        backend.exit_detection()
+                        logger.info(
+                            "Backend %s exited detection zone (healthy)",
+                            backend.backend_id,
+                        )
                     # Recovery: a failed backend that passes liveness check
                     # goes back to standby so the rotation loop can re-warm it.
                     if backend.lifecycle == "failed":
@@ -546,12 +561,27 @@ async def _probe_loop() -> None:
                         cooldown_s=_PROBE_COOLDOWN_S,
                         threshold=_PROBE_FAILURE_THRESHOLD,
                     )
+                    # Enter detection zone after N consecutive failures
+                    if (backend.consecutive_failures >= _DETECTION_ZONE_FAILURES
+                            and not backend.in_detection):
+                        backend.mark_detection()
+                        logger.warning(
+                            "Backend %s entered detection zone (%d consecutive failures)",
+                            backend.backend_id, backend.consecutive_failures,
+                        )
             except Exception as e:
                 backend.record_failure(
                     f"{type(e).__name__}: {e}",
                     cooldown_s=_PROBE_COOLDOWN_S,
                     threshold=_PROBE_FAILURE_THRESHOLD,
                 )
+                if (backend.consecutive_failures >= _DETECTION_ZONE_FAILURES
+                        and not backend.in_detection):
+                    backend.mark_detection()
+                    logger.warning(
+                        "Backend %s entered detection zone (%d consecutive failures)",
+                        backend.backend_id, backend.consecutive_failures,
+                    )
 
     while True:
         try:
@@ -564,7 +594,12 @@ async def _probe_loop() -> None:
             _reap_drained()
         except Exception:  # noqa: BLE001
             logger.exception("Gateway probe loop failed")
-        await asyncio.sleep(_PROBE_INTERVAL_S)
+        # Use shorter interval if any backend is in detection zone
+        any_in_detection = any(
+            b.in_detection for b in _registry.all() if b.enabled
+        )
+        interval = _DETECTION_PROBE_INTERVAL_S if any_in_detection else _PROBE_INTERVAL_S
+        await asyncio.sleep(interval)
 
 
 async def _rotation_loop() -> None:
@@ -618,12 +653,7 @@ async def _warm_ready_backends() -> None:
             b.readiness_failures += 1
             b.record_failure(reason, now=now, threshold=_PROBE_FAILURE_THRESHOLD)
             if b.readiness_failures >= _PROBE_FAILURE_THRESHOLD:
-                b.mark_failed_rotation(
-                    reason,
-                    disable_after=_ROTATION_DISABLE_AFTER,
-                    disabled_for_s=_ROTATION_DISABLED_FOR_S,
-                    now=now,
-                )
+                b.mark_failed_rotation(reason, now=now)
                 _persist_backend_runtime_state(b)
 
 
@@ -824,6 +854,8 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
             generation_id=backend.generation_id,
             rotation_failures=backend.rotation_failures,
             disabled_until=backend.disabled_until,
+            in_detection=backend.in_detection,
+            detection_entered_at=backend.detection_entered_at,
         )
     except Exception:
         logger.exception("Failed to persist backend state for %s", backend.backend_id)
