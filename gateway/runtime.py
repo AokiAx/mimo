@@ -747,7 +747,7 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
         if status >= 400:
             return False, f"http {status}: {raw[:200]!r}"
         if name == "tool_call":
-            ok, reason = _raw_response_has_tool_call(raw)
+            ok, reason = _raw_response_is_valid(raw)
             if not ok:
                 return False, reason
         return True, "ok"
@@ -755,27 +755,21 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
         return False, f"{type(e).__name__}: {e}"
 
 
-def _raw_response_has_tool_call(raw: bytes) -> tuple[bool, str]:
+def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
+    """Check that the tool-call readiness response is structurally valid.
+
+    We no longer require tool_calls in the response — models may choose to
+    respond with text instead of calling the tool.  A valid JSON response
+    with at least one choice is sufficient.
+    """
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        return False, f"invalid tool-call JSON: {e}"
+        return False, f"invalid JSON: {e}"
     choices = data.get("choices") if isinstance(data, dict) else None
-    if not isinstance(choices, list):
-        return False, "tool-call response has no choices"
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        msg = choice.get("message") or {}
-        if not isinstance(msg, dict):
-            continue
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            return True, "ok"
-        function_call = msg.get("function_call")
-        if isinstance(function_call, dict) and function_call:
-            return True, "ok"
-    return False, "no tool call in response"
+    if not isinstance(choices, list) or not choices:
+        return False, "response has no choices"
+    return True, "ok"
 
 
 def _readiness_model(backend: Backend) -> str:
@@ -802,23 +796,21 @@ def _readiness_stream_body(backend: Backend) -> dict[str, Any]:
 
 def _readiness_tool_call_body(backend: Backend) -> dict[str, Any]:
     body = _readiness_non_stream_body(backend)
-    body.update({
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "gateway_readiness_ping",
-                "description": "Return a small readiness acknowledgement.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ok": {"type": "boolean"},
-                    },
-                    "required": ["ok"],
+    body["messages"] = [{"role": "user", "content": "Use the gateway_readiness_ping tool."}]
+    body["tools"] = [{
+        "type": "function",
+        "function": {
+            "name": "gateway_readiness_ping",
+            "description": "Return a small readiness acknowledgement.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
                 },
+                "required": ["ok"],
             },
-        }],
-        "tool_choice": {"type": "function", "function": {"name": "gateway_readiness_ping"}},
-    })
+        },
+    }]
     return body
 
 
