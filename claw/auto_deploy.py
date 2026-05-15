@@ -67,6 +67,10 @@ def _notify_gateway_deploy_start(account_filename: str, api_port: int, log: "Dep
     try:
         from gateway.runtime import prepare_account_deploy
         result = prepare_account_deploy(account_filename, api_port=api_port)
+    except RuntimeError as e:
+        if 'attached to a different loop' in str(e):
+            log.log(f"⚠️ Gateway event loop 冲突（已忽略）: {e}")
+            return
     except Exception as e:  # noqa: BLE001
         log.log(f"⚠️ Gateway 预切换失败，将继续部署: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-start hook failed for %s", account_filename)
@@ -99,6 +103,10 @@ def _notify_gateway_deploy_done(account_filename: str, api_port: int, log: "Depl
     try:
         from gateway.runtime import complete_account_deploy
         result = complete_account_deploy(account_filename, api_port=api_port)
+    except RuntimeError as e:
+        if 'attached to a different loop' in str(e):
+            log.log(f"⚠️ Gateway event loop 冲突（已忽略）: {e}")
+            return
     except Exception as e:  # noqa: BLE001
         log.log(f"⚠️ Gateway 自动重载/热身失败，请手动重载: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-done hook failed for %s", account_filename)
@@ -119,6 +127,10 @@ def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: s
     try:
         from gateway.runtime import fail_account_deploy
         result = fail_account_deploy(account_filename, api_port=api_port, error=error)
+    except RuntimeError as e:
+        if 'attached to a different loop' in str(e):
+            log.log(f"⚠️ Gateway event loop 冲突（已忽略）: {e}")
+            return
     except Exception as e:  # noqa: BLE001
         log.log(f"⚠️ Gateway 失败状态同步失败: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-failed hook failed for %s", account_filename)
@@ -647,7 +659,9 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 if (data.get("data") or {}).get("status") == "AVAILABLE":
                     claw_ready = True
                     break
-            log.log(f"  等待中... ({(i + 1) * _CREATE_POLL_INTERVAL_S}s)")
+            _elapsed = (i + 1) * _CREATE_POLL_INTERVAL_S
+            if _elapsed <= 15 or _elapsed % 30 == 0:
+                log.log(f"  等待中... ({_elapsed}s)")
         if not claw_ready:
             log.log("❌ Claw 启动超时")
             mark_finished("error", history_status="error")
@@ -674,12 +688,19 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         log.log(
             f"Step 3: 发送部署文案到 Claw ({len(framed_message)} 字符)..."
         )
-        reply3, err3 = await claw_ws_chat(
-            framed_message, session_key, cookies=cookies,
-            attachments=attachments or None,
-        )
+        reply3, err3 = None, None
+        for _step3_attempt in range(1, 4):
+            reply3, err3 = await claw_ws_chat(
+                framed_message, session_key, cookies=cookies,
+                attachments=attachments or None,
+            )
+            if not err3:
+                break
+            log.log(f"⚠️ Step 3 第 {_step3_attempt}/3 次失败: {err3} — 10s 后重试...")
+            await asyncio.sleep(10)
+            session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
         if err3:
-            log.log(f"❌ Claw 通信失败: {err3}")
+            log.log(f"❌ Claw 通信失败（共 3 次）: {err3}")
             mark_finished("error", history_status="error")
             return
         log.log(f"Claw 回复: {_fmt_claw_reply(reply3)}")
@@ -705,6 +726,16 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 return
             log.log(f"Claw 回复: {_fmt_claw_reply(reply_retry)}")
             public_key = _parse_ssh_key(reply_retry)
+        if not public_key:
+            retry2_session = f"agent:main:auto-{account_filename}-retry2-{uuid.uuid4().hex[:8]}"
+            reply_retry2, err_retry2 = await claw_ws_chat(
+                "运行 ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N '' "
+                "然后输出 cat /root/.ssh/id_ed25519.pub 的结果。",
+                retry2_session, cookies=cookies,
+            )
+            if not err_retry2:
+                log.log(f"Claw 重试2回复: {_fmt_claw_reply(reply_retry2)}")
+                public_key = _parse_ssh_key(reply_retry2)
         if not public_key:
             log.log("❌ 无法从 Claw 回复中提取 SSH 公钥")
             mark_finished("error", history_status="error")
@@ -739,16 +770,17 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         log.log("Step 6: 通知 Claw 公钥已添加...")
         notify_msg = "公钥已就位，可以建立反向隧道了。"
         reply6, err6 = None, None
-        for attempt in range(1, 4):
+        for attempt in range(1, 6):
             reply6, err6 = await claw_ws_chat(
                 notify_msg, session_key, cookies=cookies,
             )
             if not err6:
                 break
-            log.log(f"⚠️ 通知 Claw 第 {attempt}/3 次失败: {err6} — 5s 后重试...")
-            await asyncio.sleep(5)
+            _backoff = 5 + attempt * 2
+            log.log(f"⚠️ 通知 Claw 第 {attempt}/5 次失败: {err6} — {_backoff}s 后重试...")
+            await asyncio.sleep(_backoff)
         if err6:
-            log.log(f"⚠️ 通知 Claw 最终失败（共 3 次）: {err6}（继续走 Step 8，给 Claw 时间自行执行）")
+            log.log(f"⚠️ 通知 Claw 最终失败（共 5 次）: {err6}（继续走 Step 8，给 Claw 时间自行执行）")
         else:
             log.log(f"Claw 回复: {_fmt_claw_reply(reply6)}")
         if cancelled():
@@ -766,7 +798,27 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Wait a few seconds for the reverse tunnel to settle after the Claw
         # "公钥已就位" round-trip; ssh on the jump-side socket sometimes races
         # the new sshd-session.
-        await asyncio.sleep(3)
+        log.log(f"Step 7: 等待隧道端口 :{ssh_port} 就绪...")
+        tunnel_ready = False
+        for _tw in range(1, 13):
+            check_cmd = f"ss -tln 2>/dev/null | grep -q ':{ssh_port} '"
+            _, _, rc_tw = await _ssh_jump_async(check_cmd, timeout=10)
+            if rc_tw == 0:
+                tunnel_ready = True
+                log.log(f"✅ 隧道端口 :{ssh_port} 已就绪（第 {_tw} 次检测）")
+                break
+            if _tw % 3 == 0:
+                log.log(f"  等待隧道... ({_tw * 5}s)")
+            await asyncio.sleep(5)
+        if not tunnel_ready:
+            log.log(f"❌ 隧道端口 :{ssh_port} 60s 内未就绪")
+            mark_finished("error", history_status="error")
+            return
+        await _ssh_jump_async(
+            f"ssh-keygen -R [127.0.0.1]:{ssh_port} 2>/dev/null; "
+            f"ssh-keygen -R 127.0.0.1:{ssh_port} 2>/dev/null; true",
+            timeout=10,
+        )
         ok7, msg7 = await _ecs_finalize(ssh_port, api_port, log)
         if not ok7:
             log.log(f"❌ Step 7 失败: {msg7}")
