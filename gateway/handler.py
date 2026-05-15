@@ -139,9 +139,8 @@ class GatewayHandler:
         upstream_body = self._codec.serialize_to_upstream(req)
 
         if req.stream:
-            backend = self._choose_backend(ctx, req.model)
-            return await self._handle_stream(
-                ctx, adapter, backend, upstream_body, self._headers_for(backend),
+            return await self._handle_stream_with_retries(
+                ctx, adapter, req.model, upstream_body,
             )
         return await self._handle_non_stream_with_retries(
             ctx, adapter, req.model, upstream_body,
@@ -265,6 +264,47 @@ class GatewayHandler:
             return _content_type_for(adapter, stream=False), None, body_bytes
         finally:
             backend.dec_in_flight()
+
+    async def _handle_stream_with_retries(
+        self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        """Stream with retry on pre-stream failures.
+
+        Once data starts flowing to the client we cannot retry (the client
+        would see duplicated content).  But connection errors and upstream
+        5xx responses happen before any data is sent, so those are safe to
+        retry with a different backend.
+        """
+        tried: set[str] = set()
+        last_error: GatewayError | None = None
+        for _attempt in range(2):
+            try:
+                backend = self._choose_backend(ctx, model, exclude=tried)
+            except GatewayError:
+                if last_error is not None:
+                    raise last_error
+                raise
+            tried.add(backend.backend_id)
+            try:
+                return await self._handle_stream(
+                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                )
+            except GatewayError as e:
+                last_error = e
+                if not self._is_retryable_stream(e):
+                    raise
+                ctx.decide(f"stream_retry_after:{backend.backend_id}:{e.error_code}")
+                continue
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _is_retryable_stream(err: GatewayError) -> bool:
+        status = err.details.get("status") if getattr(err, "details", None) else None
+        if isinstance(status, int):
+            return status >= 500
+        # Connection errors / timeouts have no status — retry them too.
+        return getattr(err, "http_status", 500) in (502, 503, 504)
 
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
