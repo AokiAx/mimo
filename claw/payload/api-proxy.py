@@ -20,7 +20,7 @@ from aiohttp import web
 # ────────────── 配置 ──────────────
 
 PORT = int(os.environ.get("PROXY_PORT", "18800"))
-AUTH_TOKEN=os.env...EN", "sk-Aoki-MiMo")
+AUTH_TOKEN = os.environ.get("PROXY_AUTH_TOKEN", "sk-Aoki-MiMo")
 REQUEST_TIMEOUT = 300
 STREAM_MAX_SECONDS = 600
 MAX_BODY = 50 * 1024 * 1024
@@ -74,7 +74,7 @@ _raw_ep = os.environ.get("MIMO_API_ENDPOINT", "https://api-sgp-oc.xiaomimimo.com
 _parsed = urlparse(_raw_ep)
 # 只取 scheme + host，不带 path（客户端请求自带完整路径）
 API_BASE = f"{_parsed.scheme}://{_parsed.netloc}"
-API_KEY=os.env...EY", "")
+API_KEY = os.environ.get("MIMO_API_KEY", "")
 
 log(f"Backend: {API_BASE}")
 
