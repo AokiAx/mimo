@@ -16,17 +16,33 @@ into the EWMA so subsequent routing decisions see real numbers.
 
 The handler owns the upstream lifecycle: the streaming AsyncIterator it
 returns transitively closes the httpx response when fully drained.
+
+Anthropic clients (``adapter.name == "anthropic"``) take a separate
+byte-passthrough path: the body goes through ``patch_request_thinking``
+to rehydrate dropped ``thinking`` blocks, then hits the upstream
+``/anthropic/v1/messages`` endpoint directly. The response is streamed
+back unchanged while a tee'd parser harvests fresh thinking content into
+the same reasoning cache. No IES conversion happens on this path because
+the upstream protocol already matches the client's, and keeping bytes
+intact preserves ``signature`` / future Anthropic fields automatically.
 """
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
+from gateway.anthropic_passthrough import (
+    patch_request_thinking,
+    scan_response_json,
+    tee_stream_capture_thinking,
+)
 from gateway.core import (
     AdapterError,
     AuthError,
+    BadRequestError,
     GatewayError,
     InternalEvent,
     ModelNotFoundError,
@@ -79,6 +95,7 @@ class GatewayHandler:
         decision_log: DecisionLogWriter | None = None,
         metrics: MetricsRecorder | None = None,
         upstream_path: str = "/v1/chat/completions",
+        anthropic_upstream_path: str = "/anthropic/v1/messages",
         upstream_timeout_s: float = 600.0,
     ):
         self._router = router
@@ -90,6 +107,7 @@ class GatewayHandler:
         self._decision_log = decision_log
         self._metrics = metrics
         self._upstream_path = upstream_path
+        self._anthropic_upstream_path = anthropic_upstream_path
         self._upstream_timeout_s = upstream_timeout_s
 
     async def handle(
@@ -108,6 +126,9 @@ class GatewayHandler:
         Raises GatewayError; callers (the FastAPI route) translate that
         into the proper protocol error envelope via ``adapter.error_envelope``.
         """
+        if adapter.name == "anthropic":
+            return await self._handle_anthropic_native(ctx, adapter, body)
+
         req = adapter.parse_request(body)
         ctx.model = req.model
         ctx.is_stream = req.stream
@@ -146,12 +167,271 @@ class GatewayHandler:
             ctx, adapter, req.model, upstream_body,
         )
 
-    def _choose_backend(self, ctx: RequestContext, model: str, *, exclude: set[str] | None = None):
+    # ============ Anthropic-native byte-passthrough ============
+
+    async def _handle_anthropic_native(
+        self,
+        ctx: RequestContext,
+        adapter: ProtocolAdapter,
+        body: dict[str, Any],
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        """Bypass IES for Anthropic clients.
+
+        Hits MiMo's ``/anthropic/v1/messages`` directly so ``thinking`` blocks
+        and ``signature`` round-trip as bytes. Before forwarding, we patch any
+        assistant history message that has ``tool_use`` blocks but is missing
+        the corresponding ``thinking`` block by rehydrating from the reasoning
+        cache. After forwarding, we tee the response to harvest fresh thinking
+        content back into the same cache.
+        """
+        requested_model = body.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            raise BadRequestError("Missing 'model'")
+        ctx.model = requested_model
+        ctx.is_stream = bool(body.get("stream", False))
+
+        principal = getattr(ctx, "principal", None)
+        allowed_models = tuple(getattr(principal, "allowed_models", ()) or ())
+        if allowed_models and requested_model not in allowed_models:
+            raise AuthError(
+                f"API key is not allowed to access model {requested_model!r}",
+                details={"model": requested_model},
+            )
+
+        from gateway.model_groups_store import resolve as _resolve_mapping
+        native = _resolve_mapping(requested_model, "anthropic")
+        if native is None:
+            raise ModelNotFoundError(
+                f"Model {requested_model!r} is not configured for protocol 'anthropic'",
+                details={"requested_model": requested_model, "protocol": "anthropic"},
+            )
+        if native != requested_model:
+            body["model"] = native
+            ctx.model = native
+
+        # Rehydrate missing thinking blocks before sending to upstream.
+        patch_request_thinking(body)
+
+        if ctx.is_stream:
+            return await self._handle_anthropic_stream_with_retries(ctx, adapter, native, body)
+        return await self._handle_anthropic_non_stream_with_retries(ctx, adapter, native, body)
+
+    async def _handle_anthropic_non_stream_with_retries(
+        self, ctx: RequestContext, adapter: ProtocolAdapter,
+        model: str, upstream_body: dict[str, Any],
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        tried: set[str] = set()
+        last_error: GatewayError | None = None
+        for _attempt in range(2):
+            try:
+                backend = self._choose_backend(
+                    ctx, model, exclude=tried,
+                    upstream_path=self._anthropic_upstream_path,
+                )
+            except GatewayError:
+                if last_error is not None:
+                    raise last_error
+                raise
+            tried.add(backend.backend_id)
+            try:
+                return await self._handle_anthropic_non_stream(
+                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                )
+            except GatewayError as e:
+                last_error = e
+                if not self._is_retryable_non_stream(e):
+                    raise
+                ctx.decide(f"retry_after:{backend.backend_id}:{e.error_code}")
+                continue
+        assert last_error is not None
+        raise last_error
+
+    async def _handle_anthropic_non_stream(
+        self, ctx: RequestContext, adapter: ProtocolAdapter,
+        backend, upstream_body: dict[str, Any], headers: dict[str, str],
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        backend.inc_in_flight()
+        started = time.monotonic()
+        try:
+            try:
+                status, raw = await self._transport.post_json(
+                    ctx.upstream_url, upstream_body,
+                    headers=headers, timeout_s=self._upstream_timeout_s,
+                )
+            except GatewayError as e:
+                backend.record_failure(f"{e.error_code}: {e.message}")
+                self._record_metric(ctx, backend.backend_id, 0,
+                                    (time.monotonic() - started) * 1000,
+                                    error=e.message)
+                raise
+            except Exception as e:
+                backend.record_failure(f"transport: {type(e).__name__}: {e}")
+                self._record_metric(ctx, backend.backend_id, 0,
+                                    (time.monotonic() - started) * 1000,
+                                    error=str(e))
+                raise UpstreamError(f"Upstream call failed: {e}") from e
+
+            ctx.upstream_status = status
+
+            if status >= 400:
+                if status >= 500:
+                    backend.record_failure(f"upstream http {status}")
+                self._record_metric(ctx, backend.backend_id, status,
+                                    (time.monotonic() - started) * 1000,
+                                    error=f"http {status}")
+                raise UpstreamError(
+                    f"Upstream returned {status}: {raw[:200]!r}",
+                    details={"status": status},
+                )
+
+            latency_ms = (time.monotonic() - started) * 1000
+            backend.record_success()
+            backend.record_latency(latency_ms)
+
+            # Harvest thinking before returning bytes to client.
+            scan_response_json(raw)
+
+            prompt_t, completion_t = _extract_anthropic_token_counts(raw)
+            self._record_metric(
+                ctx, backend.backend_id, status, latency_ms,
+                prompt_tokens=prompt_t, completion_tokens=completion_t,
+            )
+
+            return "application/json", None, raw
+        finally:
+            backend.dec_in_flight()
+
+    async def _handle_anthropic_stream_with_retries(
+        self, ctx: RequestContext, adapter: ProtocolAdapter,
+        model: str, upstream_body: dict[str, Any],
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        tried: set[str] = set()
+        last_error: GatewayError | None = None
+        for _attempt in range(2):
+            try:
+                backend = self._choose_backend(
+                    ctx, model, exclude=tried,
+                    upstream_path=self._anthropic_upstream_path,
+                )
+            except GatewayError:
+                if last_error is not None:
+                    raise last_error
+                raise
+            tried.add(backend.backend_id)
+            try:
+                return await self._handle_anthropic_stream(
+                    ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                )
+            except GatewayError as e:
+                last_error = e
+                if not self._is_retryable_stream(e):
+                    raise
+                ctx.decide(f"stream_retry_after:{backend.backend_id}:{e.error_code}")
+                continue
+        assert last_error is not None
+        raise last_error
+
+    async def _handle_anthropic_stream(
+        self, ctx: RequestContext, adapter: ProtocolAdapter,
+        backend, upstream_body: dict[str, Any], headers: dict[str, str],
+    ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
+        backend.inc_in_flight()
+        started = time.monotonic()
+        try:
+            status, raw_iter = await self._transport.post_stream(
+                ctx.upstream_url, upstream_body,
+                headers=headers, timeout_s=self._upstream_timeout_s,
+            )
+        except GatewayError as e:
+            backend.record_failure(f"{e.error_code}: {e.message}")
+            backend.dec_in_flight()
+            self._record_metric(ctx, backend.backend_id, 0,
+                                (time.monotonic() - started) * 1000,
+                                error=e.message)
+            raise
+        except Exception as e:
+            backend.record_failure(f"transport: {type(e).__name__}: {e}")
+            backend.dec_in_flight()
+            self._record_metric(ctx, backend.backend_id, 0,
+                                (time.monotonic() - started) * 1000,
+                                error=str(e))
+            raise UpstreamError(f"Upstream call failed: {e}") from e
+
+        ctx.upstream_status = status
+        if status >= 400:
+            try:
+                async for _ in raw_iter:
+                    pass
+            except Exception:
+                pass
+            if status >= 500:
+                backend.record_failure(f"upstream http {status}")
+            backend.dec_in_flight()
+            self._record_metric(ctx, backend.backend_id, status,
+                                (time.monotonic() - started) * 1000,
+                                error=f"http {status}")
+            raise UpstreamError(
+                f"Upstream returned {status}",
+                details={"status": status},
+            )
+
+        teed = tee_stream_capture_thinking(raw_iter)
+        recorder = self._metrics
+        bid = backend.backend_id
+
+        async def counted_chunks() -> AsyncIterator[bytes]:
+            error = ""
+            completed = False
+            try:
+                async for chunk in teed:
+                    ctx.response_chunks += 1
+                    yield chunk
+                completed = True
+            except Exception as e:
+                error = f"stream: {type(e).__name__}: {e}"
+                backend.record_failure(error)
+                raise
+            finally:
+                latency_ms = (time.monotonic() - started) * 1000
+                if completed:
+                    backend.record_success()
+                    backend.record_latency(latency_ms)
+                backend.dec_in_flight()
+                if recorder is not None:
+                    try:
+                        recorder.record(
+                            ctx=ctx, backend_id=bid,
+                            status_code=status if completed else 0,
+                            latency_ms=latency_ms,
+                            # Anthropic stream usage arrives in message_delta /
+                            # message_stop frames; harvesting it would need a
+                            # second parser. Leave at 0 for now — metrics page
+                            # still records the request.
+                            prompt_tokens=0, completion_tokens=0,
+                            error=error,
+                        )
+                    except Exception:
+                        pass
+
+        return "text/event-stream", counted_chunks(), b""
+
+    # ============ Shared helpers ============
+
+    def _choose_backend(
+        self,
+        ctx: RequestContext,
+        model: str,
+        *,
+        exclude: set[str] | None = None,
+        upstream_path: str | None = None,
+    ):
         backend, decision = self._router.choose(
             request_id=ctx.request_id, model=model, exclude=exclude,
         )
         ctx.target_backend_id = backend.backend_id
-        ctx.upstream_url = backend.base_url.rstrip("/") + self._upstream_path
+        ctx.upstream_url = backend.base_url.rstrip("/") + (
+            upstream_path or self._upstream_path
+        )
         ctx.decide(f"route:{backend.backend_id}:{decision.reason}")
         if self._decision_log is not None:
             try:
@@ -457,6 +737,26 @@ def _extract_token_counts(events) -> tuple[int, int]:
             except (TypeError, ValueError):
                 pass
     return 0, 0
+
+
+def _extract_anthropic_token_counts(raw: bytes) -> tuple[int, int]:
+    """Pull (prompt, completion) from an Anthropic non-stream response body."""
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0
+    try:
+        return (
+            int(usage.get("input_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+        )
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 # helper for typing-only import
