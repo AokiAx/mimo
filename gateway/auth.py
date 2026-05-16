@@ -61,14 +61,17 @@ async def authenticate_gateway_request(
     2. The legacy ``MIMO_PUBLIC_API_TOKEN`` / ``data/secrets.json`` token keeps
        existing clients working.
     3. New per-key APIKeyStore credentials enable revocation and model scoping.
+
+    Token can arrive via any of three headers — Anthropic clients
+    (Claude Code, Cline, OpenClaw, ...) default to ``x-api-key``; MiMo's own
+    docs additionally list ``api-key``; OpenAI-compatible clients use
+    ``Authorization: Bearer``. We accept all three so the gateway looks like
+    whatever protocol the caller expects.
     """
     if request.cookies.get(auth_cookie) == secrets.public_api_token:
         return GatewayPrincipal(key_id="panel", source="panel_cookie")
 
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise AuthError("Missing or invalid Authorization")
-    token = auth[7:].strip()
+    token = _extract_token(request)
     if not token:
         raise AuthError("Missing or invalid Authorization")
 
@@ -77,3 +80,26 @@ async def authenticate_gateway_request(
 
     rec = await get_key_store().validate(token)
     return GatewayPrincipal(key_id=rec.key_id, source="api_key", record=rec)
+
+
+def _extract_token(request: Request) -> str | None:
+    """Pull the API token from any accepted auth header.
+
+    Accepts (in order):
+      * ``Authorization: Bearer <token>``  (OpenAI SDK convention)
+      * ``x-api-key: <token>``             (Anthropic SDK convention)
+      * ``api-key: <token>``               (MiMo native convention)
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        candidate = auth[7:].strip()
+        if candidate:
+            return candidate
+    # Header lookup in starlette is case-insensitive, so either casing works.
+    for header in ("x-api-key", "api-key"):
+        v = request.headers.get(header)
+        if v:
+            candidate = v.strip()
+            if candidate:
+                return candidate
+    return None
