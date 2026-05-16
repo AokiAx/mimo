@@ -211,8 +211,13 @@ async def handle_proxy(request: web.Request):
         if v:
             backend_headers[h] = v
 
+    # Anthropic 路径重写：/v1/messages → /anthropic/v1/messages
+    path = request.path
+    if path == "/v1/messages":
+        path = "/anthropic/v1/messages"
+    
     # 路径：保留客户端原始路径 + query string（aiohttp 的 path_qs）
-    backend_url = f"{API_BASE}{request.path_qs}"
+    backend_url = f"{API_BASE}{path}?{request.query_string}" if request.query_string else f"{API_BASE}{path}"
 
     t0 = time.monotonic()
     try:
