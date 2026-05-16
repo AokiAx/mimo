@@ -867,3 +867,106 @@ def test_missing_uncached_assistant_tool_call_does_not_inject_empty_reasoning_co
     })
     msg = _adapter().serialize_to_upstream(req)["messages"][0]
     assert "reasoning_content" not in msg
+
+
+def test_serialize_to_upstream_forwards_thinking_switch_from_metadata():
+    # OpenAI SDK clients pass `extra_body={"thinking": {...}}`, which lands in
+    # InternalRequest.metadata. The adapter must hoist it onto the upstream
+    # body so MiMo actually enters thinking mode.
+    body = _adapter().parse_request({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled"},
+    })
+    upstream = _adapter().serialize_to_upstream(body)
+    assert upstream["thinking"] == {"type": "enabled"}
+
+
+def test_serialize_to_upstream_omits_thinking_when_metadata_missing():
+    body = _adapter().parse_request({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    upstream = _adapter().serialize_to_upstream(body)
+    assert "thinking" not in upstream
+
+
+def test_serialize_to_upstream_ignores_non_dict_thinking_metadata():
+    body = _adapter().parse_request({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": "enabled",  # malformed — must not break upstream serialization
+    })
+    upstream = _adapter().serialize_to_upstream(body)
+    assert "thinking" not in upstream
+
+
+def test_reasoning_cache_commits_mid_stream_on_first_tool_id():
+    """The cache must hold reasoning even if the upstream stream is cut short
+    after the model emits its first tool_call — otherwise short-circuited
+    streams (client disconnect, network blip) leave the cache empty for the
+    very turns that need it most."""
+    from gateway.reasoning_cache import clear_reasoning_cache, lookup_reasoning
+
+    clear_reasoning_cache()
+
+    chunks_payloads = [
+        {"id": "x", "model": "m",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        # Reasoning streams first…
+        {"choices": [{"index": 0,
+                      "delta": {"reasoning_content": "Thinking it through. "},
+                      "finish_reason": None}]},
+        {"choices": [{"index": 0,
+                      "delta": {"reasoning_content": "Decision made."},
+                      "finish_reason": None}]},
+        # …then the tool_call appears. Cache should commit at this point.
+        {"choices": [{"index": 0, "delta": {
+            "tool_calls": [{
+                "index": 0, "id": "call_midstream", "type": "function",
+                "function": {"name": "search", "arguments": '{"q":"x"}'},
+            }]}, "finish_reason": None}]},
+        # Simulate stream truncation: no further chunks, no MessageEnd.
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads)
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+
+    _run(run())
+
+    # Without the mid-stream commit, this would be None.
+    assert lookup_reasoning(["call_midstream"]) == "Thinking it through. Decision made."
+
+
+def test_reasoning_cache_stats_after_stream():
+    """Stream completion path still works end-to-end (stats recorded)."""
+    from gateway.reasoning_cache import clear_reasoning_cache, get_cache_stats
+
+    clear_reasoning_cache()
+
+    chunks_payloads = [
+        {"id": "x", "model": "m",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"choices": [{"index": 0,
+                      "delta": {"reasoning_content": "reason"},
+                      "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {
+            "tool_calls": [{
+                "index": 0, "id": "call_end", "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }]}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+
+    _run(run())
+
+    stats = get_cache_stats()
+    # At least one store (mid-stream commit). Second commit (post-stream)
+    # overwrites; both count as stores in the current accounting.
+    assert stats["stores"] >= 1
+    assert stats["size"] == 1

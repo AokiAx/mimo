@@ -206,7 +206,7 @@ async def handle_proxy(request: web.Request):
         "Content-Type": request.headers.get("Content-Type", "application/json"),
         "Accept": request.headers.get("Accept", "*/*"),
     }
-    for h in ("X-Request-Id", "X-Conversation-Id", "Anthropic-Version"):
+    for h in ("X-Request-Id", "X-Conversation-Id", "Anthropic-Version", "Anthropic-Beta"):
         v = request.headers.get(h)
         if v:
             backend_headers[h] = v

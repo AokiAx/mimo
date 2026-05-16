@@ -263,6 +263,13 @@ class OpenAIChatAdapter(ProtocolAdapter):
             body["tool_choice"] = req.tool_choice
         if req.stream:
             body["stream_options"] = {"include_usage": True}
+        # MiMo's thinking-mode switch lives at the top of the body
+        # (clients pass it via OpenAI SDK ``extra_body``). Forward it so
+        # upstream actually emits ``reasoning_content``; otherwise the
+        # reasoning-passthrough plumbing has nothing to carry.
+        thinking = req.metadata.get("thinking")
+        if isinstance(thinking, dict):
+            body["thinking"] = thinking
         return body
 
     @staticmethod
@@ -472,6 +479,17 @@ class OpenAIChatAdapter(ProtocolAdapter):
                         index=ies_idx, block_type="tool_use",
                         tool_id=tool_id, tool_name=tool_name,
                     )
+                    # Commit reasoning to the cache as soon as we know the
+                    # tool-call ids. By this point the model has finished
+                    # thinking and decided to call a tool, so reasoning_parts
+                    # is effectively complete — and committing here means we
+                    # still cache something useful even if the stream gets
+                    # cut short before MessageEnd.
+                    if reasoning_parts:
+                        remember_reasoning(
+                            "".join(reasoning_parts),
+                            tool_id_by_idx.values(),
+                        )
                 ies_idx = tool_idx_map[oai_idx]
                 fn = tc.get("function", {}) or {}
                 args_delta = fn.get("arguments")

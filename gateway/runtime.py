@@ -252,6 +252,9 @@ async def dispatch(adapter_name: str, request: Request) -> Response:
     except BadRequestError as e:
         return _error_response(adapter, e)
 
+    from gateway.probe_dump import dump_inbound, dump_outbound, tee_stream
+    dump_inbound(adapter_name, body)
+
     ctx = _ctx_from_request(request, adapter)
     _total_requests += 1
 
@@ -268,7 +271,11 @@ async def dispatch(adapter_name: str, request: Request) -> Response:
     headers = {"Access-Control-Allow-Origin": "*"}
     if stream_iter is not None:
         headers["Cache-Control"] = "no-cache"
-        return StreamingResponse(stream_iter, media_type=content_type, headers=headers)
+        return StreamingResponse(
+            tee_stream(adapter_name, stream_iter),
+            media_type=content_type, headers=headers,
+        )
+    dump_outbound(adapter_name, body_bytes)
     return Response(content=body_bytes, media_type=content_type, status_code=200, headers=headers)
 
 
