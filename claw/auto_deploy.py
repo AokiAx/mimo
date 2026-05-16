@@ -783,7 +783,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 return
             check_cmd = f"ss -tln 2>/dev/null | grep -q ':{ssh_port} ' && echo READY || echo NOT_READY"
             stdout, _, rc = await _ssh_jump_async(check_cmd)
-            if "READY" in stdout:
+            if stdout.strip() == "READY":
                 port_ready = True
                 log.log(f"✅ 端口 :{ssh_port} 已就绪 (等待 {probe * 5}s)")
                 break
@@ -805,7 +805,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log("Claw 已确认但端口未就绪，额外等待 10s...")
             await asyncio.sleep(10)
             stdout, _, rc = await _ssh_jump_async(check_cmd)
-            if "READY" in stdout:
+            if stdout.strip() == "READY":
                 port_ready = True
                 log.log(f"✅ 端口 :{ssh_port} 已就绪 (额外等待后)")
             else:
