@@ -970,3 +970,192 @@ def test_reasoning_cache_stats_after_stream():
     # overwrites; both count as stores in the current accounting.
     assert stats["stores"] >= 1
     assert stats["size"] == 1
+
+
+# ───────── usage details forwarding ─────────
+
+
+def test_parse_upstream_response_forwards_full_usage_details():
+    """MiMo's OpenAI endpoint returns nested cache / reasoning / multimodal
+    breakdowns; the adapter must surface every field so NewAPI can bill at
+    cached-rate and so clients can see real token splits."""
+    payload = json.dumps({
+        "id": "chatcmpl-u",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 1234,
+            "completion_tokens": 56,
+            "total_tokens": 1290,
+            "prompt_tokens_details": {
+                "cached_tokens": 1000,
+                "audio_tokens": 7,
+                "image_tokens": 11,
+                "video_tokens": 13,
+            },
+            "completion_tokens_details": {"reasoning_tokens": 42},
+            "web_search_usage": {"tool_usage": 2, "page_usage": 9},
+        },
+    }).encode()
+    events = _adapter().parse_upstream_response(payload)
+    end = next(e for e in events if isinstance(e, MessageEnd))
+    u = end.usage
+    assert u.input_tokens == 1234
+    assert u.output_tokens == 56
+    assert u.cached_tokens == 1000
+    assert u.audio_tokens == 7
+    assert u.image_tokens == 11
+    assert u.video_tokens == 13
+    assert u.reasoning_tokens == 42
+    assert u.web_search_usage == {"tool_usage": 2, "page_usage": 9}
+
+
+def test_parse_upstream_response_handles_missing_usage_details_gracefully():
+    """Older upstream / non-thinking modes won't include the nested objects;
+    we should default to 0 rather than crash."""
+    payload = json.dumps({
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    }).encode()
+    events = _adapter().parse_upstream_response(payload)
+    end = next(e for e in events if isinstance(e, MessageEnd))
+    assert end.usage.cached_tokens == 0
+    assert end.usage.reasoning_tokens == 0
+    assert end.usage.web_search_usage is None
+
+
+def test_parse_upstream_response_tolerates_malformed_nested_usage():
+    """If upstream returns prompt_tokens_details as a string or null (e.g.
+    a glitch), we shouldn't break — IES Usage must always be constructable."""
+    payload = json.dumps({
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 5, "completion_tokens": 2,
+            "prompt_tokens_details": "garbage",
+            "completion_tokens_details": None,
+            "web_search_usage": ["unexpected", "list"],
+        },
+    }).encode()
+    events = _adapter().parse_upstream_response(payload)
+    end = next(e for e in events if isinstance(e, MessageEnd))
+    assert end.usage.input_tokens == 5
+    assert end.usage.cached_tokens == 0
+    assert end.usage.web_search_usage is None
+
+
+def test_parse_upstream_stream_forwards_full_usage_details():
+    """Streaming uses the final chunk's usage object — same fields apply."""
+    chunks_payloads = [
+        {"id": "x", "model": "m",
+         "choices": [{"index": 0, "delta": {"role": "assistant"},
+                      "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": "hi"},
+                      "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {
+            "prompt_tokens": 100, "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 80, "image_tokens": 4},
+            "completion_tokens_details": {"reasoning_tokens": 3},
+        }},
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+
+    events = _run(run())
+    end = next(e for e in events if isinstance(e, MessageEnd))
+    assert end.usage.input_tokens == 100
+    assert end.usage.cached_tokens == 80
+    assert end.usage.image_tokens == 4
+    assert end.usage.reasoning_tokens == 3
+
+
+def test_serialize_response_emits_usage_details_in_openai_shape():
+    """Verify the wire shape matches OpenAI's standard schema so NewAPI's
+    billing logic finds prompt_tokens_details.cached_tokens where expected."""
+    usage = Usage(
+        input_tokens=1234, output_tokens=56,
+        cached_tokens=1000, audio_tokens=7, image_tokens=11, video_tokens=13,
+        reasoning_tokens=42,
+        web_search_usage={"tool_usage": 2, "page_usage": 9},
+    )
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-u", model="m"),
+        ContentBlockStart(index=0, block_type="text"),
+        TextDelta(index=0, text="ok"),
+        ContentBlockEnd(index=0),
+        MessageEnd(finish_reason="stop", usage=usage),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    u = body["usage"]
+    assert u["prompt_tokens"] == 1234
+    assert u["completion_tokens"] == 56
+    assert u["total_tokens"] == 1290
+    assert u["prompt_tokens_details"] == {
+        "cached_tokens": 1000, "audio_tokens": 7,
+        "image_tokens": 11, "video_tokens": 13,
+    }
+    assert u["completion_tokens_details"] == {"reasoning_tokens": 42}
+    assert u["web_search_usage"] == {"tool_usage": 2, "page_usage": 9}
+
+
+def test_serialize_response_omits_empty_usage_details_objects():
+    """No multimodal / cache / web-search data → don't pollute output with
+    empty nested objects. Keeps the response wire-compatible with vanilla
+    OpenAI clients that expect a minimal usage block."""
+    usage = Usage(input_tokens=5, output_tokens=2)
+    events: list[InternalEvent] = [
+        MessageStart(message_id="x", model="m"),
+        ContentBlockStart(index=0, block_type="text"),
+        TextDelta(index=0, text="ok"),
+        ContentBlockEnd(index=0),
+        MessageEnd(finish_reason="stop", usage=usage),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    u = body["usage"]
+    assert u == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+    assert "prompt_tokens_details" not in u
+    assert "completion_tokens_details" not in u
+    assert "web_search_usage" not in u
+
+
+def test_serialize_stream_emits_usage_details_in_final_chunk():
+    """Stream final chunk carries the usage block exactly like non-stream."""
+    async def feed() -> AsyncIterator[InternalEvent]:
+        yield MessageStart(message_id="x", model="m")
+        yield ContentBlockStart(index=0, block_type="text")
+        yield TextDelta(index=0, text="ok")
+        yield ContentBlockEnd(index=0)
+        yield MessageEnd(
+            finish_reason="stop",
+            usage=Usage(
+                input_tokens=100, output_tokens=5,
+                cached_tokens=80, reasoning_tokens=3,
+            ),
+        )
+
+    raw = _run(_drain(_adapter().serialize_response_stream(feed())))
+    payloads = [
+        json.loads(c[6:].decode())
+        for c in raw.split(b"\n\n")
+        if c and c != b"data: [DONE]" and c.startswith(b"data: ")
+    ]
+    final = payloads[-1]
+    assert final["usage"]["prompt_tokens"] == 100
+    assert final["usage"]["prompt_tokens_details"] == {"cached_tokens": 80}
+    assert final["usage"]["completion_tokens_details"] == {"reasoning_tokens": 3}
