@@ -352,11 +352,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         choice = choices[0]
         msg = choice.get("message", {}) or {}
         finish = _map_finish(choice.get("finish_reason"))
-        u_dict = data.get("usage") or {}
-        usage = Usage(
-            input_tokens=int(u_dict.get("prompt_tokens", 0)),
-            output_tokens=int(u_dict.get("completion_tokens", 0)),
-        )
+        usage = _parse_upstream_usage(data.get("usage"))
 
         events: list[InternalEvent] = [MessageStart(message_id=message_id, model=model)]
         next_idx = 0
@@ -431,11 +427,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
             last_model = chunk.get("model") or last_model
 
             if chunk.get("usage"):
-                u = chunk["usage"]
-                usage = Usage(
-                    input_tokens=int(u.get("prompt_tokens", 0)),
-                    output_tokens=int(u.get("completion_tokens", 0)),
-                )
+                usage = _parse_upstream_usage(chunk.get("usage"))
 
             choices = chunk.get("choices") or []
             if not choices:
@@ -612,11 +604,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                         "delta": {},
                         "finish_reason": _IES_TO_OPENAI_FINISH.get(ev.finish_reason, "stop"),
                     }],
-                    "usage": {
-                        "prompt_tokens": ev.usage.input_tokens,
-                        "completion_tokens": ev.usage.output_tokens,
-                        "total_tokens": ev.usage.total_tokens,
-                    },
+                    "usage": _serialize_usage(ev.usage),
                 })
                 yield b"data: [DONE]\n\n"
             elif isinstance(ev, StreamError):
@@ -684,11 +672,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 "message": msg,
                 "finish_reason": _IES_TO_OPENAI_FINISH.get(finish, "stop"),
             }],
-            "usage": {
-                "prompt_tokens": usage.input_tokens,
-                "completion_tokens": usage.output_tokens,
-                "total_tokens": usage.total_tokens,
-            },
+            "usage": _serialize_usage(usage),
         }
         return json.dumps(body, ensure_ascii=False).encode()
 
@@ -718,3 +702,78 @@ _CONSUMED_KEYS = frozenset({
 
 def _gen_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+
+def _parse_upstream_usage(u_dict: Any) -> Usage:
+    """Pull every OpenAI-style usage field MiMo upstream may include.
+
+    MiMo's OpenAI endpoint extends OpenAI's standard ``usage`` with
+    ``prompt_tokens_details`` (cached / audio / image / video) and
+    ``completion_tokens_details`` (reasoning). It also adds ``web_search_usage``.
+    NewAPI reads ``prompt_tokens_details.cached_tokens`` to apply the
+    cache-hit billing rate — dropping it on this path makes clients pay full
+    price for cached prompts.
+
+    Returns a zero Usage if the input is malformed (defensive: upstream
+    schema can drift; we don't want a single missing nested object to break
+    the response path).
+    """
+    if not isinstance(u_dict, dict):
+        return Usage()
+
+    prompt_details = u_dict.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    completion_details = u_dict.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    web_search_usage = u_dict.get("web_search_usage")
+    if not isinstance(web_search_usage, dict):
+        web_search_usage = None
+
+    def _int(d: dict, key: str) -> int:
+        try:
+            return int(d.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return Usage(
+        input_tokens=_int(u_dict, "prompt_tokens"),
+        output_tokens=_int(u_dict, "completion_tokens"),
+        cached_tokens=_int(prompt_details, "cached_tokens"),
+        audio_tokens=_int(prompt_details, "audio_tokens"),
+        image_tokens=_int(prompt_details, "image_tokens"),
+        video_tokens=_int(prompt_details, "video_tokens"),
+        reasoning_tokens=_int(completion_details, "reasoning_tokens"),
+        web_search_usage=web_search_usage,
+    )
+
+
+def _serialize_usage(u: Usage) -> dict[str, Any]:
+    """Render an IES Usage as an OpenAI-shaped ``usage`` dict.
+
+    Nested *_details / web_search_usage objects are emitted only when any
+    sub-field is non-zero, so the wire payload stays clean for callers that
+    don't use multimodal / web-search / cache features.
+    """
+    out: dict[str, Any] = {
+        "prompt_tokens": u.input_tokens,
+        "completion_tokens": u.output_tokens,
+        "total_tokens": u.total_tokens,
+    }
+    prompt_details: dict[str, int] = {}
+    if u.cached_tokens:
+        prompt_details["cached_tokens"] = u.cached_tokens
+    if u.audio_tokens:
+        prompt_details["audio_tokens"] = u.audio_tokens
+    if u.image_tokens:
+        prompt_details["image_tokens"] = u.image_tokens
+    if u.video_tokens:
+        prompt_details["video_tokens"] = u.video_tokens
+    if prompt_details:
+        out["prompt_tokens_details"] = prompt_details
+    if u.reasoning_tokens:
+        out["completion_tokens_details"] = {"reasoning_tokens": u.reasoning_tokens}
+    if u.web_search_usage:
+        out["web_search_usage"] = u.web_search_usage
+    return out

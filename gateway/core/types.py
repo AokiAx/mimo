@@ -95,6 +95,19 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
 
+    # OpenAI Chat extended usage breakdown — forwarded verbatim from upstream
+    # so NewAPI / direct clients see real numbers and bill cached/reasoning
+    # tokens at the correct rate. MiMo's OpenAI endpoint returns these inside
+    # ``prompt_tokens_details`` and ``completion_tokens_details``.
+    cached_tokens: int = 0           # prompt_tokens_details.cached_tokens
+    reasoning_tokens: int = 0        # completion_tokens_details.reasoning_tokens
+    audio_tokens: int = 0            # prompt_tokens_details.audio_tokens
+    image_tokens: int = 0            # prompt_tokens_details.image_tokens
+    video_tokens: int = 0            # prompt_tokens_details.video_tokens
+    # web_search_usage is a nested {tool_usage, page_usage} object — keep it
+    # as dict so we don't have to track its schema separately.
+    web_search_usage: dict[str, int] | None = None
+
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
