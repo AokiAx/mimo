@@ -125,7 +125,13 @@ def _ensure_initialized() -> None:
         with _lock:
             for tool_ids_str, reasoning, expires_at in rows:
                 key = tuple(tool_ids_str.split("|"))
-                _by_tool_ids[key] = (reasoning, expires_at)
+                # ``setdefault`` so a concurrent ``remember_reasoning`` that
+                # just wrote a fresher value (with the same key) before
+                # init landed isn't clobbered by an older row on disk.
+                # See PR #25 review (Codex P1) — without this, the very
+                # first cache write after a cold start could be reverted
+                # by the reload that follows it.
+                _by_tool_ids.setdefault(key, (reasoning, expires_at))
             # Rows were ordered by expires_at DESC; reverse the OrderedDict
             # iteration so the most-recently-expiring entries become the most
             # recently used (= last in LRU order). Tiny detail but it means
@@ -287,9 +293,13 @@ def remember_reasoning(
     # Best-effort async persistence.
     try:
         _ensure_initialized()
-    except OSError as e:
-        # DB init failed (permissions, missing parent dir we can't create,
-        # etc). Stay memory-only; surface in stats.
+    except (OSError, sqlite3.DatabaseError) as e:
+        # DB init failed: filesystem permissions / missing parent dir
+        # (OSError) or DB file corrupted / locked / wrong schema
+        # (sqlite3.DatabaseError). Cache must fail open — we stay
+        # memory-only and surface in stats. Anything that crashes here
+        # would otherwise turn a cache-layer issue into user-visible
+        # request failures (see PR #25 review, Codex P1 #2).
         logger.warning("reasoning_cache DB init failed: %s", e)
         with _lock:
             _stats["write_drops"] += 1
@@ -340,7 +350,9 @@ def lookup_reasoning(tool_call_ids: Iterable[str | None]) -> str | None:
     # microseconds and avoids the locking headache.
     try:
         _ensure_initialized()
-    except OSError:
+    except (OSError, sqlite3.DatabaseError):
+        # Cache must fail open — DB-layer errors shouldn't propagate
+        # out of a lookup and break the request. Treat as miss.
         with _lock:
             _stats["misses"] += 1
         return None
@@ -395,16 +407,37 @@ def get_cache_stats() -> dict[str, int]:
 
 
 def clear_reasoning_cache() -> None:
-    """Clear both memory and SQLite. Used by tests and operational escape hatch."""
+    """Clear both memory and SQLite. Used by tests and operational escape hatch.
+
+    Note: we deliberately do NOT short-circuit when ``_db_initialized`` is
+    False — a fresh process with persisted rows on disk must still be able
+    to wipe them. Otherwise an operator calling ``clear`` right after start
+    would see no effect, and the next lookup's lazy init would reload the
+    stale rows back into memory (PR #25 review, Codex P2).
+    """
     with _lock:
         _by_tool_ids.clear()
         for k in _stats:
             _stats[k] = 0
-    if not _db_initialized:
+    path = _db_path()
+    if not path.exists():
+        # DB never created → nothing to delete + don't accidentally create
+        # an empty file as a side effect.
         return
     try:
-        conn = sqlite3.connect(str(_db_path()), check_same_thread=False)
+        conn = sqlite3.connect(str(path), check_same_thread=False)
         try:
+            # CREATE-then-DELETE pattern: if the file exists but the table
+            # somehow doesn't (e.g. partially-initialized DB), make sure
+            # the schema is there before deleting, otherwise the DELETE
+            # raises ``no such table``.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reasoning_cache ("
+                "  tool_ids TEXT PRIMARY KEY,"
+                "  reasoning TEXT NOT NULL,"
+                "  expires_at REAL NOT NULL"
+                ")"
+            )
             conn.execute("DELETE FROM reasoning_cache")
             conn.commit()
         finally:

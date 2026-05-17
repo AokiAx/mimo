@@ -277,3 +277,131 @@ def test_overflow_falls_back_to_memory_only(monkeypatch):
     assert lookup_reasoning(["toolu_overflow"]) == "dropped from disk"
     # write_drops should bump.
     assert get_cache_stats()["write_drops"] >= 1
+
+
+# ───────── PR #25 review regressions ─────────
+
+
+def test_init_reload_does_not_clobber_fresh_memory_write():
+    """PR #25 Codex P1 #1.
+
+    First remember after restart: SQLite has an older value for the same
+    tool_ids, then remember_reasoning writes a fresher value to memory and
+    triggers _ensure_initialized → reload. The reload must NOT overwrite
+    the freshly-written value with the stale on-disk one.
+
+    Repro: seed SQLite with an old row, reset memory (keep DB), call
+    remember_reasoning with a new value, then lookup — should return new.
+    """
+    # Phase 1: write old value, flush to SQLite, simulate process restart
+    # by clearing memory + the writer thread (DB file survives).
+    remember_reasoning("OLD reasoning", ["toolu_clobber"])
+    _wait_for_flush()
+    reset_for_tests()
+
+    # Phase 2: fresh process writes a new value for the same key.
+    remember_reasoning("NEW reasoning", ["toolu_clobber"])
+
+    # Phase 3: lookup — must see the new value, not the old one reloaded
+    # from disk during init.
+    assert lookup_reasoning(["toolu_clobber"]) == "NEW reasoning"
+
+
+def test_init_reload_still_brings_in_unrelated_rows():
+    """The setdefault fix must not break the legitimate reload case:
+    rows whose keys aren't currently in memory should still come back."""
+    remember_reasoning("disk-only row A", ["toolu_disk_a"])
+    remember_reasoning("disk-only row B", ["toolu_disk_b"])
+    _wait_for_flush()
+    reset_for_tests()
+
+    # Write a third, fresh value — its init reload should NOT touch this,
+    # but SHOULD still load A and B.
+    remember_reasoning("fresh row C", ["toolu_fresh_c"])
+
+    assert lookup_reasoning(["toolu_disk_a"]) == "disk-only row A"
+    assert lookup_reasoning(["toolu_disk_b"]) == "disk-only row B"
+    assert lookup_reasoning(["toolu_fresh_c"]) == "fresh row C"
+
+
+def test_remember_swallows_sqlite_init_corruption(monkeypatch, tmp_path):
+    """PR #25 Codex P1 #2.
+
+    A corrupted DB file makes sqlite3.connect / execute raise
+    DatabaseError, not OSError. remember_reasoning must catch it and
+    continue memory-only, not propagate the exception out into the request
+    pipeline.
+    """
+    # Write garbage to where the cache DB is expected.
+    db = tmp_path / "corrupt_cache.db"
+    db.write_bytes(b"this is not a valid sqlite database file at all")
+    monkeypatch.setenv("MIMO_REASONING_CACHE_DB", str(db))
+    reset_for_tests()
+
+    # Must not raise.
+    remember_reasoning("survives corruption", ["toolu_corrupt"])
+
+    # Memory layer still served the write — lookup hits memory.
+    assert lookup_reasoning(["toolu_corrupt"]) == "survives corruption"
+
+    # Stats reflect the failed persistence attempt.
+    stats = get_cache_stats()
+    assert stats["write_drops"] >= 1
+
+
+def test_lookup_swallows_sqlite_init_corruption(monkeypatch, tmp_path):
+    """Same fail-open semantics for the read path: a corrupt DB must
+    cause a miss, not raise."""
+    db = tmp_path / "corrupt_cache.db"
+    db.write_bytes(b"\x00garbage data\xff")
+    monkeypatch.setenv("MIMO_REASONING_CACHE_DB", str(db))
+    reset_for_tests()
+
+    # Must not raise; returns None (miss).
+    assert lookup_reasoning(["toolu_anything"]) is None
+    assert get_cache_stats()["misses"] >= 1
+
+
+def test_clear_wipes_disk_even_on_cold_start():
+    """PR #25 Codex P2 #3.
+
+    Operator scenario: fresh process, never called remember/lookup, has
+    rows persisted on disk from previous run. Calling clear_reasoning_cache
+    must delete those disk rows (previously short-circuited and returned
+    immediately because _db_initialized was False).
+    """
+    # Phase 1: seed DB and persist.
+    remember_reasoning("survive me not", ["toolu_clear_test"])
+    _wait_for_flush()
+    assert _sqlite_count() == 1
+
+    # Phase 2: full restart — db file survives, in-memory state is wiped,
+    # _db_initialized is False.
+    reset_for_tests()
+    import gateway.reasoning_cache as rc
+    assert rc._db_initialized is False
+
+    # Phase 3: call clear before any other cache call.
+    from gateway.reasoning_cache import clear_reasoning_cache
+    clear_reasoning_cache()
+
+    # Disk row gone.
+    assert _sqlite_count() == 0
+
+    # Belt-and-braces: subsequent lookup must also miss (no zombie reload).
+    assert lookup_reasoning(["toolu_clear_test"]) is None
+
+
+def test_clear_on_missing_db_does_not_create_empty_file(tmp_path, monkeypatch):
+    """Side check: clear shouldn't create the DB file just to delete from
+    it. A fresh deployment with no cache history should leave the
+    filesystem untouched."""
+    db = tmp_path / "never_used.db"
+    monkeypatch.setenv("MIMO_REASONING_CACHE_DB", str(db))
+    reset_for_tests()
+    assert not db.exists()
+
+    from gateway.reasoning_cache import clear_reasoning_cache
+    clear_reasoning_cache()
+
+    assert not db.exists(), "clear() should not create an empty DB file"
