@@ -40,6 +40,7 @@ from croniter import croniter
 CONFIG_PATH = Path(__file__).parent.parent / "data" / "auto_deploy.json"
 LOG_DIR = Path(__file__).parent.parent / "data" / "deploy_logs"
 HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
+INCIDENT_DIR = LOG_DIR / "incidents"
 PAYLOAD_DIR = Path(__file__).parent / "payload"
 
 JUMP_SERVER = "149.88.90.137"
@@ -157,6 +158,40 @@ def _ensure_dirs():
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_incident_log(
+    account_filename: str,
+    reason: str,
+    state: str,
+    log_lines: list[str],
+    extra: dict | None = None,
+) -> Path | None:
+    """Dump a self-contained log for a failed deploy run.
+
+    Each failure gets its own timestamped file under ``deploy_logs/incidents/``
+    so anomalies are easy to find without grepping through the rolling
+    per-account log. Returns the file path on success."""
+    try:
+        _ensure_dirs()
+        safe_name = account_filename.replace("/", "_").replace("\\", "_")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = INCIDENT_DIR / f"{safe_name}__{ts}__{state}.log"
+        header = [
+            f"# Deploy incident",
+            f"# account: {account_filename}",
+            f"# time:    {datetime.now().isoformat(timespec='seconds')}",
+            f"# state:   {state}",
+            f"# reason:  {reason}",
+        ]
+        if extra:
+            header.append(f"# extra:   {json.dumps(extra, ensure_ascii=False)}")
+        body = "\n".join(header) + "\n\n" + "\n".join(log_lines) + "\n"
+        path.write_text(body, encoding="utf-8")
+        return path
+    except Exception:
+        return None
 
 
 def _save_run_history(account_filename: str, status: str, log_lines: list):
@@ -545,6 +580,18 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         _active_deploys[account_filename]["finished_ts"] = time.time()
         if history_status is not None:
             _save_run_history(account_filename, history_status, log.lines[:])
+        # Dump a standalone incident log on error so unfamiliar failures are
+        # easy to inspect without sifting through the rolling per-account log.
+        if history_status == "error":
+            reason = log.lines[-1] if log.lines else "(no log)"
+            incident_path = _save_incident_log(
+                account_filename,
+                reason=reason,
+                state=state,
+                log_lines=log.lines[:],
+            )
+            if incident_path is not None:
+                log.log(f"📝 incident log: {incident_path.name}")
 
     def cancelled() -> bool:
         return cancel_event.is_set()

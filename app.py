@@ -629,7 +629,12 @@ async def claw_ws_chat(
         user_id = data2.get("data", {}).get("userId")
 
     if not ticket or not user_id:
-        return "", "Failed to get WS ticket/userId"
+        # 不要把两个调用的失败揉成一句，下游 incident log 看不到根因。
+        return "", (
+            f"Failed to get WS ticket/userId — "
+            f"ticket_call: http={code}, body={data!r}; "
+            f"userid_call: http={code2}, body={data2!r}"
+        )
 
     ws_url = "wss://aistudio.xiaomimimo.com/ws/proxy?ticket={0}&userId={1}".format(ticket, user_id)
 
