@@ -50,9 +50,9 @@ def _env_float(name: str, default: float) -> float:
 
 
 _PROBE_INTERVAL_S = 30.0
-_PROBE_TIMEOUT_S = 5.0
-_PROBE_FAILURE_THRESHOLD = 3
-_PROBE_COOLDOWN_S = 30.0
+_PROBE_TIMEOUT_S = 10.0
+_PROBE_FAILURE_THRESHOLD = 4
+_PROBE_COOLDOWN_S = 20.0
 _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
@@ -60,13 +60,13 @@ _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 # Account-rotation defaults. Cloud deployments are expected to live for about
 # one hour; rotate at 50 minutes to leave room for deploy + readiness checks.
 _ROTATION_INTERVAL_S = 50 * 60.0
-_READINESS_INTERVAL_S = 10.0
+_READINESS_INTERVAL_S = 5.0
 _READINESS_REQUIRED_SUCCESSES = 1
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
-_DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
+_DETECTION_ZONE_FAILURES = 3           # consecutive failures to enter detection
 _DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
-_ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
+_ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 15.0)
 
 _READINESS_MAX_STREAM_CHUNKS = 32
 _READINESS_MAX_STREAM_SECONDS = 20.0
@@ -544,7 +544,7 @@ async def _probe_loop() -> None:
                     timeout=_PROBE_TIMEOUT_S,
                 )
                 latency = (time.monotonic() - started) * 1000
-                if 200 <= resp.status_code < 400:
+                if 200 <= resp.status_code < 500:
                     backend.record_success()
                     backend.record_latency(latency)
                     # Exit detection zone on success
@@ -563,31 +563,31 @@ async def _probe_loop() -> None:
                             backend.backend_id,
                         )
                 else:
-                    backend.record_failure(
+                    backend.record_probe_failure(
                         f"http {resp.status_code}",
                         cooldown_s=_PROBE_COOLDOWN_S,
                         threshold=_PROBE_FAILURE_THRESHOLD,
                     )
-                    # Enter detection zone after N consecutive failures
-                    if (backend.consecutive_failures >= _DETECTION_ZONE_FAILURES
+                    # Enter detection zone after N consecutive probe failures
+                    if (backend.probe_consecutive_failures >= _DETECTION_ZONE_FAILURES
                             and not backend.in_detection):
                         backend.mark_detection()
                         logger.warning(
-                            "Backend %s entered detection zone (%d consecutive failures)",
-                            backend.backend_id, backend.consecutive_failures,
+                            "Backend %s entered detection zone (%d consecutive probe failures)",
+                            backend.backend_id, backend.probe_consecutive_failures,
                         )
             except Exception as e:
-                backend.record_failure(
+                backend.record_probe_failure(
                     f"{type(e).__name__}: {e}",
                     cooldown_s=_PROBE_COOLDOWN_S,
                     threshold=_PROBE_FAILURE_THRESHOLD,
                 )
-                if (backend.consecutive_failures >= _DETECTION_ZONE_FAILURES
+                if (backend.probe_consecutive_failures >= _DETECTION_ZONE_FAILURES
                         and not backend.in_detection):
                     backend.mark_detection()
                     logger.warning(
-                        "Backend %s entered detection zone (%d consecutive failures)",
-                        backend.backend_id, backend.consecutive_failures,
+                        "Backend %s entered detection zone (%d consecutive probe failures)",
+                        backend.backend_id, backend.probe_consecutive_failures,
                     )
 
     while True:

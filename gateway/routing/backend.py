@@ -58,6 +58,9 @@ class Backend:
     in_detection: bool = False
     detection_entered_at: float = 0.0
 
+    # Probe-path failure tracking (separate from request-path failures)
+    probe_consecutive_failures: int = 0
+
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
     weight: int = 1                          # static weight for selection
@@ -150,6 +153,7 @@ class Backend:
         self.in_detection = False
         self.detection_entered_at = 0.0
         self.consecutive_failures = 0
+        self.probe_consecutive_failures = 0
 
     # ───── health helpers ─────
 
@@ -159,6 +163,7 @@ class Backend:
         self.last_probe_at = n
         self.last_success_at = n
         self.consecutive_failures = 0
+        self.probe_consecutive_failures = 0
         self.last_error = ""
         self.reset_breaker()
 
@@ -182,10 +187,24 @@ class Backend:
         else:
             self.health = "degraded"
 
+    def record_probe_failure(
+        self,
+        error: str,
+        *,
+        now: float | None = None,
+        cooldown_s: float = 30.0,
+        threshold: int = 3,
+    ) -> None:
+        """Record a failure from the liveness probe path only."""
+        self.probe_consecutive_failures += 1
+        self.record_failure(error, now=now, cooldown_s=cooldown_s, threshold=threshold)
+
     def is_selectable(self, now: float | None = None) -> bool:
         if not self.enabled:
             return False
-        if self.lifecycle != "active":
+        if self.lifecycle not in ("active", "warming"):
+            return False
+        if self.lifecycle == "warming" and self.readiness_successes < 1:
             return False
         if self.in_detection:
             return False
@@ -215,11 +234,19 @@ class Backend:
             self.ewma_latency_ms = a * latency_ms + (1 - a) * self.ewma_latency_ms
         self.total_requests += 1
 
+    def _failure_rate(self) -> float:
+        """Recent failure rate as a 0.0-1.0 fraction. 0.0 if insufficient data."""
+        total = self.total_requests + self.total_failures
+        if total < 5:
+            return 0.0
+        return self.total_failures / total
+
     def routing_score(self) -> float:
-        """Lower is better. Combines latency, current load, and weight.
+        """Lower is better. Combines latency, current load, weight, and reliability.
 
         Unobserved latency is deliberately conservative so a newly promoted
         backend does not steal all traffic before readiness probes seed EWMA.
         """
-        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 250.0
-        return base * (1 + self.in_flight) / max(self.weight, 1)
+        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 100.0
+        penalty = 1.0 + self._failure_rate() * 4.0
+        return base * (1 + self.in_flight) / max(self.weight, 1) * penalty
