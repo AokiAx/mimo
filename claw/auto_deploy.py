@@ -176,12 +176,18 @@ def _save_incident_log(
     try:
         _ensure_dirs()
         safe_name = account_filename.replace("/", "_").replace("\\", "_")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = INCIDENT_DIR / f"{safe_name}__{ts}__{state}.log"
+        # Microsecond precision so rapid retry failures (Step 1's 429 loop
+        # can fail-fast within a single second) don't overwrite each other.
+        # Add a short uuid suffix as a final tie-breaker against any clock
+        # quirks (system clock rollback, low-res timer on some platforms).
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond:06d}"
+        suffix = uuid.uuid4().hex[:6]
+        path = INCIDENT_DIR / f"{safe_name}__{ts}_{suffix}__{state}.log"
         header = [
             f"# Deploy incident",
             f"# account: {account_filename}",
-            f"# time:    {datetime.now().isoformat(timespec='seconds')}",
+            f"# time:    {now.isoformat(timespec='microseconds')}",
             f"# state:   {state}",
             f"# reason:  {reason}",
         ]

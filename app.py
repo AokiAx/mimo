@@ -629,11 +629,21 @@ async def claw_ws_chat(
         user_id = data2.get("data", {}).get("userId")
 
     if not ticket or not user_id:
-        # 不要把两个调用的失败揉成一句，下游 incident log 看不到根因。
+        # 不要把两个调用的失败揉成一句，下游 incident log 看不到根因；但 ticket
+        # 字段本身是短期 auth token，不能原样写进可持久化的诊断里。
+        def _redact(d):
+            if not isinstance(d, dict):
+                return d
+            data_blob = d.get("data")
+            if isinstance(data_blob, dict) and "ticket" in data_blob:
+                redacted = dict(data_blob)
+                redacted["ticket"] = "<redacted>"
+                return {**d, "data": redacted}
+            return d
         return "", (
             f"Failed to get WS ticket/userId — "
-            f"ticket_call: http={code}, body={data!r}; "
-            f"userid_call: http={code2}, body={data2!r}"
+            f"ticket_call: http={code}, body={_redact(data)!r}; "
+            f"userid_call: http={code2}, body={_redact(data2)!r}"
         )
 
     ws_url = "wss://aistudio.xiaomimimo.com/ws/proxy?ticket={0}&userId={1}".format(ticket, user_id)
