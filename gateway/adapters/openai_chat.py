@@ -301,6 +301,15 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 cached_reasoning = lookup_reasoning(t.tool_id for t in tool_uses)
                 if cached_reasoning:
                     out["reasoning_content"] = cached_reasoning
+            elif text_parts:
+                # Text-only thinking response: no tool ids to key on, fall
+                # back to the text-hash cache. Same rationale as above —
+                # MiMo's mimo-v2.5-pro can produce a reasoned text answer
+                # without calling a tool, and the next turn still has to
+                # carry reasoning_content back.
+                cached_reasoning = lookup_reasoning((), text="".join(text_parts))
+                if cached_reasoning:
+                    out["reasoning_content"] = cached_reasoning
             if tool_uses:
                 out["tool_calls"] = [
                     {
@@ -371,10 +380,14 @@ class OpenAIChatAdapter(ProtocolAdapter):
         if isinstance(reasoning, str) and reasoning:
             events.append(ReasoningDelta(text=reasoning))
 
-        tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
-        remember_reasoning(reasoning, tool_call_ids)
-
         text = msg.get("content")
+        text_str = text if isinstance(text, str) else None
+        tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
+        # Pass text= so text-only thinking responses (no tool_calls)
+        # can still be rehydrated on the next turn via the text-hash
+        # fallback key.
+        remember_reasoning(reasoning, tool_call_ids, text=text_str)
+
         if isinstance(text, str) and text:
             events.append(ContentBlockStart(index=next_idx, block_type="text"))
             events.append(TextDelta(index=next_idx, text=text))
@@ -418,6 +431,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         tool_idx_map: dict[int, int] = {}        # OpenAI idx → IES idx
         tool_id_by_idx: dict[int, str] = {}      # IES idx → tool_id
         reasoning_parts: list[str] = []
+        text_parts: list[str] = []
         next_block = 0
         finish_reason: str | None = None
         usage = Usage()
@@ -463,6 +477,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     text_idx = next_block
                     next_block += 1
                     yield ContentBlockStart(index=text_idx, block_type="text")
+                text_parts.append(content)
                 yield TextDelta(index=text_idx, text=content)
 
             for tc in delta.get("tool_calls") or []:
@@ -516,7 +531,11 @@ class OpenAIChatAdapter(ProtocolAdapter):
         for ies_idx in sorted(tool_idx_map.values()):
             yield ContentBlockEnd(index=ies_idx)
 
-        remember_reasoning("".join(reasoning_parts), tool_id_by_idx.values())
+        remember_reasoning(
+            "".join(reasoning_parts),
+            tool_id_by_idx.values(),
+            text="".join(text_parts) if text_parts else None,
+        )
 
         yield MessageEnd(finish_reason=_map_finish(finish_reason), usage=usage)
 

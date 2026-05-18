@@ -27,6 +27,7 @@ so test isolation works.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -255,6 +256,22 @@ def _key(tool_call_ids: Iterable[str | None]) -> tuple[str, ...]:
     return tuple(sorted(t for t in tool_call_ids if isinstance(t, str) and t))
 
 
+def _text_key(text: str | None) -> tuple[str, ...]:
+    """Build a fallback cache key from the assistant response text.
+
+    Tool-id-keyed entries don't cover text-only thinking-mode responses
+    (MiMo's ``mimo-v2.5-pro`` can produce a reasoned answer without ever
+    calling a tool). In that case we hash the assistant text and use a
+    sentinel-prefixed tuple as the key, so the same storage layer
+    (memory LRU + SQLite) can hold both kinds of entries without
+    colliding with any plausible tool id.
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    return ("__text__", h)
+
+
 def _key_str(key: tuple[str, ...]) -> str:
     return "|".join(key)
 
@@ -265,17 +282,23 @@ def _key_str(key: tuple[str, ...]) -> str:
 def remember_reasoning(
     reasoning_content: str | None,
     tool_call_ids: Iterable[str | None],
+    *,
+    text: str | None = None,
 ) -> None:
     """Remember reasoning keyed by the message's sorted tool-call ids.
 
-    Empty/missing reasoning or missing tool ids are no-ops because they
-    can't help any future lookup.
+    Empty/missing reasoning is a no-op. When tool-call ids are absent
+    but ``text`` is supplied, fall back to a hash of the assistant
+    text so text-only thinking-mode responses can still be rehydrated
+    on the next turn.
     """
     if not isinstance(reasoning_content, str) or not reasoning_content:
         with _lock:
             _stats["store_skips"] += 1
         return
     key = _key(tool_call_ids)
+    if not key:
+        key = _text_key(text)
     if not key:
         with _lock:
             _stats["store_skips"] += 1
@@ -316,9 +339,19 @@ def remember_reasoning(
             _stats["write_drops"] += 1
 
 
-def lookup_reasoning(tool_call_ids: Iterable[str | None]) -> str | None:
-    """Return cached reasoning if any (memory first, SQLite second)."""
+def lookup_reasoning(
+    tool_call_ids: Iterable[str | None],
+    *,
+    text: str | None = None,
+) -> str | None:
+    """Return cached reasoning if any (memory first, SQLite second).
+
+    Falls back to a hash of ``text`` when no tool-call ids are
+    available — symmetric with :func:`remember_reasoning`.
+    """
     key = _key(tool_call_ids)
+    if not key:
+        key = _text_key(text)
     if not key:
         with _lock:
             _stats["misses"] += 1

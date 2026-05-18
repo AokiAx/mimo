@@ -229,6 +229,42 @@ def test_remember_with_empty_reasoning_is_skip():
     assert _sqlite_count() == 0
 
 
+def test_text_fallback_keys_text_only_thinking_responses():
+    """Text-only thinking responses have no tool ids. The ``text=`` kwarg
+    lets us key on a hash of the assistant text so the same conversation
+    can rehydrate reasoning_content on the next turn."""
+    remember_reasoning(
+        "deep thought here",
+        [],                                  # no tool calls
+        text="The answer is 42.",
+    )
+    # Same text → cache hit.
+    assert lookup_reasoning([], text="The answer is 42.") == "deep thought here"
+
+
+def test_text_fallback_misses_on_text_change():
+    remember_reasoning("orig", [], text="hello world")
+    assert lookup_reasoning([], text="hello earth") is None
+
+
+def test_text_fallback_does_not_collide_with_tool_id_keys():
+    """Sentinel-prefixed text keys must not collide with single-tool-id keys."""
+    remember_reasoning("via tool id", ["toolu_x"])
+    remember_reasoning("via text hash", [], text="some response")
+    assert lookup_reasoning(["toolu_x"]) == "via tool id"
+    assert lookup_reasoning([], text="some response") == "via text hash"
+
+
+def test_remember_prefers_tool_id_key_when_both_provided():
+    """When both tool ids and text are supplied, tool-id keying wins —
+    that's the primary, hash is the fallback."""
+    remember_reasoning("real reasoning", ["toolu_y"], text="ignored text")
+    # Lookup by tool id hits.
+    assert lookup_reasoning(["toolu_y"]) == "real reasoning"
+    # Lookup by text alone misses — we didn't write under the text key.
+    assert lookup_reasoning([], text="ignored text") is None
+
+
 # ───────── writer thread behavior ─────────
 
 

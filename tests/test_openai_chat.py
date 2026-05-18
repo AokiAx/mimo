@@ -917,6 +917,77 @@ def test_missing_uncached_assistant_tool_call_does_not_inject_empty_reasoning_co
     assert "reasoning_content" not in msg
 
 
+def test_text_only_thinking_response_rehydrates_via_text_hash_cache():
+    """MiMo's mimo-v2.5-pro can produce a reasoned text reply with no
+    tool_use. The next turn must still carry reasoning_content back, but
+    the tool-id-keyed cache can't help (no tool ids). The text-hash
+    fallback covers this case so the second-turn request doesn't 400."""
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+    # First turn: upstream returns text + reasoning_content, no tool_calls.
+    _adapter().parse_upstream_response(json.dumps({
+        "id": "chatcmpl-text",
+        "model": "mimo-v2.5-pro",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The answer is 42.",
+                "reasoning_content": "step 1: ... step 2: ...",
+            },
+            "finish_reason": "stop",
+        }],
+    }).encode())
+
+    # Second turn: client re-sends the assistant text but drops the
+    # non-standard reasoning_content field. Gateway must rehydrate from
+    # the text-hash cache.
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-pro",
+        "messages": [
+            {"role": "user", "content": "what is the answer?"},
+            {"role": "assistant", "content": "The answer is 42."},
+            {"role": "user", "content": "are you sure?"},
+        ],
+    })
+    msg = _adapter().serialize_to_upstream(req)["messages"][1]
+    assert msg["reasoning_content"] == "step 1: ... step 2: ..."
+
+
+def test_text_only_thinking_response_rehydrates_from_stream():
+    """Same as above but the first turn arrives as an OpenAI SSE stream
+    instead of a non-stream JSON body."""
+    import asyncio
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+
+    def feed():
+        yield from [
+            b'data: {"id":"r","model":"mimo-v2.5-pro","choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":null}]}\n\n',
+            b'data: {"id":"r","model":"mimo-v2.5-pro","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
+            b'data: {"id":"r","model":"mimo-v2.5-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+
+    async def _drive() -> None:
+        async def src():
+            for chunk in feed():
+                yield chunk
+        async for _ in _adapter().parse_upstream_stream(src()):
+            pass
+
+    asyncio.run(_drive())
+
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-pro",
+        "messages": [{"role": "assistant", "content": "hello"}],
+    })
+    msg = _adapter().serialize_to_upstream(req)["messages"][0]
+    assert msg["reasoning_content"] == "think"
+
+
 def test_serialize_to_upstream_forwards_thinking_switch_from_metadata():
     # OpenAI SDK clients pass `extra_body={"thinking": {...}}`, which lands in
     # InternalRequest.metadata. The adapter must hoist it onto the upstream
