@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator
 import pytest
 
 from gateway.anthropic_passthrough import (
+    _conversation_key_from_body,
+    _conversation_key_from_messages_up_to,
     patch_request_thinking,
     scan_response_json,
     tee_stream_capture_thinking,
@@ -22,8 +24,25 @@ from gateway.anthropic_passthrough import (
 from gateway.reasoning_cache import (
     clear_reasoning_cache,
     get_cache_stats,
-    remember_reasoning,
+    remember_reasoning as _remember_raw,
 )
+
+
+# Test helper: seed the cache under the same conversation key that
+# ``patch_request_thinking`` will use when it walks the body to position
+# ``assistant_idx``. Without this the test would store under one scope
+# and look up under another — same as a real-world cross-conversation
+# miss, which is correct security behavior but useless for testing
+# rehydration.
+def _seed_for_turn(body: dict, assistant_idx: int, reasoning: str, tool_ids: list[str]) -> None:
+    conv_key = _conversation_key_from_messages_up_to(body, assistant_idx)
+    _remember_raw(reasoning, tool_ids, conversation_key=conv_key)
+
+
+def remember_reasoning(reasoning, tool_ids, *, conversation_key="conv-default"):
+    """Compat shim for tests that pre-date conversation scoping. Tests that
+    care about the scope itself call _remember_raw or _seed_for_turn directly."""
+    _remember_raw(reasoning, tool_ids, conversation_key=conversation_key)
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +72,6 @@ async def _drain(it: AsyncIterator[bytes]) -> bytes:
 
 
 def test_patch_rehydrates_when_cache_has_matching_ids():
-    remember_reasoning("I planned the search.", ["toolu_a", "toolu_b"])
     body = {
         "model": "mimo-v2.5-pro",
         "messages": [
@@ -72,6 +90,9 @@ def test_patch_rehydrates_when_cache_has_matching_ids():
             ]},
         ],
     }
+    # Seed under the same conversation scope the patch walk will derive
+    # for the assistant turn at index 1 (i.e., from messages[:1]).
+    _seed_for_turn(body, 1, "I planned the search.", ["toolu_a", "toolu_b"])
     n = patch_request_thinking(body)
     assert n == 1
     asst_content = body["messages"][1]["content"]
@@ -130,8 +151,6 @@ def test_patch_skips_on_cache_miss():
 
 
 def test_patch_handles_multiple_assistant_messages_independently():
-    remember_reasoning("first reasoning", ["toolu_1"])
-    remember_reasoning("second reasoning", ["toolu_2"])
     body = {
         "model": "m",
         "messages": [
@@ -147,6 +166,9 @@ def test_patch_handles_multiple_assistant_messages_independently():
             ]},
         ],
     }
+    # Each assistant turn has its own conversation prefix → its own scope.
+    _seed_for_turn(body, 1, "first reasoning", ["toolu_1"])
+    _seed_for_turn(body, 3, "second reasoning", ["toolu_2"])
     n = patch_request_thinking(body)
     assert n == 2
     assert body["messages"][1]["content"][0]["thinking"] == "first reasoning"
@@ -219,18 +241,33 @@ def test_scan_response_populates_cache_for_future_turn():
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 20},
     }).encode()
-    scan_response_json(raw)
+    # Same request body the handler would have sent up — the conversation
+    # key derived from it must match the key the next-turn patch derives.
+    request_body = {
+        "model": "mimo-v2.5-pro",
+        "messages": [{"role": "user", "content": "what's the weather + 2+2?"}],
+    }
+    scan_response_json(raw, conversation_key=_conversation_key_from_body(request_body))
 
-    # Now simulate next turn with thinking dropped
-    body = {"model": "m", "messages": [{
-        "role": "assistant",
-        "content": [
-            {"type": "tool_use", "id": "toolu_x", "name": "search", "input": {"q": "weather"}},
-            {"type": "tool_use", "id": "toolu_y", "name": "calc", "input": {}},
+    # Next turn: same conversation history + the assistant tool calls + a
+    # tool result. patch_request_thinking walks the new body and looks up
+    # under the scope of messages[:1] — which equals the scope we wrote
+    # under above. So it hits.
+    body = {
+        "model": "mimo-v2.5-pro",
+        "messages": [
+            {"role": "user", "content": "what's the weather + 2+2?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_x", "name": "search", "input": {"q": "weather"}},
+                    {"type": "tool_use", "id": "toolu_y", "name": "calc", "input": {}},
+                ],
+            },
         ],
-    }]}
+    }
     assert patch_request_thinking(body) == 1
-    assert body["messages"][0]["content"][0]["thinking"] == "I'll search both."
+    assert body["messages"][1]["content"][0]["thinking"] == "I'll search both."
 
 
 def test_scan_response_ignores_response_without_tool_use():
@@ -240,7 +277,7 @@ def test_scan_response_ignores_response_without_tool_use():
             {"type": "text", "text": "Answer is 42."},
         ],
     }).encode()
-    scan_response_json(raw)
+    scan_response_json(raw, conversation_key="any")
     # Cache should have nothing (thinking without tool_use isn't keyable).
     stats = get_cache_stats()
     assert stats["size"] == 0
@@ -253,14 +290,54 @@ def test_scan_response_ignores_response_without_thinking():
             {"type": "tool_use", "id": "toolu_z", "name": "f", "input": {}},
         ],
     }).encode()
-    scan_response_json(raw)
+    scan_response_json(raw, conversation_key="any")
     assert get_cache_stats()["size"] == 0
 
 
 def test_scan_response_handles_malformed_json_gracefully():
-    scan_response_json(b"not json {{{{")
+    scan_response_json(b"not json {{{{", conversation_key="any")
     # No crash, no cache entry.
     assert get_cache_stats()["size"] == 0
+
+
+# ───────── Conversation-isolation safety ─────────
+
+
+def test_patch_does_not_rehydrate_across_conversations():
+    """Confused-deputy: an attacker who guesses or replays another
+    conversation's tool_use_id MUST NOT be able to harvest the victim's
+    thinking text. Verified by writing the cache under conversation A's
+    scope and trying to read from conversation B's body (different
+    message prefix → different scope → cache miss)."""
+    # Conversation A: short history → its prefix-up-to-assistant-turn
+    # hashes to one value. Seed under that scope.
+    body_a = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "ask in A"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_shared", "name": "f", "input": {}},
+            ]},
+        ],
+    }
+    _seed_for_turn(body_a, 1, "SECRET A thinking", ["toolu_shared"])
+
+    # Conversation B: different user message, same tool id. patch must miss.
+    body_b = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "ask in B (different)"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_shared", "name": "f", "input": {}},
+            ]},
+        ],
+    }
+    n = patch_request_thinking(body_b)
+    assert n == 0, "Cross-conversation leak: B saw A's thinking"
+    # Verify the assistant content in B is untouched (no injected thinking)
+    assert body_b["messages"][1]["content"] == [
+        {"type": "tool_use", "id": "toolu_shared", "name": "f", "input": {}},
+    ]
 
 
 # ───────── tee_stream_capture_thinking ─────────
@@ -299,21 +376,28 @@ def test_tee_stream_passes_bytes_through_and_caches_thinking():
         _sse("message_stop", {"type": "message_stop"}),
     ]
 
+    # The handler computes the conversation key from the request body it
+    # sent up. We mirror that here so the next-turn patch lookup (which
+    # hashes messages[:1] of the new body) lands on the same key.
+    request_body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    conv_key = _conversation_key_from_body(request_body)
+
     async def run():
-        wrapped = tee_stream_capture_thinking(_gen(frames))
+        wrapped = tee_stream_capture_thinking(_gen(frames), conversation_key=conv_key)
         return await _drain(wrapped)
 
     out = _run(run())
     # Every input byte must come back out unchanged (byte passthrough).
     assert out == b"".join(frames)
 
-    # Cache populated by the message's tool_use id.
-    body = {"model": "m", "messages": [{
-        "role": "assistant",
-        "content": [{"type": "tool_use", "id": "toolu_stream", "name": "f", "input": {}}],
-    }]}
+    # Cache populated under the same conversation as request_body.
+    body = {"model": "m", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant",
+         "content": [{"type": "tool_use", "id": "toolu_stream", "name": "f", "input": {}}]},
+    ]}
     assert patch_request_thinking(body) == 1
-    assert body["messages"][0]["content"][0]["thinking"] == "Step one. Step two."
+    assert body["messages"][1]["content"][0]["thinking"] == "Step one. Step two."
 
 
 def test_tee_stream_with_arbitrary_chunk_boundaries():
@@ -336,18 +420,22 @@ def test_tee_stream_with_arbitrary_chunk_boundaries():
     # 13-byte chunks: chosen to land inside JSON bodies.
     chunks = [frames[i:i + 13] for i in range(0, len(frames), 13)]
 
+    request_body = {"model": "m", "messages": [{"role": "user", "content": "go"}]}
+    conv_key = _conversation_key_from_body(request_body)
+
     async def run():
-        return await _drain(tee_stream_capture_thinking(_gen(chunks)))
+        return await _drain(tee_stream_capture_thinking(_gen(chunks), conversation_key=conv_key))
 
     out = _run(run())
     assert out == frames
 
-    body = {"model": "m", "messages": [{
-        "role": "assistant",
-        "content": [{"type": "tool_use", "id": "toolu_split", "name": "f", "input": {}}],
-    }]}
+    body = {"model": "m", "messages": [
+        {"role": "user", "content": "go"},
+        {"role": "assistant",
+         "content": [{"type": "tool_use", "id": "toolu_split", "name": "f", "input": {}}]},
+    ]}
     assert patch_request_thinking(body) == 1
-    assert body["messages"][0]["content"][0]["thinking"] == "splittable text"
+    assert body["messages"][1]["content"][0]["thinking"] == "splittable text"
 
 
 def test_tee_stream_without_tool_use_does_not_cache():
@@ -365,7 +453,7 @@ def test_tee_stream_without_tool_use_does_not_cache():
     ]
 
     async def run():
-        await _drain(tee_stream_capture_thinking(_gen(frames)))
+        await _drain(tee_stream_capture_thinking(_gen(frames), conversation_key="any"))
 
     _run(run())
     assert get_cache_stats()["size"] == 0
@@ -380,7 +468,7 @@ def test_cache_stats_track_hits_and_misses():
     assert s1["stores"] == 1
     assert s1["size"] == 1
 
-    # Hit
+    # Hit (same default scope as the write)
     assert "text" == _lookup(["toolu_a"])
     # Miss
     assert _lookup(["toolu_unknown"]) is None
@@ -409,7 +497,7 @@ def test_cache_stats_track_evictions_on_overflow(monkeypatch):
 
 def _lookup(ids):
     from gateway.reasoning_cache import lookup_reasoning
-    return lookup_reasoning(ids)
+    return lookup_reasoning(ids, conversation_key="conv-default")
 
 
 # ───────── tee_stream usage capture ─────────
@@ -448,7 +536,9 @@ def test_tee_stream_captures_input_and_output_tokens():
     usage: dict[str, int] = {}
 
     async def run():
-        await _drain(tee_stream_capture_thinking(_gen(frames), usage))
+        await _drain(tee_stream_capture_thinking(
+            _gen(frames), usage, conversation_key="any",
+        ))
 
     _run(run())
     assert usage.get("input_tokens") == 42
@@ -460,6 +550,6 @@ def test_tee_stream_usage_sink_optional():
     frames = [_sse("message_stop", {"type": "message_stop"})]
 
     async def run():
-        await _drain(tee_stream_capture_thinking(_gen(frames)))
+        await _drain(tee_stream_capture_thinking(_gen(frames), conversation_key="any"))
 
     _run(run())  # Must not raise.

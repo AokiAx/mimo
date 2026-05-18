@@ -16,7 +16,11 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from gateway.reasoning_cache import lookup_reasoning, remember_reasoning
+from gateway.reasoning_cache import (
+    derive_conversation_key,
+    lookup_reasoning,
+    remember_reasoning,
+)
 from gateway.core import (
     AdapterError,
     BadRequestError,
@@ -64,6 +68,48 @@ def _map_finish(openai_reason: str | None) -> FinishReason:
     if openai_reason is None:
         return "stop"
     return _OPENAI_TO_IES_FINISH.get(openai_reason, "stop")
+
+
+# ────────────── conversation hashing ──────────────
+
+def _canonical_message_bytes(m: InternalMessage) -> bytes:
+    """Stable bytes representation of one ``InternalMessage`` for hashing.
+
+    Deliberately omits ``reasoning_content`` and any ``thinking`` blocks —
+    clients drop those between turns, so the hash must agree whether or
+    not they're present (the gateway will inject them back in via cache
+    rehydration after the hash has already been computed). Tool inputs
+    are sorted to match the OpenAI Chat tool_call ordering. Image data
+    is hashed by its base64 string (matches what gets sent upstream).
+    """
+    blocks: list[dict[str, Any]] = []
+    for c in m.content:
+        if c.type == "text":
+            blocks.append({"t": "text", "x": c.text or ""})
+        elif c.type == "tool_use":
+            blocks.append({
+                "t": "tool_use", "id": c.tool_id or "",
+                "name": c.tool_name or "",
+                "args": c.tool_input or {},
+            })
+        elif c.type == "tool_result":
+            blocks.append({
+                "t": "tool_result", "id": c.tool_id or "",
+                "out": c.tool_output or "",
+            })
+        elif c.type == "image":
+            blocks.append({"t": "image", "mime": c.image_mime or "", "d": c.image_data or ""})
+        # NOTE: "thinking" blocks deliberately omitted — see docstring.
+    payload = {"role": m.role, "content": blocks}
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _conversation_key_for_request(messages: list[InternalMessage]) -> str:
+    """Conversation key for ``messages``. Used at response-capture time —
+    the messages we sent up are the conversation that produced the
+    response we're now caching."""
+    blob = b"[" + b",".join(_canonical_message_bytes(m) for m in messages) + b"]"
+    return derive_conversation_key(blob)
 
 
 # ────────────── SSE utility ──────────────
@@ -235,9 +281,33 @@ class OpenAIChatAdapter(ProtocolAdapter):
     # ============ Upstream serialization (IES → OpenAI Chat dict) ============
 
     def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]:
+        # Per-message prefix hash: for each assistant message at index k,
+        # rehydration must look up the cache under
+        # ``derive_conversation_key(canonical(messages[:k]))``. We compute
+        # incrementally so we don't re-canonicalize the prefix every time.
+        prefix_blob = b"["
+        first = True
+        serialized: list[dict[str, Any]] = []
+        for m in req.messages:
+            if m.role == "assistant":
+                # The hash for this assistant turn is the conversation as
+                # it was *before* the model produced this turn — i.e., all
+                # messages that came before. That matches what the response
+                # capture path stored on the previous turn.
+                conv_key = derive_conversation_key(prefix_blob + b"]")
+                serialized.append(self._serialize_message(m, conversation_key=conv_key))
+            else:
+                serialized.append(self._serialize_message(m, conversation_key=None))
+            piece = _canonical_message_bytes(m)
+            if first:
+                prefix_blob += piece
+                first = False
+            else:
+                prefix_blob += b"," + piece
+
         body: dict[str, Any] = {
             "model": req.model,
-            "messages": [self._serialize_message(m) for m in req.messages],
+            "messages": serialized,
             "max_tokens": req.max_tokens,
             "stream": req.stream,
         }
@@ -273,7 +343,18 @@ class OpenAIChatAdapter(ProtocolAdapter):
         return body
 
     @staticmethod
-    def _serialize_message(m: InternalMessage) -> dict[str, Any]:
+    def _serialize_message(
+        m: InternalMessage,
+        *,
+        conversation_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Serialize one IES message into MiMo's upstream chat shape.
+
+        ``conversation_key`` must be supplied for assistant messages so the
+        reasoning-cache lookup is scoped to *this* conversation only. For
+        non-assistant messages (user/system/tool) the cache is never read,
+        so the argument is ignored.
+        """
         if m.role == "tool":
             tr = next((c for c in m.content if c.type == "tool_result"), None)
             return {
@@ -291,14 +372,17 @@ class OpenAIChatAdapter(ProtocolAdapter):
             }
             if m.reasoning_content is not None:
                 out["reasoning_content"] = m.reasoning_content
-            elif tool_uses:
+            elif tool_uses and conversation_key is not None:
                 # MiMo requires reasoning_content to be present in later
-                # thinking-mode tool-call turns. Rehydrate from the gateway
-                # cache when clients dropped this non-standard field. Do not
-                # inject an empty string: MiMo expects the *complete* reasoning,
-                # and sending an empty value can turn valid non-thinking tool
-                # histories into 400s.
-                cached_reasoning = lookup_reasoning(t.tool_id for t in tool_uses)
+                # thinking-mode tool-call turns. Rehydrate from the cache —
+                # scoped to *this* conversation only so a different
+                # conversation that happens to reuse the same tool id (or a
+                # forged id from a malicious request) can't read this
+                # conversation's reasoning.
+                cached_reasoning = lookup_reasoning(
+                    (t.tool_id for t in tool_uses),
+                    conversation_key=conversation_key,
+                )
                 if cached_reasoning:
                     out["reasoning_content"] = cached_reasoning
             if tool_uses:
@@ -342,11 +426,21 @@ class OpenAIChatAdapter(ProtocolAdapter):
 
     # ============ Upstream parsing — non-stream ============
 
-    def parse_upstream_response(self, body: bytes) -> list[InternalEvent]:
+    def parse_upstream_response(
+        self,
+        body: bytes,
+        *,
+        conversation_key: str,
+    ) -> list[InternalEvent]:
         """Parse a non-stream OpenAI Chat completion JSON into IES events.
 
         Emits the same event sequence a streaming response would, so any
         downstream adapter can use the same serializer for both modes.
+
+        ``conversation_key`` scopes the reasoning-cache write so the
+        captured reasoning_content can only be rehydrated on a subsequent
+        turn of the *same* conversation. Required — passing the wrong
+        value would silently store under the wrong scope.
         """
         try:
             data = json.loads(body)
@@ -372,7 +466,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
             events.append(ReasoningDelta(text=reasoning))
 
         tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
-        remember_reasoning(reasoning, tool_call_ids)
+        remember_reasoning(reasoning, tool_call_ids, conversation_key=conversation_key)
 
         text = msg.get("content")
         if isinstance(text, str) and text:
@@ -405,13 +499,20 @@ class OpenAIChatAdapter(ProtocolAdapter):
     # ============ Upstream parsing — stream ============
 
     async def parse_upstream_stream(
-        self, raw: AsyncIterator[bytes]
+        self,
+        raw: AsyncIterator[bytes],
+        *,
+        conversation_key: str,
     ) -> AsyncIterator[InternalEvent]:
         """Parse OpenAI Chat SSE bytes into IES events.
 
         State machine: lazy text-block opening, OpenAI tool_call.index ↔ IES
         block index mapping, finish_reason captured but emitted at end with
         accumulated usage (which often arrives after finish_reason).
+
+        ``conversation_key`` scopes any reasoning captured from this stream
+        (both the mid-stream "tool call started" snapshot and the end-of-
+        stream final write) to this conversation. Required.
         """
         message_started = False
         text_idx: int | None = None
@@ -491,6 +592,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                         remember_reasoning(
                             "".join(reasoning_parts),
                             tool_id_by_idx.values(),
+                            conversation_key=conversation_key,
                         )
                 ies_idx = tool_idx_map[oai_idx]
                 fn = tc.get("function", {}) or {}
@@ -516,7 +618,11 @@ class OpenAIChatAdapter(ProtocolAdapter):
         for ies_idx in sorted(tool_idx_map.values()):
             yield ContentBlockEnd(index=ies_idx)
 
-        remember_reasoning("".join(reasoning_parts), tool_id_by_idx.values())
+        remember_reasoning(
+            "".join(reasoning_parts),
+            tool_id_by_idx.values(),
+            conversation_key=conversation_key,
+        )
 
         yield MessageEnd(finish_reason=_map_finish(finish_reason), usage=usage)
 

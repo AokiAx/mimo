@@ -19,13 +19,29 @@ import pytest
 from gateway.reasoning_cache import (
     flush,
     get_cache_stats,
-    lookup_reasoning,
-    remember_reasoning,
+    lookup_reasoning as _lookup_raw,
+    remember_reasoning as _remember_raw,
     reset_for_tests,
 )
 
 
 # ───────── helpers ─────────
+
+
+# Default conversation scope for tests that don't care about isolation
+# (they're testing persistence / TTL / etc., not the scoping itself).
+_TEST_CONV = "convtest"
+
+
+def _remember(reasoning, tool_ids, *, conversation_key=_TEST_CONV):
+    """Test shim: defaults conversation_key so the tests that pre-date
+    conversation scoping stay readable. Tests that exercise scope cross-
+    contamination pass an explicit key."""
+    _remember_raw(reasoning, tool_ids, conversation_key=conversation_key)
+
+
+def _lookup(tool_ids, *, conversation_key=_TEST_CONV):
+    return _lookup_raw(tool_ids, conversation_key=conversation_key)
 
 
 def _wait_for_flush(timeout: float = 3.0) -> None:
@@ -49,12 +65,15 @@ def _sqlite_count() -> int:
         conn.close()
 
 
-def _sqlite_fetch(tool_ids: list[str]) -> tuple[str, float] | None:
+def _sqlite_fetch(tool_ids: list[str], *, conversation_key: str = _TEST_CONV) -> tuple[str, float] | None:
     conn = sqlite3.connect(_db_path())
     try:
+        # New key shape (schema v2): "<conv>|<tool>|<tool>...".
+        ids = [t for t in tool_ids if t]
+        key = "|".join([conversation_key, *sorted(ids)])
         row = conn.execute(
             "SELECT reasoning, expires_at FROM reasoning_cache WHERE tool_ids = ?",
-            ("|".join(sorted(tool_ids)),),
+            (key,),
         ).fetchone()
         return row
     finally:
@@ -65,7 +84,7 @@ def _sqlite_fetch(tool_ids: list[str]) -> tuple[str, float] | None:
 
 
 def test_write_lands_in_sqlite_after_flush():
-    remember_reasoning("persisted reasoning", ["toolu_a", "toolu_b"])
+    _remember("persisted reasoning", ["toolu_a", "toolu_b"])
     _wait_for_flush()
     row = _sqlite_fetch(["toolu_a", "toolu_b"])
     assert row is not None
@@ -81,7 +100,7 @@ def test_lookup_after_memory_evict_falls_back_to_sqlite():
     ``reset_for_tests`` (which wipes memory but the SQLite file remains
     because ``conftest`` keeps the env var pointing at the same path).
     """
-    remember_reasoning("disk-only after restart", ["toolu_durable"])
+    _remember("disk-only after restart", ["toolu_durable"])
     _wait_for_flush()
     assert _sqlite_count() == 1
 
@@ -89,7 +108,7 @@ def test_lookup_after_memory_evict_falls_back_to_sqlite():
     reset_for_tests()
 
     # First lookup must miss memory and hit SQLite.
-    result = lookup_reasoning(["toolu_durable"])
+    result = _lookup(["toolu_durable"])
     assert result == "disk-only after restart"
 
     stats = get_cache_stats()
@@ -100,18 +119,18 @@ def test_lookup_after_memory_evict_falls_back_to_sqlite():
 def test_sqlite_hit_rehydrates_memory():
     """After a SQLite-hit lookup the entry should live in memory too, so a
     second lookup is the fast path."""
-    remember_reasoning("hot data", ["toolu_x"])
+    _remember("hot data", ["toolu_x"])
     _wait_for_flush()
     reset_for_tests()
 
     # SQLite hit (cold).
-    assert lookup_reasoning(["toolu_x"]) == "hot data"
+    assert _lookup(["toolu_x"]) == "hot data"
     s = get_cache_stats()
     assert s["sqlite_hits"] == 1
     assert s["size"] == 1   # rehydrated
 
     # Memory hit (hot).
-    assert lookup_reasoning(["toolu_x"]) == "hot data"
+    assert _lookup(["toolu_x"]) == "hot data"
     s = get_cache_stats()
     assert s["memory_hits"] == 1
 
@@ -121,7 +140,7 @@ def test_simulated_gateway_restart_reloads_top_entries(monkeypatch):
     so a fresh process is immediately warm (modulo cap)."""
     # Write a few entries.
     for i in range(5):
-        remember_reasoning(f"r{i}", [f"toolu_{i}"])
+        _remember(f"r{i}", [f"toolu_{i}"])
     _wait_for_flush()
     assert _sqlite_count() == 5
 
@@ -130,7 +149,7 @@ def test_simulated_gateway_restart_reloads_top_entries(monkeypatch):
     # Triggering the next remember_reasoning runs _ensure_initialized,
     # which is where the reload happens. Use lookup so we don't also add a
     # 6th entry.
-    lookup_reasoning(["toolu_0"])
+    _lookup(["toolu_0"])
     stats = get_cache_stats()
     # After init reload, memory should hold all 5 entries.
     assert stats["size"] == 5
@@ -146,7 +165,7 @@ def test_expired_sqlite_entry_treated_as_miss():
     check on the SQLite read path."""
     import gateway.reasoning_cache as rc
 
-    remember_reasoning("about to expire", ["toolu_dead"])
+    _remember("about to expire", ["toolu_dead"])
     _wait_for_flush()
 
     # Drop from memory ONLY (don't reset writer thread / re-init DB —
@@ -157,13 +176,13 @@ def test_expired_sqlite_entry_treated_as_miss():
     # Backdate the SQLite row directly.
     conn = sqlite3.connect(_db_path())
     conn.execute("UPDATE reasoning_cache SET expires_at = ? WHERE tool_ids = ?",
-                 (time.time() - 60, "toolu_dead"))
+                 (time.time() - 60, f"{_TEST_CONV}|toolu_dead"))
     conn.commit()
     conn.close()
 
     # Now lookup: memory miss → SQLite read returns row → row is expired →
     # bumps expired + misses, returns None.
-    assert lookup_reasoning(["toolu_dead"]) is None
+    assert _lookup(["toolu_dead"]) is None
     stats = get_cache_stats()
     assert stats["expired"] >= 1
     assert stats["misses"] >= 1
@@ -172,20 +191,20 @@ def test_expired_sqlite_entry_treated_as_miss():
 def test_init_purges_expired_rows():
     """On startup, the table should have its expired rows wiped — keeps the
     DB file from accumulating dead state over time."""
-    remember_reasoning("live", ["toolu_live"])
-    remember_reasoning("stale", ["toolu_stale"])
+    _remember("live", ["toolu_live"])
+    _remember("stale", ["toolu_stale"])
     _wait_for_flush()
 
     conn = sqlite3.connect(_db_path())
     conn.execute("UPDATE reasoning_cache SET expires_at = ? WHERE tool_ids = ?",
-                 (time.time() - 1, "toolu_stale"))
+                 (time.time() - 1, f"{_TEST_CONV}|toolu_stale"))
     conn.commit()
     conn.close()
 
     # Init runs purge during _ensure_initialized → reset + re-init.
     reset_for_tests()
     # Force re-init via any call.
-    lookup_reasoning(["toolu_live"])
+    _lookup(["toolu_live"])
 
     assert _sqlite_count() == 1
     assert _sqlite_fetch(["toolu_live"]) is not None
@@ -198,11 +217,11 @@ def test_init_purges_expired_rows():
 def test_remember_lookup_round_trip_without_touching_sqlite():
     """The hot path: write then immediately read inside the same process.
     Should be memory hit, no SQLite read involved."""
-    remember_reasoning("fast path", ["toolu_z"])
+    _remember("fast path", ["toolu_z"])
 
     # Look up BEFORE the writer thread necessarily flushed — memory layer
     # is updated synchronously inside remember_reasoning.
-    assert lookup_reasoning(["toolu_z"]) == "fast path"
+    assert _lookup(["toolu_z"]) == "fast path"
     stats = get_cache_stats()
     assert stats["memory_hits"] == 1
     assert stats["sqlite_hits"] == 0
@@ -210,9 +229,9 @@ def test_remember_lookup_round_trip_without_touching_sqlite():
 
 def test_lookup_with_no_tool_ids_is_miss():
     """Empty / all-invalid id iterables short-circuit to miss."""
-    assert lookup_reasoning([]) is None
-    assert lookup_reasoning([None]) is None
-    assert lookup_reasoning(["", "   "]) is None
+    assert _lookup([]) is None
+    assert _lookup([None]) is None
+    assert _lookup(["", "   "]) is None
     stats = get_cache_stats()
     assert stats["misses"] >= 1
 
@@ -220,12 +239,39 @@ def test_lookup_with_no_tool_ids_is_miss():
 def test_remember_with_empty_reasoning_is_skip():
     """We deliberately don't persist empty strings — they would 400 if
     rehydrated. Track as store_skip."""
-    remember_reasoning("", ["toolu_e"])
-    remember_reasoning(None, ["toolu_e"])  # type: ignore[arg-type]
+    _remember("", ["toolu_e"])
+    _remember(None, ["toolu_e"])  # type: ignore[arg-type]
 
     stats = get_cache_stats()
     assert stats["stores"] == 0
     assert stats["store_skips"] >= 2
+
+
+# ───────── conversation-isolation safety ─────────
+
+
+def test_cache_isolates_same_tool_id_across_conversations():
+    """Two different conversation_keys with the same tool_id MUST NOT share
+    a cache entry. This is the security property — without it, an attacker
+    who reuses or forges a tool_id can pull another conversation's
+    reasoning out of the cache."""
+    _remember_raw("secret-A", ["toolu_shared"], conversation_key="conv-A")
+    _remember_raw("secret-B", ["toolu_shared"], conversation_key="conv-B")
+
+    # Each scope sees its own value, never the other's.
+    assert _lookup_raw(["toolu_shared"], conversation_key="conv-A") == "secret-A"
+    assert _lookup_raw(["toolu_shared"], conversation_key="conv-B") == "secret-B"
+    # An attacker-guessed third scope misses entirely.
+    assert _lookup_raw(["toolu_shared"], conversation_key="conv-attacker") is None
+
+
+def test_remember_rejects_missing_conversation_key():
+    """Hard error rather than silently sharing a default scope: passing an
+    empty conversation_key is always a bug. Same for lookup."""
+    with pytest.raises(ValueError):
+        _remember_raw("r", ["tid"], conversation_key="")
+    with pytest.raises(ValueError):
+        _lookup_raw(["tid"], conversation_key="")
     assert _sqlite_count() == 0
 
 
@@ -241,7 +287,7 @@ def test_concurrent_writes_serialize_through_queue():
     def writer(i: int) -> None:
         barrier.wait()
         for j in range(20):
-            remember_reasoning(f"writer{i}-job{j}", [f"toolu_{i}_{j}"])
+            _remember(f"writer{i}-job{j}", [f"toolu_{i}_{j}"])
 
     threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
     for t in threads:
@@ -262,7 +308,7 @@ def test_overflow_falls_back_to_memory_only(monkeypatch):
     import gateway.reasoning_cache as rc
 
     # Force init to set up the queue.
-    remember_reasoning("seed", ["toolu_seed"])
+    _remember("seed", ["toolu_seed"])
 
     # Replace the queue with a "full" one — its put_nowait will always
     # raise queue.Full.
@@ -271,10 +317,10 @@ def test_overflow_falls_back_to_memory_only(monkeypatch):
     full_queue.put_nowait(("filler", "", 0))
     monkeypatch.setattr(rc, "_write_queue", full_queue)
 
-    remember_reasoning("dropped from disk", ["toolu_overflow"])
+    _remember("dropped from disk", ["toolu_overflow"])
 
     # Memory still has it.
-    assert lookup_reasoning(["toolu_overflow"]) == "dropped from disk"
+    assert _lookup(["toolu_overflow"]) == "dropped from disk"
     # write_drops should bump.
     assert get_cache_stats()["write_drops"] >= 1
 
@@ -295,33 +341,33 @@ def test_init_reload_does_not_clobber_fresh_memory_write():
     """
     # Phase 1: write old value, flush to SQLite, simulate process restart
     # by clearing memory + the writer thread (DB file survives).
-    remember_reasoning("OLD reasoning", ["toolu_clobber"])
+    _remember("OLD reasoning", ["toolu_clobber"])
     _wait_for_flush()
     reset_for_tests()
 
     # Phase 2: fresh process writes a new value for the same key.
-    remember_reasoning("NEW reasoning", ["toolu_clobber"])
+    _remember("NEW reasoning", ["toolu_clobber"])
 
     # Phase 3: lookup — must see the new value, not the old one reloaded
     # from disk during init.
-    assert lookup_reasoning(["toolu_clobber"]) == "NEW reasoning"
+    assert _lookup(["toolu_clobber"]) == "NEW reasoning"
 
 
 def test_init_reload_still_brings_in_unrelated_rows():
     """The setdefault fix must not break the legitimate reload case:
     rows whose keys aren't currently in memory should still come back."""
-    remember_reasoning("disk-only row A", ["toolu_disk_a"])
-    remember_reasoning("disk-only row B", ["toolu_disk_b"])
+    _remember("disk-only row A", ["toolu_disk_a"])
+    _remember("disk-only row B", ["toolu_disk_b"])
     _wait_for_flush()
     reset_for_tests()
 
     # Write a third, fresh value — its init reload should NOT touch this,
     # but SHOULD still load A and B.
-    remember_reasoning("fresh row C", ["toolu_fresh_c"])
+    _remember("fresh row C", ["toolu_fresh_c"])
 
-    assert lookup_reasoning(["toolu_disk_a"]) == "disk-only row A"
-    assert lookup_reasoning(["toolu_disk_b"]) == "disk-only row B"
-    assert lookup_reasoning(["toolu_fresh_c"]) == "fresh row C"
+    assert _lookup(["toolu_disk_a"]) == "disk-only row A"
+    assert _lookup(["toolu_disk_b"]) == "disk-only row B"
+    assert _lookup(["toolu_fresh_c"]) == "fresh row C"
 
 
 def test_remember_swallows_sqlite_init_corruption(monkeypatch, tmp_path):
@@ -339,10 +385,10 @@ def test_remember_swallows_sqlite_init_corruption(monkeypatch, tmp_path):
     reset_for_tests()
 
     # Must not raise.
-    remember_reasoning("survives corruption", ["toolu_corrupt"])
+    _remember("survives corruption", ["toolu_corrupt"])
 
     # Memory layer still served the write — lookup hits memory.
-    assert lookup_reasoning(["toolu_corrupt"]) == "survives corruption"
+    assert _lookup(["toolu_corrupt"]) == "survives corruption"
 
     # Stats reflect the failed persistence attempt.
     stats = get_cache_stats()
@@ -358,7 +404,7 @@ def test_lookup_swallows_sqlite_init_corruption(monkeypatch, tmp_path):
     reset_for_tests()
 
     # Must not raise; returns None (miss).
-    assert lookup_reasoning(["toolu_anything"]) is None
+    assert _lookup(["toolu_anything"]) is None
     assert get_cache_stats()["misses"] >= 1
 
 
@@ -371,7 +417,7 @@ def test_clear_wipes_disk_even_on_cold_start():
     immediately because _db_initialized was False).
     """
     # Phase 1: seed DB and persist.
-    remember_reasoning("survive me not", ["toolu_clear_test"])
+    _remember("survive me not", ["toolu_clear_test"])
     _wait_for_flush()
     assert _sqlite_count() == 1
 
@@ -389,7 +435,7 @@ def test_clear_wipes_disk_even_on_cold_start():
     assert _sqlite_count() == 0
 
     # Belt-and-braces: subsequent lookup must also miss (no zombie reload).
-    assert lookup_reasoning(["toolu_clear_test"]) is None
+    assert _lookup(["toolu_clear_test"]) is None
 
 
 def test_clear_on_missing_db_does_not_create_empty_file(tmp_path, monkeypatch):

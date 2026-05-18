@@ -483,7 +483,7 @@ def test_parse_upstream_response_text_only():
         }],
         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     assert isinstance(events[0], MessageStart)
     assert events[0].message_id == "chatcmpl-abc"
     assert any(isinstance(e, TextDelta) and e.text == "hello world" for e in events)
@@ -514,7 +514,7 @@ def test_parse_upstream_response_with_tool_calls():
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     starts = [e for e in events if isinstance(e, ContentBlockStart)]
     assert len(starts) == 2
     assert starts[0].block_type == "tool_use"
@@ -545,7 +545,7 @@ def test_parse_upstream_response_preserves_reasoning_content():
             "finish_reason": "tool_calls",
         }],
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     assert any(isinstance(e, ReasoningDelta) and e.text == "thinking" for e in events)
 
 
@@ -570,7 +570,7 @@ def test_parse_upstream_stream_text_with_split_chunks():
     raw_chunks = [bytes_stream[i:i + 7] for i in range(0, len(bytes_stream), 7)]
 
     async def run() -> list[InternalEvent]:
-        return await _events(_adapter().parse_upstream_stream(_gen(raw_chunks)))
+        return await _events(_adapter().parse_upstream_stream(_gen(raw_chunks), conversation_key="test-conv"))
 
     events = _run(run())
     assert isinstance(events[0], MessageStart)
@@ -617,7 +617,7 @@ def test_parse_upstream_stream_tool_calls_with_index_mapping():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
 
     async def run() -> list[InternalEvent]:
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     events = _run(run())
 
@@ -653,7 +653,7 @@ def test_parse_upstream_stream_function_call_legacy_mapped_to_tool_calls():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
 
     async def run():
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     events = _run(run())
     end = events[-1]
@@ -672,7 +672,7 @@ def test_parse_upstream_stream_preserves_reasoning_content_delta():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
 
     async def run():
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     events = _run(run())
     assert any(isinstance(e, ReasoningDelta) and e.text == "think" for e in events)
@@ -862,9 +862,16 @@ def test_error_envelope_openai_shape():
 
 
 def test_reasoning_cache_rehydrates_missing_assistant_reasoning_content():
+    from gateway.adapters.openai_chat import _conversation_key_for_request
     from gateway.reasoning_cache import clear_reasoning_cache
 
     clear_reasoning_cache()
+    # Capture must happen under the same conversation_key the next-turn
+    # lookup will derive. In serialize_to_upstream, the lookup for the
+    # assistant message at index 0 hashes ``messages[:0]`` = empty list.
+    # So we capture under hash([]) too — by passing an empty messages list.
+    capture_conv = _conversation_key_for_request([])
+
     _adapter().parse_upstream_response(json.dumps({
         "id": "chatcmpl-r",
         "model": "m",
@@ -881,7 +888,7 @@ def test_reasoning_cache_rehydrates_missing_assistant_reasoning_content():
             },
             "finish_reason": "tool_calls",
         }],
-    }).encode())
+    }).encode(), conversation_key=capture_conv)
 
     req = _adapter().parse_request({
         "model": "m",
@@ -915,6 +922,116 @@ def test_missing_uncached_assistant_tool_call_does_not_inject_empty_reasoning_co
     })
     msg = _adapter().serialize_to_upstream(req)["messages"][0]
     assert "reasoning_content" not in msg
+
+
+# ───────── Conversation-isolation safety tests ─────────
+
+
+def test_reasoning_cache_isolates_different_conversations_with_same_tool_id():
+    """Security-critical: if two unrelated conversations happen to use the
+    same upstream tool_call_id (collision or attacker forging the id), the
+    cache must NOT cross-rehydrate reasoning between them. This is the
+    confused-deputy vector Codex flagged on PR #34."""
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+
+    # Conversation A: produces tool_call "call_x" with reasoning "secret_A".
+    _adapter().parse_upstream_response(json.dumps({
+        "id": "chatcmpl-A", "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant", "content": None,
+                "reasoning_content": "secret_A",
+                "tool_calls": [{"id": "call_x", "type": "function",
+                                "function": {"name": "f", "arguments": "{}"}}],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode(), conversation_key="conv-A")
+
+    # Conversation B (different message history) tries to look up call_x.
+    # In serialize_to_upstream the lookup uses B's prefix-hash, which
+    # differs from "conv-A" → must miss.
+    req_b = _adapter().parse_request({
+        "model": "m",
+        "messages": [
+            # Different user message → different prefix hash than conv A.
+            {"role": "user", "content": "totally different question"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_x", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+        ],
+    })
+    msg_b = _adapter().serialize_to_upstream(req_b)["messages"][1]
+    assert "reasoning_content" not in msg_b, (
+        "Cross-conversation leak: B should not see A's reasoning"
+    )
+
+
+def test_reasoning_cache_continues_within_same_conversation():
+    """The flip side of isolation: a real next-turn within the same
+    conversation must still rehydrate. Otherwise the security fix would
+    just break the feature."""
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    from gateway.reasoning_cache import clear_reasoning_cache
+
+    clear_reasoning_cache()
+
+    # First turn's request was [user "ask Q"]. Capture the response under
+    # the conversation key for that exact prefix.
+    first_turn_messages = [
+        InternalMessage(role="user", content=[InternalContent(type="text", text="ask Q")]),
+    ]
+    capture_conv = _conversation_key_for_request(first_turn_messages)
+
+    _adapter().parse_upstream_response(json.dumps({
+        "id": "chatcmpl-first", "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant", "content": None,
+                "reasoning_content": "step by step thinking",
+                "tool_calls": [{"id": "call_real", "type": "function",
+                                "function": {"name": "search", "arguments": "{}"}}],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode(), conversation_key=capture_conv)
+
+    # Second turn: same prefix + assistant tool_use + tool result.
+    req = _adapter().parse_request({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "ask Q"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_real", "type": "function",
+                             "function": {"name": "search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_real", "content": "answer"},
+            {"role": "user", "content": "and?"},
+        ],
+    })
+    # The assistant message is at index 1 → its prefix is messages[:1] =
+    # [user "ask Q"] → same conversation key we wrote under.
+    msg = _adapter().serialize_to_upstream(req)["messages"][1]
+    assert msg["reasoning_content"] == "step by step thinking"
+
+
+def test_remember_reasoning_rejects_empty_conversation_key():
+    """Fail loud, not silent: caller passing an empty string for
+    conversation_key is a bug, not a "use the default scope" instruction."""
+    from gateway.reasoning_cache import (
+        clear_reasoning_cache,
+        lookup_reasoning,
+        remember_reasoning,
+    )
+
+    clear_reasoning_cache()
+    with pytest.raises(ValueError):
+        remember_reasoning("r", ["tid"], conversation_key="")
+    with pytest.raises(ValueError):
+        lookup_reasoning(["tid"], conversation_key="")
 
 
 def test_serialize_to_upstream_forwards_thinking_switch_from_metadata():
@@ -979,12 +1096,14 @@ def test_reasoning_cache_commits_mid_stream_on_first_tool_id():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads)
 
     async def run():
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     _run(run())
 
     # Without the mid-stream commit, this would be None.
-    assert lookup_reasoning(["call_midstream"]) == "Thinking it through. Decision made."
+    assert lookup_reasoning(
+        ["call_midstream"], conversation_key="test-conv",
+    ) == "Thinking it through. Decision made."
 
 
 def test_reasoning_cache_stats_after_stream():
@@ -1009,7 +1128,7 @@ def test_reasoning_cache_stats_after_stream():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
 
     async def run():
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     _run(run())
 
@@ -1049,7 +1168,7 @@ def test_parse_upstream_response_forwards_full_usage_details():
             "web_search_usage": {"tool_usage": 2, "page_usage": 9},
         },
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     end = next(e for e in events if isinstance(e, MessageEnd))
     u = end.usage
     assert u.input_tokens == 1234
@@ -1074,7 +1193,7 @@ def test_parse_upstream_response_handles_missing_usage_details_gracefully():
         }],
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     end = next(e for e in events if isinstance(e, MessageEnd))
     assert end.usage.cached_tokens == 0
     assert end.usage.reasoning_tokens == 0
@@ -1098,7 +1217,7 @@ def test_parse_upstream_response_tolerates_malformed_nested_usage():
             "web_search_usage": ["unexpected", "list"],
         },
     }).encode()
-    events = _adapter().parse_upstream_response(payload)
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
     end = next(e for e in events if isinstance(e, MessageEnd))
     assert end.usage.input_tokens == 5
     assert end.usage.cached_tokens == 0
@@ -1123,7 +1242,7 @@ def test_parse_upstream_stream_forwards_full_usage_details():
     bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
 
     async def run():
-        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream])))
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
 
     events = _run(run())
     end = next(e for e in events if isinstance(e, MessageEnd))

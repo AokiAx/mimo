@@ -158,13 +158,23 @@ class GatewayHandler:
             ctx.model = native
 
         upstream_body = self._codec.serialize_to_upstream(req)
+        # Conversation-scope key derived from this request's full message
+        # history. The codec writes captured reasoning under this key on the
+        # response path; next turn's serialize_to_upstream uses per-message
+        # prefix hashes to look back up. Different conversations get
+        # different keys, so an attacker who guesses a tool_id can't pull
+        # another conversation's reasoning out of the cache.
+        from gateway.adapters.openai_chat import _conversation_key_for_request
+        conversation_key = _conversation_key_for_request(req.messages)
 
         if req.stream:
             return await self._handle_stream_with_retries(
                 ctx, adapter, req.model, upstream_body,
+                conversation_key=conversation_key,
             )
         return await self._handle_non_stream_with_retries(
             ctx, adapter, req.model, upstream_body,
+            conversation_key=conversation_key,
         )
 
     # ============ Anthropic-native byte-passthrough ============
@@ -210,11 +220,25 @@ class GatewayHandler:
             ctx.model = native
 
         # Rehydrate missing thinking blocks before sending to upstream.
+        # patch_request_thinking computes its own per-assistant-message
+        # prefix hashes internally — it walks ``body["messages"]`` and
+        # scopes each lookup to the prefix up to that turn.
         patch_request_thinking(body)
 
+        # Response-side capture uses one key derived from the full body we
+        # sent up. Compute once, pass to scan / tee.
+        from gateway.anthropic_passthrough import _conversation_key_from_body
+        conversation_key = _conversation_key_from_body(body)
+
         if ctx.is_stream:
-            return await self._handle_anthropic_stream_with_retries(ctx, adapter, native, body)
-        return await self._handle_anthropic_non_stream_with_retries(ctx, adapter, native, body)
+            return await self._handle_anthropic_stream_with_retries(
+                ctx, adapter, native, body,
+                conversation_key=conversation_key,
+            )
+        return await self._handle_anthropic_non_stream_with_retries(
+            ctx, adapter, native, body,
+            conversation_key=conversation_key,
+        )
 
     def _headers_for_anthropic(
         self, backend, ctx: RequestContext,
@@ -241,6 +265,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -259,6 +284,7 @@ class GatewayHandler:
                 return await self._handle_anthropic_non_stream(
                     ctx, adapter, backend, upstream_body,
                     self._headers_for_anthropic(backend, ctx),
+                    conversation_key=conversation_key,
                 )
             except GatewayError as e:
                 last_error = e
@@ -272,6 +298,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -312,7 +339,7 @@ class GatewayHandler:
             backend.record_latency(latency_ms)
 
             # Harvest thinking before returning bytes to client.
-            scan_response_json(raw)
+            scan_response_json(raw, conversation_key=conversation_key)
             prompt_t, completion_t = _extract_anthropic_token_counts(raw)
 
             self._record_metric(
@@ -327,6 +354,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -345,6 +373,7 @@ class GatewayHandler:
                 return await self._handle_anthropic_stream(
                     ctx, adapter, backend, upstream_body,
                     self._headers_for_anthropic(backend, ctx),
+                    conversation_key=conversation_key,
                 )
             except GatewayError as e:
                 last_error = e
@@ -358,6 +387,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -403,7 +433,9 @@ class GatewayHandler:
         # message_delta frames flow past, so the metrics record after the
         # stream finishes can report real token counts.
         usage_sink: dict[str, int] = {}
-        teed = tee_stream_capture_thinking(raw_iter, usage_sink)
+        teed = tee_stream_capture_thinking(
+            raw_iter, usage_sink, conversation_key=conversation_key,
+        )
         recorder = self._metrics
         bid = backend.backend_id
 
@@ -474,6 +506,7 @@ class GatewayHandler:
 
     async def _handle_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -490,6 +523,7 @@ class GatewayHandler:
             try:
                 return await self._handle_non_stream(
                     ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                    conversation_key=conversation_key,
                 )
             except GatewayError as e:
                 last_error = e
@@ -510,6 +544,7 @@ class GatewayHandler:
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -553,7 +588,9 @@ class GatewayHandler:
             backend.record_latency(latency_ms)
 
             try:
-                events = self._codec.parse_upstream_response(raw)
+                events = self._codec.parse_upstream_response(
+                    raw, conversation_key=conversation_key,
+                )
             except GatewayError:
                 raise
             except Exception as e:
@@ -572,6 +609,7 @@ class GatewayHandler:
 
     async def _handle_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         """Stream with retry on pre-stream failures.
 
@@ -593,6 +631,7 @@ class GatewayHandler:
             try:
                 return await self._handle_stream(
                     ctx, adapter, backend, upstream_body, self._headers_for(backend),
+                    conversation_key=conversation_key,
                 )
             except GatewayError as e:
                 last_error = e
@@ -614,6 +653,7 @@ class GatewayHandler:
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
+        *, conversation_key: str,
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -655,7 +695,9 @@ class GatewayHandler:
                 details={"status": status},
             )
 
-        ies_events = self._codec.parse_upstream_stream(raw_iter)
+        ies_events = self._codec.parse_upstream_stream(
+            raw_iter, conversation_key=conversation_key,
+        )
         # Tee usage out of the IES stream while it flows to the serializer.
         # Upstream usage typically arrives in the final MessageEnd event,
         # so we only know real numbers after the stream finishes.

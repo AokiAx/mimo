@@ -64,7 +64,15 @@ class UpstreamCodec(Protocol):
     def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]: ...
 
     def parse_upstream_stream(
-        self, raw: AsyncIterator[bytes]
+        self,
+        raw: AsyncIterator[bytes],
+        *,
+        conversation_key: str,
     ) -> AsyncIterator[InternalEvent]: ...
 
-    def parse_upstream_response(self, body: bytes) -> list[InternalEvent]: ...
+    def parse_upstream_response(
+        self,
+        body: bytes,
+        *,
+        conversation_key: str,
+    ) -> list[InternalEvent]: ...

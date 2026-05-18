@@ -27,6 +27,7 @@ so test isolation works.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -46,6 +47,15 @@ _MAX_ENTRIES = 4096           # memory LRU cap (preserved name for monkeypatch i
 _TTL_S = 7 * 24 * 3600        # 7 days
 _WRITE_QUEUE_MAX = 1024
 _WORKER_DRAIN_TIMEOUT_S = 1.0  # how long the worker waits for the first item
+
+# Schema version. Bump when the on-disk key shape changes so older rows
+# get wiped on startup instead of polluting the new key space.
+#   v1 — keys were just sorted tool ids joined by "|"
+#   v2 — keys are conversation-scoped: "<conv_hash>|<tool_id>..." or
+#        "<conv_hash>|__text__|<text_hash>". Different scope across
+#        conversations / different newapi users => mismatch on lookup =>
+#        no cross-conversation rehydration even if tool_ids collide.
+_SCHEMA_VERSION = 2
 
 # ────────────── module state ──────────────
 
@@ -104,6 +114,13 @@ def _ensure_initialized() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_reasoning_expire "
                 "ON reasoning_cache(expires_at)"
             )
+            # Wipe rows from prior key schemas. Old rows would never match
+            # the new conversation-scoped lookups anyway; keeping them only
+            # wastes LRU slots and SQLite I/O.
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version != _SCHEMA_VERSION:
+                conn.execute("DELETE FROM reasoning_cache")
+                conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             now = time.time()
             conn.execute(
                 "DELETE FROM reasoning_cache WHERE expires_at < ?", (now,)
@@ -251,8 +268,30 @@ def _purge_expired(conn: sqlite3.Connection) -> None:
 # ────────────── key shape ──────────────
 
 
-def _key(tool_call_ids: Iterable[str | None]) -> tuple[str, ...]:
-    return tuple(sorted(t for t in tool_call_ids if isinstance(t, str) and t))
+def derive_conversation_key(canonical: bytes) -> str:
+    """Derive the conversation-scope key from canonical message-history bytes.
+
+    Each adapter canonicalizes its own message shape (different content-block
+    schemas across OpenAI / Anthropic) and hands us bytes; we hash here so
+    the key shape is uniform across protocols.
+
+    The returned string is the leading element of every cache key — two
+    conversations (or two newapi users behind a shared gateway) with
+    different histories produce different ``conversation_key`` values, so
+    even if their upstream tool ids happen to collide, the cache treats the
+    entries as different and never cross-rehydrates.
+    """
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _tool_id_key(
+    conversation_key: str,
+    tool_call_ids: Iterable[str | None],
+) -> tuple[str, ...]:
+    ids = tuple(sorted(t for t in tool_call_ids if isinstance(t, str) and t))
+    if not ids:
+        return ()
+    return (conversation_key, *ids)
 
 
 def _key_str(key: tuple[str, ...]) -> str:
@@ -265,17 +304,32 @@ def _key_str(key: tuple[str, ...]) -> str:
 def remember_reasoning(
     reasoning_content: str | None,
     tool_call_ids: Iterable[str | None],
+    *,
+    conversation_key: str,
 ) -> None:
-    """Remember reasoning keyed by the message's sorted tool-call ids.
+    """Remember reasoning keyed by ``(conversation_key, sorted tool_call_ids)``.
 
-    Empty/missing reasoning or missing tool ids are no-ops because they
-    can't help any future lookup.
+    ``conversation_key`` is mandatory and there is no default. Forgetting to
+    pass it is a programmer error: silently falling back to a single global
+    scope would leak one conversation's reasoning into another's request.
+    Compute via :func:`derive_conversation_key` on the canonical bytes of
+    the message history that produced this reasoning.
+
+    Empty reasoning is a no-op. Missing tool ids is also a no-op — text-only
+    thinking responses cannot be safely rehydrated by this cache (would
+    require hashing assistant text, which short common replies like "好的"
+    would collide across conversations even with conversation_key scoping
+    in degenerate cases).
     """
     if not isinstance(reasoning_content, str) or not reasoning_content:
         with _lock:
             _stats["store_skips"] += 1
         return
-    key = _key(tool_call_ids)
+    if not isinstance(conversation_key, str) or not conversation_key:
+        # Hard error — passing an empty conversation_key means the caller
+        # didn't actually scope this write. Fail loud, don't fall back.
+        raise ValueError("conversation_key is required and must be non-empty")
+    key = _tool_id_key(conversation_key, tool_call_ids)
     if not key:
         with _lock:
             _stats["store_skips"] += 1
@@ -316,9 +370,22 @@ def remember_reasoning(
             _stats["write_drops"] += 1
 
 
-def lookup_reasoning(tool_call_ids: Iterable[str | None]) -> str | None:
-    """Return cached reasoning if any (memory first, SQLite second)."""
-    key = _key(tool_call_ids)
+def lookup_reasoning(
+    tool_call_ids: Iterable[str | None],
+    *,
+    conversation_key: str,
+) -> str | None:
+    """Return cached reasoning if any (memory first, SQLite second).
+
+    Scoped by ``conversation_key`` — a lookup with a different scope than
+    the one used at :func:`remember_reasoning` is guaranteed to miss, even
+    if ``tool_call_ids`` match. That's the whole point: two conversations
+    that happen to reuse the same upstream tool id (or where an attacker
+    forges a tool id) cannot read each other's reasoning.
+    """
+    if not isinstance(conversation_key, str) or not conversation_key:
+        raise ValueError("conversation_key is required and must be non-empty")
+    key = _tool_id_key(conversation_key, tool_call_ids)
     if not key:
         with _lock:
             _stats["misses"] += 1
