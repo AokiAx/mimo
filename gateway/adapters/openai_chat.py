@@ -313,6 +313,16 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     }
                     for tu in tool_uses
                 ]
+            # MiMo rejects assistant messages that supply none of content /
+            # reasoning_content / tool_calls. Claude Code occasionally re-sends
+            # historical {role: assistant, content: null} stubs; backfill a
+            # whitespace placeholder so history can round-trip instead of 400.
+            if (
+                out["content"] is None
+                and "reasoning_content" not in out
+                and "tool_calls" not in out
+            ):
+                out["content"] = " "
             return out
 
         # system / user
@@ -661,6 +671,13 @@ class OpenAIChatAdapter(ProtocolAdapter):
             msg["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls_by_idx:
             msg["tool_calls"] = [tool_calls_by_idx[i] for i in sorted(tool_calls_by_idx)]
+        # Avoid emitting bare {content: null} stubs to clients. Some agents
+        # (notably Claude Code) preserve null content in their history and
+        # re-send it on the next turn, which MiMo then rejects with 400. A
+        # whitespace placeholder breaks that feedback loop without changing
+        # the message semantics.
+        if msg["content"] is None and "tool_calls" not in msg and "reasoning_content" not in msg:
+            msg["content"] = " "
 
         body = {
             "id": message_id or _gen_id(),
