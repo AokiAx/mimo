@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -137,6 +138,11 @@ _DESTROY_POLL_INTERVAL_S = 5
 _DESTROY_POLL_MAX_ITERS = 12  # → up to 60s wait
 _CREATE_POLL_INTERVAL_S = 5
 _CREATE_POLL_MAX_ITERS = 60   # → up to 300s wait (Claw cold-start can hit 80-150s)
+# 429 "Mimo Claw使用中机器已达上限" 重试预算与节奏。MiMo 的 claw 池子在高峰
+# 期会被打满；旧 claw 已经被 Step 0 销毁，这里只能等池子腾出位置。重试期间
+# 这个账号是停服状态，所以预算不宜过长。
+_CREATE_429_RETRY_BUDGET_S = 30 * 60        # 总预算 30 分钟
+_CREATE_429_JITTER_MAX_S = 5.0              # 每次重试前 0–5s 随机抖动
 _PROBE_API_INTERVAL_S = 5
 _PROBE_API_MAX_ITERS = 36     # → up to 180s wait (Claw 异步建隧道有时晚到 100s+)
 
@@ -621,14 +627,52 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Step 1: Create claw.
         set_state("step1_create")
         log.log("Step 1: 创建新 Claw...")
-        code, data = await acurl(
-            "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
-        )
-        if not (isinstance(data, dict) and data.get("code") == 0):
-            log.log(f"❌ 创建 Claw 失败: {data}")
-            mark_finished("error", history_status="error")
-            return
-        log.log("Claw 创建请求已发送")
+
+        retry_deadline = time.monotonic() + _CREATE_429_RETRY_BUDGET_S
+        attempt = 0
+        while True:
+            attempt += 1
+            code, data = await acurl(
+                "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
+            )
+            if isinstance(data, dict) and data.get("code") == 0:
+                if attempt > 1:
+                    log.log(f"Claw 创建请求已发送（第 {attempt} 次尝试成功）")
+                else:
+                    log.log("Claw 创建请求已发送")
+                break
+
+            # 429 "机器已达上限" 单独处理：池子满了，立即重试。其它错误维持原
+            # 行为（直接 mark_finished("error") 退出）。
+            is_capacity_429 = (
+                isinstance(data, dict)
+                and data.get("code") == 429
+                and "上限" in str(data.get("msg", ""))
+            )
+            if not is_capacity_429:
+                log.log(f"❌ 创建 Claw 失败: {data}")
+                mark_finished("error", history_status="error")
+                return
+
+            if cancelled():
+                mark_finished("cancelled", history_status="cancelled")
+                return
+
+            remaining = retry_deadline - time.monotonic()
+            if remaining <= 0:
+                log.log(
+                    f"❌ 创建 Claw 失败：MiMo 容量饱和重试 {attempt} 次后放弃"
+                    f"（预算 {_CREATE_429_RETRY_BUDGET_S}s 用尽）"
+                )
+                mark_finished("error", history_status="error")
+                return
+
+            sleep_s = random.uniform(0, _CREATE_429_JITTER_MAX_S)
+            log.log(
+                f"⏳ MiMo 容量饱和（429），{sleep_s:.1f}s 后重试"
+                f"（已尝试 {attempt} 次，剩余预算 {int(remaining)}s）"
+            )
+            await asyncio.sleep(sleep_s)
 
         # Step 2: Wait until claw is AVAILABLE.
         set_state("step2_wait")
