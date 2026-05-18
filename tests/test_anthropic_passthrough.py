@@ -176,6 +176,32 @@ def test_patch_ignores_malformed_blocks():
     assert n == 0
 
 
+def test_patch_backfills_null_content_assistant():
+    # Claude Code occasionally re-sends historical assistant stubs with
+    # content=null; MiMo would 400 on these. Normalize to a whitespace block.
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": "again"},
+        ],
+    }
+    n = patch_request_thinking(body)
+    assert n == 1
+    assert body["messages"][1]["content"] == [{"type": "text", "text": " "}]
+
+
+def test_patch_backfills_empty_list_content_assistant():
+    body = {
+        "model": "m",
+        "messages": [{"role": "assistant", "content": []}],
+    }
+    n = patch_request_thinking(body)
+    assert n == 1
+    assert body["messages"][0]["content"] == [{"type": "text", "text": " "}]
+
+
 # ───────── scan_response_json ─────────
 
 

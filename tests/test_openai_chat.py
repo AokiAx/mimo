@@ -406,6 +406,39 @@ def test_serialize_to_upstream_preserves_assistant_reasoning_content():
     assert msg["tool_calls"][0]["id"] == "t1"
 
 
+def test_serialize_to_upstream_backfills_empty_assistant_content():
+    # Clients sometimes re-send {role: assistant, content: null} stubs from
+    # earlier turns. MiMo would 400; the adapter must backfill so the message
+    # carries at least one of content / reasoning_content / tool_calls.
+    req = InternalRequest(
+        model="m", max_tokens=128,
+        messages=[
+            InternalMessage(role="user", content=[InternalContent(type="text", text="hi")]),
+            InternalMessage(role="assistant", content=[]),
+        ],
+    )
+    msg = _adapter().serialize_to_upstream(req)["messages"][1]
+    assert msg["content"] == " "
+    assert "tool_calls" not in msg
+    assert "reasoning_content" not in msg
+
+
+def test_serialize_to_upstream_leaves_tool_call_only_assistant_null_content():
+    # When tool_calls are present, content=None is valid OpenAI semantics and
+    # MiMo accepts it. Don't backfill in that case.
+    req = InternalRequest(
+        model="m", max_tokens=128,
+        messages=[InternalMessage(role="assistant", content=[
+            InternalContent(
+                type="tool_use", tool_id="t1", tool_name="f", tool_input={},
+            ),
+        ])],
+    )
+    msg = _adapter().serialize_to_upstream(req)["messages"][0]
+    assert msg["content"] is None
+    assert msg["tool_calls"][0]["id"] == "t1"
+
+
 def test_serialize_to_upstream_image_block_kept_as_blocks():
     req = InternalRequest(
         model="m", max_tokens=128,
@@ -780,6 +813,21 @@ def test_serialize_response_collects_tool_calls():
     assert msg["tool_calls"][0]["function"]["name"] == "f"
     assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
     assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_serialize_response_backfills_empty_assistant_content():
+    # Returning {content: null} with no tool_calls / reasoning poisons client
+    # history: Claude Code preserves the null and re-sends it next turn,
+    # causing MiMo to 400. Emit a whitespace placeholder to break the loop.
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-empty", model="m"),
+        MessageEnd(finish_reason="stop", usage=Usage(input_tokens=1, output_tokens=0)),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    msg = body["choices"][0]["message"]
+    assert msg["content"] == " "
+    assert "tool_calls" not in msg
+    assert "reasoning_content" not in msg
 
 
 # ───────── finish_reason mapping ─────────

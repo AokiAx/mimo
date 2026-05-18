@@ -55,6 +55,17 @@ def patch_request_thinking(body: dict[str, Any]) -> int:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content")
+
+        # MiMo's /anthropic/v1/messages rejects assistant messages whose
+        # content is null or an empty list. Some Anthropic-style clients
+        # (notably Claude Code) emit such stubs on re-sent history; normalize
+        # them to a whitespace text block so the upstream call doesn't 400.
+        if content is None or (isinstance(content, list) and not content):
+            msg["content"] = [{"type": "text", "text": " "}]
+            content = msg["content"]
+            patched += 1
+            continue
+
         if not isinstance(content, list):
             continue
 
