@@ -340,6 +340,54 @@ def test_patch_does_not_rehydrate_across_conversations():
     ]
 
 
+def test_patch_does_not_rehydrate_across_different_system_prompts():
+    """Same messages + same tool_id but different ``system`` field must
+    still produce different conversation scopes. Otherwise an attacker
+    who replays a victim's message history with their own system prompt
+    can siphon the victim's thinking text (Codex PR #36 P1)."""
+    common_messages = [
+        {"role": "user", "content": "what's the answer"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_X", "name": "f", "input": {}},
+        ]},
+    ]
+    body_a = {"model": "m", "system": "You are agent A.", "messages": common_messages}
+    _seed_for_turn(body_a, 1, "SECRET A thinking", ["toolu_X"])
+
+    # Identical messages, different system prompt — must miss.
+    body_b = {
+        "model": "m",
+        "system": "You are agent B (totally different role).",
+        "messages": common_messages,
+    }
+    assert patch_request_thinking(body_b) == 0
+
+
+def test_patch_does_not_rehydrate_across_different_tool_sets():
+    """Same messages + system but different ``tools`` catalog → different
+    scope. Two agents wrapping different tool libraries shouldn't pollute
+    each other's caches."""
+    common_messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_T", "name": "f", "input": {}},
+        ]},
+    ]
+    body_a = {
+        "model": "m",
+        "messages": common_messages,
+        "tools": [{"name": "f", "description": "search", "input_schema": {}}],
+    }
+    _seed_for_turn(body_a, 1, "SECRET A thinking", ["toolu_T"])
+
+    body_b = {
+        "model": "m",
+        "messages": common_messages,
+        "tools": [{"name": "f", "description": "DIFFERENT TOOL", "input_schema": {}}],
+    }
+    assert patch_request_thinking(body_b) == 0
+
+
 # ───────── tee_stream_capture_thinking ─────────
 
 

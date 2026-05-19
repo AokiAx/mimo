@@ -159,13 +159,17 @@ class GatewayHandler:
 
         upstream_body = self._codec.serialize_to_upstream(req)
         # Conversation-scope key derived from this request's full message
-        # history. The codec writes captured reasoning under this key on the
-        # response path; next turn's serialize_to_upstream uses per-message
-        # prefix hashes to look back up. Different conversations get
-        # different keys, so an attacker who guesses a tool_id can't pull
-        # another conversation's reasoning out of the cache.
+        # history *and* tool surface. The codec writes captured reasoning
+        # under this key on the response path; next turn's
+        # serialize_to_upstream uses per-message prefix hashes (also
+        # including tools/tool_choice) to look back up. Different
+        # conversations / different tool sets get different keys, so an
+        # attacker who guesses a tool_id can't pull another conversation's
+        # reasoning out of the cache.
         from gateway.adapters.openai_chat import _conversation_key_for_request
-        conversation_key = _conversation_key_for_request(req.messages)
+        conversation_key = _conversation_key_for_request(
+            req.messages, tools=req.tools, tool_choice=req.tool_choice,
+        )
 
         if req.stream:
             return await self._handle_stream_with_retries(

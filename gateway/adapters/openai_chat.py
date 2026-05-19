@@ -104,12 +104,37 @@ def _canonical_message_bytes(m: InternalMessage) -> bytes:
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _conversation_key_for_request(messages: list[InternalMessage]) -> str:
-    """Conversation key for ``messages``. Used at response-capture time —
-    the messages we sent up are the conversation that produced the
-    response we're now caching."""
-    blob = b"[" + b",".join(_canonical_message_bytes(m) for m in messages) + b"]"
-    return derive_conversation_key(blob)
+def _conversation_key_for_request(
+    messages: list[InternalMessage],
+    *,
+    tools: list[InternalTool] | None = None,
+    tool_choice: Any = None,
+) -> str:
+    """Conversation key for the request that produced this response.
+
+    Hashes message history *plus* the tool surface (``tools`` /
+    ``tool_choice``). Two requests with identical messages but a
+    different tool catalog would produce different upstream behaviour
+    (different tool_use ids, different reasoning), so they're treated
+    as separate conversations — and an attacker can't pull another
+    conversation's reasoning by replaying just the messages without
+    also matching the exact tool set.
+
+    For OpenAI Chat there's no separate ``system`` field — system goes
+    in ``messages[0]``, so it's already covered.
+    """
+    msg_blob = b"[" + b",".join(_canonical_message_bytes(m) for m in messages) + b"]"
+    tools_canonical = None
+    if tools:
+        tools_canonical = sorted(
+            [{"n": t.name, "d": t.description, "p": t.input_schema} for t in tools],
+            key=lambda d: d["n"],
+        )
+    extra = json.dumps(
+        {"tools": tools_canonical, "tool_choice": tool_choice},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return derive_conversation_key(msg_blob + b"|" + extra)
 
 
 # ────────────── SSE utility ──────────────
@@ -283,8 +308,21 @@ class OpenAIChatAdapter(ProtocolAdapter):
     def serialize_to_upstream(self, req: InternalRequest) -> dict[str, Any]:
         # Per-message prefix hash: for each assistant message at index k,
         # rehydration must look up the cache under
-        # ``derive_conversation_key(canonical(messages[:k]))``. We compute
-        # incrementally so we don't re-canonicalize the prefix every time.
+        # ``_conversation_key_for_request(messages[:k], tools=..., tool_choice=...)``.
+        # We compute incrementally so we don't re-canonicalize the prefix
+        # every time, but the tools/tool_choice tail is appended each turn
+        # so it stays part of the scope.
+        tools_canonical = None
+        if req.tools:
+            tools_canonical = sorted(
+                [{"n": t.name, "d": t.description, "p": t.input_schema} for t in req.tools],
+                key=lambda d: d["n"],
+            )
+        extras_blob = b"|" + json.dumps(
+            {"tools": tools_canonical, "tool_choice": req.tool_choice},
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+
         prefix_blob = b"["
         first = True
         serialized: list[dict[str, Any]] = []
@@ -292,9 +330,9 @@ class OpenAIChatAdapter(ProtocolAdapter):
             if m.role == "assistant":
                 # The hash for this assistant turn is the conversation as
                 # it was *before* the model produced this turn — i.e., all
-                # messages that came before. That matches what the response
-                # capture path stored on the previous turn.
-                conv_key = derive_conversation_key(prefix_blob + b"]")
+                # messages that came before, plus the request's tool surface
+                # (which shapes which reasoning the model emitted).
+                conv_key = derive_conversation_key(prefix_blob + b"]" + extras_blob)
                 serialized.append(self._serialize_message(m, conversation_key=conv_key))
             else:
                 serialized.append(self._serialize_message(m, conversation_key=None))

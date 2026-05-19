@@ -77,10 +77,48 @@ def _canonical_anthropic_block(block: Any) -> Any:
     return {"t": btype, "raw": block}
 
 
+def _canonical_anthropic_system(system: Any) -> Any:
+    """Stable form of the ``system`` field (top-level on Anthropic).
+
+    Anthropic accepts ``system`` as either a string or a list of content
+    blocks (with ``cache_control`` flags etc.). Normalize so both forms
+    that are textually equivalent hash the same."""
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return [{"t": "text", "x": system}]
+    if isinstance(system, list):
+        out: list[Any] = []
+        for blk in system:
+            if isinstance(blk, str):
+                out.append({"t": "text", "x": blk})
+            elif isinstance(blk, dict):
+                # cache_control is operator-tuning, not conversation identity.
+                out.append({
+                    "t": blk.get("type") or "text",
+                    "x": blk.get("text") or "",
+                })
+        return out
+    return None
+
+
 def _conversation_key_from_body(body: dict[str, Any]) -> str:
-    """Conversation-scope key from an Anthropic ``/v1/messages`` body."""
+    """Conversation-scope key from an Anthropic ``/v1/messages`` body.
+
+    Hashes every body field that contributes to "which conversation this
+    is": ``system``, ``messages``, ``tools``, ``tool_choice``,
+    ``metadata``. An attacker who forges a ``tool_use`` id must also
+    reproduce *all* of these to land in the same cache scope —
+    effectively requiring full conversation context to be guessed, which
+    isn't materially easier than knowing a session token.
+
+    Body fields that don't shape conversation identity are deliberately
+    excluded so the hash is stable across runs even if the client tweaks
+    them: ``max_tokens``, ``temperature``, ``top_p``, ``stop_sequences``,
+    ``stream``, ``model``.
+    """
     msgs = body.get("messages") or []
-    canonical: list[dict[str, Any]] = []
+    canon_messages: list[dict[str, Any]] = []
     for m in msgs:
         if not isinstance(m, dict):
             continue
@@ -92,7 +130,15 @@ def _conversation_key_from_body(body: dict[str, Any]) -> str:
             blocks = [b for b in (_canonical_anthropic_block(c) for c in raw_content) if b is not None]
         else:
             blocks = []
-        canonical.append({"role": role, "content": blocks})
+        canon_messages.append({"role": role, "content": blocks})
+
+    canonical = {
+        "messages": canon_messages,
+        "system": _canonical_anthropic_system(body.get("system")),
+        "tools": body.get("tools") or None,
+        "tool_choice": body.get("tool_choice"),
+        "metadata": body.get("metadata") or None,
+    }
     blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return derive_conversation_key(blob)
 
