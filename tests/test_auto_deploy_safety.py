@@ -215,6 +215,31 @@ def test_coordinator_repairs_unselectable_accounts_without_reducing_capacity():
     assert plan["accounts"]["acc5.json"]["skip_reason"] == "queued"
 
 
+def test_coordinator_bootstraps_one_repair_when_no_selectable_backend_exists():
+    cfg = _cfg(6)
+    backends = [
+        _backend("acc0.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc1.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc2.json", 0, healthy=False, lifecycle="failed"),
+        _backend("acc3.json", 0, healthy=False, lifecycle="failed"),
+        _backend("acc4.json", 0, healthy=False, lifecycle="warming"),
+        _backend("acc5.json", 0, healthy=False, lifecycle="failed"),
+    ]
+
+    plan = auto_deploy._plan_rotation_batch(
+        cfg,
+        now=datetime(2026, 5, 19, 12, 0, 0),
+        backends=backends,
+        active_deploys={},
+    )
+
+    assert plan["counts"]["active_selectable"] == 0
+    assert plan["counts"]["repair_candidate_count"] == 6
+    assert plan["counts"]["selected_count"] == 1
+    assert plan["selected"][0]["next_rotation_reason"] == "repair_no_selectable_backend"
+    assert plan["accounts"][plan["selected"][0]["account"]]["skip_reason"] == ""
+
+
 def test_coordinator_marks_enabled_account_without_backend_as_unmatched():
     cfg = _cfg(3)
     backends = [_backend("acc0.json", 41 * 60), _backend("acc1.json", 10 * 60)]

@@ -603,6 +603,14 @@ def _plan_rotation_batch(
     max_parallel = (
         policy["emergency_max_parallel"] if emergency_mode else policy["normal_max_parallel"]
     )
+    if repair_candidates and active_selectable < min_active_required:
+        # Repairing an unselectable backend does not reduce current capacity.
+        # When the pool is already below target, keep the existing floor and
+        # recover unhealthy accounts one by one.
+        min_active_required = min(
+            active_selectable,
+            max(1, policy["emergency_min_active"] - 1),
+        )
     remaining_slots = max(0, max_parallel - deploying_count)
     selected: list[dict] = []
     selected_accounts: set[str] = set()
@@ -625,12 +633,20 @@ def _plan_rotation_batch(
                 account for account, item in account_status.items()
                 if item["active"] and account not in (running_deploys | selected_accounts)
             ])
+        if candidate.get("repair") and active_selectable == 0:
+            active_after = 0
         if active_after < min_active_required:
             status["skip_reason"] = "skipped_capacity"
             continue
         candidate_models = set(candidate.get("models") or [])
         if not candidate_models:
             status["skip_reason"] = "skipped_unmatched"
+            continue
+        if candidate.get("repair") and active_selectable == 0:
+            selected.append(candidate)
+            selected_accounts.add(candidate["account"])
+            status["skip_reason"] = ""
+            remaining_slots -= 1
             continue
         for model in candidate_models:
             if not any(model in (account_status[account].get("selectable_models") or []) for account in takeover_accounts):
