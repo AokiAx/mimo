@@ -246,12 +246,24 @@ def _is_safe_account_filename(filename: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP. Prefers X-Forwarded-For when present (panel
-    runs behind nginx/cloudflare for most operators)."""
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        # First entry is the originating client per RFC 7239 convention.
-        return xff.split(",")[0].strip() or (request.client.host if request.client else "?")
+    """Best-effort client IP.
+
+    Honors ``X-Forwarded-For`` only when ``MIMO_TRUST_PROXY_HEADERS`` is set
+    in the environment — that header is client-controlled unless a trusted
+    reverse proxy strips/sets it first. With the env var unset (default),
+    we use the direct socket peer so audit logs can't be spoofed by an
+    attacker just by sending a fake ``X-Forwarded-For`` header.
+
+    Operators running this panel behind nginx / Cloudflare / Caddy / etc.
+    should set ``MIMO_TRUST_PROXY_HEADERS=1`` (and make sure the proxy
+    actually overwrites the header rather than appending — most do by
+    default).
+    """
+    if os.environ.get("MIMO_TRUST_PROXY_HEADERS") in ("1", "true", "yes"):
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            # First entry is the originating client per RFC 7239 convention.
+            return xff.split(",")[0].strip() or (request.client.host if request.client else "?")
     return request.client.host if request.client else "?"
 
 
