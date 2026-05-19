@@ -36,6 +36,7 @@ bash run.sh
 - `DISABLE_SCHEDULER=1` — 不启动 auto-deploy 调度器（面板仍可手动触发部署）
 - `MIMO_JUMP_LOCAL=1` — 面板**就跑在跳板机本机**时启用。`auto_deploy` 的端口清理 / 加公钥等操作改走本地 `bash -c`，避免 root 自连 SSH
 - `MIMO_DEBUG_CLAW=1` — auto_deploy 把 Claw 的 WS 回复**完整**写入日志（默认只记前 200 字符）
+- `MIMO_TRUST_PROXY_HEADERS=1` — 信任 `X-Forwarded-For` 头作为客户端 IP（默认 **关闭**，用 socket peer 地址）。仅在面板部署在 nginx / Cloudflare / Caddy 等反向代理之后时启用，否则攻击者可以伪造 IP 来污染审计日志（`login_failure` / `auth_bad_cookie` / `path_traversal_blocked` 等事件）。
 
 ---
 

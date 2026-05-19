@@ -87,9 +87,11 @@ async def do_login(request: Request):
     params = parse_qs(body.decode())
     pwd = params.get("password", [""])[0]
     if pwd == PANEL_PASSWORD:
+        _audit("login_success", request)
         resp = RedirectResponse("/", status_code=302)
         resp.set_cookie(AUTH_COOKIE, AUTH_TOKEN, max_age=86400*30, httponly=True)
         return resp
+    _audit("login_failure", request, pwd_len=len(pwd))
     return RedirectResponse("/login?err=1", status_code=302)
 
 @app.middleware("http")
@@ -119,13 +121,43 @@ async def auth_middleware(request: Request, call_next):
     # Publicly readable endpoints (no auth — safe to expose)
     if path in ("/stats", "/api/public/stats"):
         return await call_next(request)
-    if request.cookies.get(AUTH_COOKIE) == AUTH_TOKEN:
-        return await call_next(request)
-    return RedirectResponse("/login", status_code=302)
+    if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
+        # Don't audit every redirect (browsers retry, gets noisy), only the
+        # ones with an *attempted* but wrong cookie value — that's the
+        # interesting signal.
+        if request.cookies.get(AUTH_COOKIE):
+            _audit("auth_bad_cookie", request)
+        return RedirectResponse("/login", status_code=302)
+    # Authenticated. Guard /api/account/{filename}/* against path traversal:
+    # ``filename`` is a URL path segment that downstream handlers concatenate
+    # into the ``accounts/`` directory. A panel user (or anyone who guesses
+    # the panel password) could otherwise write to ``data/secrets.json`` by
+    # POSTing ``/api/account/..%2F..%2Fdata%2Fsecrets/login``.
+    if path.startswith("/api/account/"):
+        # path is like /api/account/{filename}/...
+        segs = path.split("/", 4)   # ['', 'api', 'account', filename, rest?]
+        if len(segs) >= 4 and segs[3]:
+            if not _is_safe_account_filename(segs[3]):
+                _audit("path_traversal_blocked", request, filename=segs[3])
+                return JSONResponse(
+                    {"error": "invalid account filename"}, status_code=400,
+                )
+    return await call_next(request)
 
 @app.on_event("startup")
 async def startup_event():
     """Start auto-deploy scheduler and gateway probe."""
+    # Warn (don't refuse) on the well-known default panel password. The
+    # default lives in ``gateway/secrets_store.py`` and ships in this public
+    # repo, so any deployment that keeps it = open admin. We don't *force*
+    # a change here because some operators may genuinely run on a private
+    # network, but the warning makes the risk visible in logs.
+    if PANEL_PASSWORD == "Aoki-MiMo":
+        logger.warning(
+            "[startup] SECURITY: panel password is the public default "
+            "'Aoki-MiMo'. If this panel is reachable from the internet, "
+            "anyone scanning can log in. Change it via data/secrets.json."
+        )
     # Set DISABLE_SCHEDULER=1 in the systemd unit to keep the scheduler off
     # (e.g. when first deploying to a new host — operators usually want to
     # verify accounts / cookies before letting cron fire real Claw deploys).
@@ -176,6 +208,79 @@ def _account_filename(name):
     safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', name).strip('_')
     return safe if safe else "unnamed"
 
+
+# ──────────── Security helpers ────────────
+
+# Cache the resolved accounts dir so each request doesn't re-stat the FS.
+_ACCOUNTS_DIR_RESOLVED: Path | None = None
+
+
+def _is_safe_account_filename(filename: str) -> bool:
+    """True iff ``filename`` is a safe single-segment account id.
+
+    Rejects anything that:
+      * is empty / falsy
+      * contains path separators or NUL
+      * differs from its ``_account_filename`` sanitized form (catches `..`,
+        spaces, %-encoded leftovers, etc. — legitimate names already match
+        ``[A-Za-z0-9_\\-]+`` because that's all ``_account_filename`` allows
+        through)
+      * after joining + resolving falls outside ``ACCOUNTS_DIR`` (final
+        defense in case the sanitizer is ever loosened)
+    """
+    if not filename or not isinstance(filename, str):
+        return False
+    if "\x00" in filename or "/" in filename or "\\" in filename:
+        return False
+    if filename != _account_filename(filename):
+        return False
+    global _ACCOUNTS_DIR_RESOLVED
+    if _ACCOUNTS_DIR_RESOLVED is None:
+        _ACCOUNTS_DIR_RESOLVED = ACCOUNTS_DIR.resolve()
+    candidate = (ACCOUNTS_DIR / f"{filename}.json").resolve()
+    try:
+        candidate.relative_to(_ACCOUNTS_DIR_RESOLVED)
+    except ValueError:
+        return False
+    return True
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP.
+
+    Honors ``X-Forwarded-For`` only when ``MIMO_TRUST_PROXY_HEADERS`` is set
+    in the environment — that header is client-controlled unless a trusted
+    reverse proxy strips/sets it first. With the env var unset (default),
+    we use the direct socket peer so audit logs can't be spoofed by an
+    attacker just by sending a fake ``X-Forwarded-For`` header.
+
+    Operators running this panel behind nginx / Cloudflare / Caddy / etc.
+    should set ``MIMO_TRUST_PROXY_HEADERS=1`` (and make sure the proxy
+    actually overwrites the header rather than appending — most do by
+    default).
+    """
+    if os.environ.get("MIMO_TRUST_PROXY_HEADERS") in ("1", "true", "yes"):
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            # First entry is the originating client per RFC 7239 convention.
+            return xff.split(",")[0].strip() or (request.client.host if request.client else "?")
+    return request.client.host if request.client else "?"
+
+
+def _audit(event: str, request: Request, **extra) -> None:
+    """Append a structured audit-log line for security-relevant events.
+
+    Going through the module logger so it lands in the standard
+    ``logs/error.log`` rotation (panel-cookie-only readable). Format kept
+    grep-friendly: ``audit event=… ip=… ua=… path=…`` plus any extras."""
+    parts = [f"audit event={event}"]
+    parts.append(f"ip={_client_ip(request)}")
+    parts.append(f"ua={request.headers.get('user-agent', '?')[:200]!r}")
+    parts.append(f"path={request.url.path}")
+    for k, v in extra.items():
+        parts.append(f"{k}={v!r}")
+    logger.warning(" ".join(parts))
+
 def _get_current_account_name():
     """Read the current account name from _current.json."""
     if not CURRENT_ACCOUNT_FILE.exists():
@@ -197,6 +302,9 @@ def _set_current_account(filename):
 
 def _load_account_by_filename(filename):
     """Load an account dict by its filename (without .json)."""
+    if not _is_safe_account_filename(filename):
+        logger.warning("blocked unsafe account read filename=%r", filename)
+        return None
     path = ACCOUNTS_DIR / "{}.json".format(filename)
     if not path.exists():
         return None
@@ -208,6 +316,11 @@ def _load_account_by_filename(filename):
 
 def _save_account(filename, account_data):
     """Save an account dict to its file."""
+    if not _is_safe_account_filename(filename):
+        # Loud rather than silent: a write attempt with a bad filename is
+        # always a bug or an attack — both deserve to surface immediately.
+        logger.error("blocked unsafe account write filename=%r", filename)
+        raise ValueError("invalid account filename")
     _ensure_accounts_dir()
     path = ACCOUNTS_DIR / "{}.json".format(filename)
     with open(path, "w") as f:
