@@ -160,7 +160,7 @@ async def startup_event():
         )
     # Set DISABLE_SCHEDULER=1 in the systemd unit to keep the scheduler off
     # (e.g. when first deploying to a new host — operators usually want to
-    # verify accounts / cookies before letting cron fire real Claw deploys).
+    # verify accounts / cookies before adaptive Claw rotation starts).
     if os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
         logger.info("[startup] DISABLE_SCHEDULER set — auto-deploy scheduler not started")
     else:

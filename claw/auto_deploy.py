@@ -36,8 +36,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from croniter import croniter
-
 CONFIG_PATH = Path(__file__).parent.parent / "data" / "auto_deploy.json"
 LOG_DIR = Path(__file__).parent.parent / "data" / "deploy_logs"
 HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
@@ -277,7 +275,6 @@ def get_account_config(account_filename: str) -> dict:
     cfg = load_config()
     return cfg.get("accounts", {}).get(account_filename, {
         "enabled": False,
-        "cron": "0 3 * * *",
     })
 
 
@@ -1362,7 +1359,6 @@ def get_scheduler_status() -> dict:
     accounts = cfg.get("accounts", {})
     plan = _plan_rotation_batch(cfg)
     schedule_info = {}
-    now = datetime.now()
 
     for acc_filename, acc_cfg in accounts.items():
         rotation_info = (plan.get("accounts") or {}).get(acc_filename, {})
@@ -1375,31 +1371,20 @@ def get_scheduler_status() -> dict:
                 "skip_reason": "disabled",
             }
             continue
-        cron_expr = acc_cfg.get("cron", "0 3 * * *")
         last_run = acc_cfg.get("last_run", 0)
-        try:
-            cron = croniter(cron_expr, now)
-            next_run = cron.get_next(datetime)
-        except (ValueError, KeyError):
-            schedule_info[acc_filename] = {
-                "enabled": True, "cron": cron_expr,
-                "error": "Cron 表达式格式错误",
-                **rotation_info,
-            }
-            continue
         schedule_info[acc_filename] = {
             "enabled": True,
-            "cron": cron_expr,
             "last_run": (
                 datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M")
                 if last_run else "从未运行"
             ),
-            "next_run": next_run.strftime("%Y-%m-%d %H:%M"),
+            "schedule_mode": "adaptive",
             **rotation_info,
         }
 
     return {
         "scheduler_running": _scheduler_running,
+        "schedule_mode": "adaptive",
         "policy": plan.get("policy", {}),
         "counts": plan.get("counts", {}),
         "selected": plan.get("selected", []),

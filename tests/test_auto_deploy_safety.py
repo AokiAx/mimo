@@ -56,7 +56,6 @@ def _cfg(account_count: int) -> dict:
             f"acc{i}.json": {
                 "enabled": True,
                 "api_port": 8800 + i,
-                "cron": "*/5 * * * *",
             }
             for i in range(account_count)
         }
