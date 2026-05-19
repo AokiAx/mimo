@@ -2,16 +2,16 @@
 
 - 日期：2026-05-19
 - 审查者：Codex
-- 任务：生产环境 gateway 多缺陷修复审查
+- 任务：生产环境 gateway 多缺陷修复与全量 Active Claw 自适应轮换审查
 - 证据来源：本地代码 diff、pytest、只读生产 `error.log`
 
 ## 评分
 
-- 需求符合性：28/30
-- 技术质量：28/30
+- 需求符合性：29/30
+- 技术质量：29/30
 - 集成兼容性：19/20
-- 性能与可扩展性：18/20
-- 综合评分：93/100
+- 性能与可扩展性：19/20
+- 综合评分：96/100
 - 建议：通过
 
 ## 关键发现
@@ -31,11 +31,14 @@
 5. Claw 轮换不再主动制造无后端窗口。
    `claw/auto_deploy.py` 会在没有可接管健康后端时跳过销毁旧 Claw；`gateway/runtime.py` 将默认轮换年龄调至 40 分钟，并用 selectable peer 而不是单纯 active peer 判断接管能力。
 
+6. 全量 Active Claw 策略已落地。
+   新增 coordinator 按 40/50/55 分钟阈值、enabled 账号数、active 可接管账号数与部署中数量选择轮换批次；6 账号正常保持 5 个可接管，紧急至少 4 个可接管。手动触发和 scheduler 触发都走同一容量门，状态接口和面板展示 `skipped_capacity`、`skipped_unmatched`、`queued` 等原因。
+
 ## 审查清单
 
 - 需求字段完整性：通过。目标、范围、验证方式、风险均已记录。
-- 原始意图覆盖：通过。生产日志前 10 个错误组中的可代码修复项均有对应改动。
-- 交付物映射：通过。代码、测试、`.codex/testing.md`、`verification.md` 均已生成。
+- 原始意图覆盖：通过。生产日志前 10 个错误组中的可代码修复项均有对应改动，且已覆盖用户补充的 6 账号全量负载均衡轮换要求。
+- 交付物映射：通过。代码、测试、面板状态展示、`.codex/testing.md`、`verification.md` 均已生成。
 - 依赖与风险评估：通过。未引入新依赖，主要残余风险是部署后生产观测与失效 key 更换。
 - 留痕：通过。远程日志只读来源、测试命令、结果和清理动作均已记录。
 
@@ -43,7 +46,12 @@
 
 ```text
 python -m pytest tests/ -q
-251 passed, 4 warnings in 4.39s
+261 passed, 4 warnings in 4.36s
+```
+
+```text
+python -m pytest tests/test_auto_deploy_safety.py tests/test_lifecycle_rotation.py tests/test_routing.py -q
+57 passed in 1.02s
 ```
 
 ```text
@@ -54,6 +62,6 @@ git diff --check
 ## 风险与阻塞
 
 - 无阻塞。
-- 未修改云端代码，未执行 git push。
+- 未修改云端代码；仅通过 GitHub PR 分支交付本地代码变更。
 - 已删除本地 `.scratch_remote_logs/id_ed25519` 临时私钥副本。
 - `AGENTS.md` 与 `CLAUDE.md` 为进入本轮前已存在的未跟踪文件，本轮未纳入处理。

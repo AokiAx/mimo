@@ -1286,6 +1286,17 @@ function renderAutoDeployAccounts(deployCfg) {
 
 function renderAutoDeployList(el, deployCfg, scheduler) {
   var html = '';
+  var counts = scheduler.counts || {};
+  if (counts.enabled_accounts !== undefined) {
+    html += '<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:#0b1623;font-size:0.78rem;color:var(--text3)">';
+    html += '<span>启用 <b style="color:var(--text2)">' + escapeHtml(String(counts.enabled_accounts || 0)) + '</b></span>';
+    html += '<span>可用 <b style="color:var(--green)">' + escapeHtml(String(counts.active_selectable || 0)) + '</b></span>';
+    html += '<span>部署中 <b style="color:var(--accent)">' + escapeHtml(String(counts.deploying || 0)) + '</b></span>';
+    html += '<span>正常下限 <b style="color:var(--text2)">' + escapeHtml(String(counts.normal_min_active || 0)) + '</b></span>';
+    html += '<span>紧急下限 <b style="color:var(--text2)">' + escapeHtml(String(counts.emergency_min_active || 0)) + '</b></span>';
+    html += '<span>候选 <b style="color:var(--text2)">' + escapeHtml(String(counts.candidate_count || 0)) + '</b></span>';
+    html += '</div>';
+  }
   for (var i = 0; i < window.accounts.length; i++) {
     var a = window.accounts[i];
     var fn = a.filename;
@@ -1315,10 +1326,20 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
     var nextRun = schedInfo.next_run || '-';
+    var ageMin = schedInfo.age_min !== undefined ? schedInfo.age_min : '-';
+    var rotateReason = schedInfo.next_rotation_reason || '-';
+    var skipReason = schedInfo.skip_reason || '';
+    var activeState = schedInfo.active ? '可用' : (enabled ? '等待' : '禁用');
     html += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     html += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
     html += '<span>下次：<b style="color:var(--accent)">' + escapeHtml(String(nextRun)) + '</b></span>';
     html += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
+    html += '</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
+    html += '<span>年龄 <b style="color:var(--text2)">' + escapeHtml(String(ageMin)) + 'm</b></span>';
+    html += '<span>状态 <b style="color:var(--text2)">' + escapeHtml(activeState) + '</b></span>';
+    html += '<span>原因 <b style="color:var(--text2)">' + escapeHtml(String(rotateReason)) + '</b></span>';
+    if (skipReason) html += '<span>跳过 <b style="color:var(--yellow)">' + escapeHtml(String(skipReason)) + '</b></span>';
     html += '</div>';
     var dt = cfg.deploy_text || '';
     html += '<div><label style="font-size:0.78rem;color:var(--text3);display:block;margin-bottom:4px">部署文案（发送给 Claw）</label>';

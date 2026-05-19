@@ -47,6 +47,35 @@ git diff --check
 - 自动部署在没有可接管后端时跳过销毁旧 Claw，避免创建新 Claw 的 5-10 分钟内出现 no backend 空窗。
 - 默认轮换时间改为 40 分钟，给 1 小时上游硬断前留出更保守的创建与热身窗口。
 
+## 2026-05-19 全量 Active Claw 自适应轮换验证
+
+新增验证命令：
+
+```powershell
+python -m pytest tests/test_auto_deploy_safety.py tests/test_lifecycle_rotation.py tests/test_routing.py -q
+python -m pytest tests/ -q
+git diff --check
+```
+
+结果：
+
+```text
+57 passed in 1.02s
+261 passed, 4 warnings in 4.36s
+git diff --check 通过，仅有 Windows LF/CRLF 提示
+```
+
+新增回归覆盖：
+
+- 3/6/9 个账号的 desired active、normal/emergency min active 与并发轮换上限。
+- 6 个账号正常 40 分钟轮换只选择 1 个，剩余 5 个可接管。
+- 6 个账号多个超过 50 分钟时进入紧急模式，最多选择 2 个且剩余不少于 4 个。
+- 健康 active 不足紧急下限时记录 `skipped_capacity`，不触发销毁。
+- 启用账号缺少 gateway backend 时记录 `skipped_unmatched`。
+- 3 个账号场景允许轮换 1 个，但必须剩余 2 个可接管。
+- scheduler 每分钟只触发 coordinator 选中的账号。
+- 手动触发部署也先经过 coordinator 容量门，并在启动线程前登记 `queued` 状态。
+
 ## 清理
 
 - 已删除本地临时私钥副本：`C:\Users\sikuai\Desktop\develop\mimo\.scratch_remote_logs\id_ed25519`

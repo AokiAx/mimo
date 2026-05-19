@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -151,6 +152,11 @@ def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: s
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
 _TERMINAL_STATES = ("done", "error", "cancelled", "skipped")
+
+# 上游 Claw 连接约 1 小时会被硬断，提前轮换给 5-10 分钟冷启动留余量。
+_ROTATION_TARGET_AGE_S = 40 * 60
+_ROTATION_CRITICAL_AGE_S = 50 * 60
+_ROTATION_HARD_EXPIRY_AGE_S = 55 * 60
 
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
@@ -365,6 +371,312 @@ def get_deploy_status(account_filename: str = None) -> dict:
             "log": d["logger"].get_recent(20),
         }
     return result
+
+
+# ─── Rotation coordinator ───
+
+def _rotation_policy(enabled_count: int) -> dict:
+    enabled = max(0, int(enabled_count or 0))
+    if enabled <= 0:
+        return {
+            "desired_active": 0,
+            "normal_min_active": 0,
+            "emergency_min_active": 0,
+            "normal_max_parallel": 0,
+            "emergency_max_parallel": 0,
+        }
+
+    normal_min = min(enabled, max(3, int(math.ceil(enabled * 0.80))))
+    # 生产示例要求 9 个账号紧急下限为 6，因此这里按 floor 取值。
+    emergency_min = min(enabled, max(3, int(math.floor(enabled * 0.67))))
+    normal_parallel = max(1, enabled - normal_min)
+    emergency_parallel = max(normal_parallel, enabled - emergency_min)
+    return {
+        "desired_active": enabled,
+        "normal_min_active": normal_min,
+        "emergency_min_active": emergency_min,
+        "normal_max_parallel": normal_parallel,
+        "emergency_max_parallel": emergency_parallel,
+    }
+
+
+def _deploy_is_running(deploy: dict | None) -> bool:
+    return bool(deploy) and deploy.get("state") not in (*_TERMINAL_STATES, "idle")
+
+
+def _load_gateway_backends() -> list[dict]:
+    try:
+        from gateway.runtime import get_all_backends
+        return get_all_backends()
+    except Exception:  # noqa: BLE001
+        logger_module.exception("Failed to read gateway backend status for rotation coordinator")
+        return []
+
+
+def _backend_url_port(backend: dict) -> int | None:
+    match = re.search(r":(\d+)(?:/)?$", str(backend.get("url") or "").rstrip("/"))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _account_match_keys(account_filename: str) -> set[str]:
+    raw = (account_filename or "").strip()
+    keys = {raw} if raw else set()
+    if raw.endswith(".json"):
+        keys.add(raw[:-5])
+    elif raw:
+        keys.add(f"{raw}.json")
+    return keys
+
+
+def _account_backends(account_filename: str, acc_cfg: dict, backends: list[dict]) -> list[dict]:
+    keys = _account_match_keys(account_filename)
+    api_port = acc_cfg.get("api_port")
+    matches = []
+    for backend in backends:
+        account = str(backend.get("account") or "")
+        if account and account in keys:
+            matches.append(backend)
+            continue
+        if api_port is not None and _backend_url_port(backend) == api_port:
+            matches.append(backend)
+    return matches
+
+
+def _backend_is_selectable(backend: dict) -> bool:
+    lifecycle = backend.get("lifecycle")
+    return (
+        bool(backend.get("enabled", True))
+        and bool(backend.get("healthy"))
+        and lifecycle in ("active", "warming")
+    )
+
+
+def _rotation_reason(age_s: float) -> str:
+    if age_s >= _ROTATION_HARD_EXPIRY_AGE_S:
+        return "hard_expiry_age"
+    if age_s >= _ROTATION_CRITICAL_AGE_S:
+        return "critical_age"
+    if age_s >= _ROTATION_TARGET_AGE_S:
+        return "target_age"
+    return "fresh"
+
+
+def _candidate_priority(item: dict) -> tuple:
+    reason_rank = {
+        "hard_expiry_age": 0,
+        "critical_age": 1,
+        "target_age": 2,
+    }
+    return (
+        reason_rank.get(item.get("next_rotation_reason"), 99),
+        -float(item.get("age_s") or 0),
+        item.get("account") or "",
+    )
+
+
+def _rotation_capacity_floor(enabled_count: int, configured_floor: int) -> int:
+    if enabled_count <= 0:
+        return 0
+    if enabled_count <= 2:
+        return enabled_count
+    return max(2, min(int(configured_floor), enabled_count - 1))
+
+
+def _plan_rotation_batch(
+    cfg: dict,
+    *,
+    now: datetime | None = None,
+    backends: list[dict] | None = None,
+    active_deploys: dict | None = None,
+) -> dict:
+    """选择下一批不会打穿容量底线的 Claw 轮换账号。
+
+    coordinator 只读地做容量决策；真正销毁 Claw 前，部署流程仍会调用
+    ``prepare_account_deploy`` 进行 gateway 侧安全确认。
+    """
+    now = now or datetime.now()
+    backends = list(backends if backends is not None else _load_gateway_backends())
+    active_deploys = active_deploys if active_deploys is not None else _active_deploys
+
+    accounts_cfg = cfg.get("accounts", {}) or {}
+    enabled_accounts = [
+        (account, acc_cfg)
+        for account, acc_cfg in accounts_cfg.items()
+        if acc_cfg.get("enabled", False)
+    ]
+    enabled_count = len(enabled_accounts)
+    policy = _rotation_policy(enabled_count)
+
+    running_deploys = {
+        account for account, deploy in active_deploys.items()
+        if _deploy_is_running(deploy)
+    }
+    deploying_count = len(running_deploys)
+
+    account_status: dict[str, dict] = {}
+    candidates: list[dict] = []
+    emergency_candidates = 0
+
+    for account, acc_cfg in enabled_accounts:
+        matches = _account_backends(account, acc_cfg, backends)
+        selectable = [backend for backend in matches if _backend_is_selectable(backend)]
+        age_s = max((float(backend.get("active_for_s") or 0) for backend in selectable), default=0.0)
+        models = sorted({
+            model
+            for backend in matches
+            for model in (backend.get("models") or [])
+        })
+        selectable_models = sorted({
+            model
+            for backend in selectable
+            for model in (backend.get("models") or [])
+        })
+        reason = _rotation_reason(age_s)
+        status = {
+            "enabled": True,
+            "api_port": acc_cfg.get("api_port"),
+            "active": bool(selectable),
+            "backend_count": len(matches),
+            "selectable_backend_count": len(selectable),
+            "models": models,
+            "selectable_models": selectable_models,
+            "age_s": int(age_s),
+            "age_min": round(age_s / 60.0, 1) if age_s else 0,
+            "next_rotation_reason": reason,
+            "skip_reason": "",
+        }
+        account_status[account] = status
+
+        if account in running_deploys:
+            status["skip_reason"] = "deploying"
+            continue
+        if not matches:
+            status["skip_reason"] = "skipped_unmatched"
+            continue
+        if not selectable:
+            status["skip_reason"] = "no_selectable_backend"
+            continue
+        if reason == "fresh":
+            status["skip_reason"] = "active_fresh"
+            continue
+
+        candidate = {
+            "account": account,
+            "age_s": int(age_s),
+            "age_min": round(age_s / 60.0, 1),
+            "next_rotation_reason": reason,
+            "models": selectable_models,
+        }
+        candidates.append(candidate)
+        if age_s >= _ROTATION_CRITICAL_AGE_S:
+            emergency_candidates += 1
+
+    active_selectable = sum(1 for status in account_status.values() if status["active"])
+    emergency_mode = emergency_candidates >= 2
+    configured_min_active = (
+        policy["emergency_min_active"] if emergency_mode else policy["normal_min_active"]
+    )
+    min_active_required = _rotation_capacity_floor(enabled_count, configured_min_active)
+    max_parallel = (
+        policy["emergency_max_parallel"] if emergency_mode else policy["normal_max_parallel"]
+    )
+    remaining_slots = max(0, max_parallel - deploying_count)
+    selected: list[dict] = []
+    selected_accounts: set[str] = set()
+    candidates.sort(key=_candidate_priority)
+
+    for candidate in candidates:
+        status = account_status[candidate["account"]]
+        if remaining_slots <= 0:
+            status["skip_reason"] = "queued"
+            continue
+        excluded_accounts = running_deploys | selected_accounts | {candidate["account"]}
+        takeover_accounts = [
+            account for account, item in account_status.items()
+            if item["active"] and account not in excluded_accounts
+        ]
+        active_after = len(takeover_accounts)
+        if active_after < min_active_required:
+            status["skip_reason"] = "skipped_capacity"
+            continue
+        candidate_models = set(candidate.get("models") or [])
+        if not candidate_models:
+            status["skip_reason"] = "skipped_unmatched"
+            continue
+        for model in candidate_models:
+            if not any(model in (account_status[account].get("selectable_models") or []) for account in takeover_accounts):
+                status["skip_reason"] = "skipped_capacity"
+                break
+        if status["skip_reason"]:
+            continue
+        selected.append(candidate)
+        selected_accounts.add(candidate["account"])
+        status["skip_reason"] = ""
+        remaining_slots -= 1
+
+    return {
+        "generated_at": now.isoformat(),
+        "policy": policy,
+        "counts": {
+            "enabled_accounts": enabled_count,
+            "desired_active": policy["desired_active"],
+            "active_selectable": active_selectable,
+            "deploying": deploying_count,
+            "normal_min_active": policy["normal_min_active"],
+            "emergency_min_active": policy["emergency_min_active"],
+            "min_active_required": min_active_required,
+            "max_parallel": max_parallel,
+            "candidate_count": len(candidates),
+            "selected_count": len(selected),
+            "emergency_mode": emergency_mode,
+        },
+        "selected": selected,
+        "accounts": account_status,
+    }
+
+
+def _rotation_safety_for_account(account_filename: str, cfg: dict | None = None) -> dict:
+    cfg = cfg or load_config()
+    plan = _plan_rotation_batch(cfg)
+    status = (plan.get("accounts") or {}).get(account_filename)
+    if status is None:
+        return {"safe": False, "reason": "account_disabled_or_missing", "plan": plan}
+    if any(item.get("account") == account_filename for item in plan.get("selected") or []):
+        return {"safe": True, "reason": "coordinator_selected", "plan": plan}
+    if not status.get("active"):
+        return {
+            "safe": False,
+            "reason": status.get("skip_reason") or "no_selectable_backend",
+            "plan": plan,
+        }
+
+    counts = plan.get("counts") or {}
+    min_active_required = int(counts.get("min_active_required") or 0)
+    running_accounts = {
+        account for account, deploy in _active_deploys.items()
+        if _deploy_is_running(deploy)
+    }
+    excluded = running_accounts | {account_filename}
+    account_status = plan.get("accounts") or {}
+    takeover_accounts = [
+        account for account, item in account_status.items()
+        if item.get("active") and account not in excluded
+    ]
+    if len(takeover_accounts) < min_active_required:
+        return {"safe": False, "reason": "skipped_capacity", "plan": plan}
+
+    models = set(status.get("selectable_models") or status.get("models") or [])
+    if not models:
+        return {"safe": False, "reason": "skipped_unmatched", "plan": plan}
+    for model in models:
+        if not any(model in (account_status[account].get("selectable_models") or []) for account in takeover_accounts):
+            return {"safe": False, "reason": "skipped_capacity", "plan": plan}
+    return {"safe": True, "reason": "manual_capacity_ok", "plan": plan}
 
 
 # ─── SSH jump helper ───
@@ -961,9 +1273,28 @@ def trigger_deploy(account_filename: str) -> dict:
     cur = _active_deploys.get(account_filename)
     if cur and cur.get("state") not in (*_TERMINAL_STATES, "idle"):
         return {"success": False, "error": "该账号正在部署中"}
+    safety = _rotation_safety_for_account(account_filename)
+    if not safety.get("safe"):
+        return {
+            "success": False,
+            "error": "当前容量不足，已跳过部署以避免 no backend",
+            "reason": safety.get("reason", "skipped_capacity"),
+            "plan": safety.get("plan", {}),
+        }
+    log = DeployLogger(account_filename)
+    _active_deploys[account_filename] = {
+        "thread": None,
+        "logger": log,
+        "state": "queued",
+        "cancel": threading.Event(),
+        "started_at": datetime.now().isoformat(),
+        "started_ts": time.time(),
+        "finished_ts": None,
+    }
     t = threading.Thread(
         target=_run_deploy_thread, args=(account_filename, False), daemon=True,
     )
+    _active_deploys[account_filename]["thread"] = t
     t.start()
     return {"success": True, "message": f"已启动 {account_filename} 的部署"}
 
@@ -980,11 +1311,7 @@ def cancel_deploy(account_filename: str) -> dict:
 # ─── Scheduler ───
 
 def _scheduler_loop():
-    """Run every minute: for each enabled account, fire when:
-      * cron has crossed a fire boundary within the last 2 min, AND
-      * we haven't already triggered for that fire (last_run < prev_fire), AND
-      * no active deploy is in flight.
-    """
+    """每分钟由全局 coordinator 统一选择安全轮换批次。"""
     global _scheduler_running
     _scheduler_running = True
     print("[scheduler] 启动自动部署调度器", flush=True)
@@ -992,33 +1319,25 @@ def _scheduler_loop():
     while _scheduler_running:
         try:
             cfg = load_config()
-            accounts = cfg.get("accounts", {})
-
-            for acc_filename, acc_cfg in accounts.items():
-                if not acc_cfg.get("enabled", False):
-                    continue
-                cron_expr = acc_cfg.get("cron", "0 3 * * *")
-                last_run = acc_cfg.get("last_run", 0) or 0
-                now = datetime.now()
-                try:
-                    cron = croniter(cron_expr, now)
-                except (ValueError, KeyError):
-                    continue
-                prev_fire = cron.get_prev(datetime)
-                diff = (now - prev_fire).total_seconds()
-                if not (0 <= diff <= 120):
-                    continue
-                if last_run >= prev_fire.timestamp():
-                    # Already triggered for this fire boundary; skip even if
-                    # the previous run finished quickly (issue #5 fix).
-                    continue
-                cur = _active_deploys.get(acc_filename)
-                if cur and cur.get("state") not in _TERMINAL_STATES:
-                    continue
-                print(f"[scheduler] 触发 {acc_filename} 的部署", flush=True)
-                cfg["accounts"][acc_filename]["last_run"] = now.timestamp()
+            now = datetime.now()
+            plan = _plan_rotation_batch(cfg, now=now)
+            selected = plan.get("selected") or []
+            if selected:
+                for item in selected:
+                    acc_filename = item["account"]
+                    print(
+                        "[scheduler] 触发 %s 的部署（%s, %.1f 分钟）"
+                        % (
+                            acc_filename,
+                            item.get("next_rotation_reason", "rotation"),
+                            float(item.get("age_min") or 0),
+                        ),
+                        flush=True,
+                    )
+                    cfg["accounts"][acc_filename]["last_run"] = now.timestamp()
                 save_config(cfg)
-                trigger_deploy(acc_filename)
+                for item in selected:
+                    trigger_deploy(item["account"])
         except Exception as e:
             print(f"[scheduler] 错误: {e}", flush=True)
 
@@ -1041,12 +1360,20 @@ def stop_scheduler():
 def get_scheduler_status() -> dict:
     cfg = load_config()
     accounts = cfg.get("accounts", {})
+    plan = _plan_rotation_batch(cfg)
     schedule_info = {}
     now = datetime.now()
 
     for acc_filename, acc_cfg in accounts.items():
+        rotation_info = (plan.get("accounts") or {}).get(acc_filename, {})
         if not acc_cfg.get("enabled", False):
-            schedule_info[acc_filename] = {"enabled": False}
+            schedule_info[acc_filename] = {
+                "enabled": False,
+                "age_s": 0,
+                "age_min": 0,
+                "next_rotation_reason": "disabled",
+                "skip_reason": "disabled",
+            }
             continue
         cron_expr = acc_cfg.get("cron", "0 3 * * *")
         last_run = acc_cfg.get("last_run", 0)
@@ -1057,6 +1384,7 @@ def get_scheduler_status() -> dict:
             schedule_info[acc_filename] = {
                 "enabled": True, "cron": cron_expr,
                 "error": "Cron 表达式格式错误",
+                **rotation_info,
             }
             continue
         schedule_info[acc_filename] = {
@@ -1067,9 +1395,13 @@ def get_scheduler_status() -> dict:
                 if last_run else "从未运行"
             ),
             "next_run": next_run.strftime("%Y-%m-%d %H:%M"),
+            **rotation_info,
         }
 
     return {
         "scheduler_running": _scheduler_running,
+        "policy": plan.get("policy", {}),
+        "counts": plan.get("counts", {}),
+        "selected": plan.get("selected", []),
         "accounts": schedule_info,
     }

@@ -27,17 +27,36 @@
 - `auto_deploy` 在 `safe_to_destroy=False` 时将本次部署标记为 `skipped` 并直接退出，不进入 Step 0 销毁旧 Claw。
 - `skipped` 已加入部署终态，避免安全跳过后调度器/UI 误判为仍在运行。
 
+## 全量 Active Claw 自适应轮换
+
+- 所有 readiness 通过且健康的 backend 保持 `active/selectable`，由 Router 继续按 EWMA latency、in-flight、weight 与失败率惩罚做负载均衡，不再因为存在多个 peer 就主动放入 standby。
+- `claw.auto_deploy` 新增全局 coordinator，每分钟按 enabled 账号数、active 可接管账号数、部署中账号数和账号 age 统一选择轮换批次。
+- 轮换阈值为 40/50/55 分钟：40 分钟进入候选，50 分钟进入紧急优先级，55 分钟标记 hard expiry；容量不足时告警/跳过而不是制造 `no backend`。
+- 当前 6 个账号时，正常下限为 5 个 active，紧急下限为 4 个 active；正常最多轮换 1 个，多个账号超过 50 分钟时最多并发轮换 2 个。
+- 3 个账号时允许轮换 1 个，但必须剩余 2 个可接管；9 个账号时正常下限 8，紧急下限 6。
+- 手动触发和 scheduler 触发都先经过 coordinator 容量门；真正销毁旧 Claw 前仍由 `prepare_account_deploy()` 做最后的 gateway 安全确认。
+- `/api/auto-deploy/status` 与面板展示新增 active 数、enabled 数、deploying 数、normal/emergency min active、每账号 age、轮换原因与 `skipped_capacity`/`skipped_unmatched`/`queued` 等可见状态。
+
 ## 执行命令
 
 ```powershell
 python -m pytest tests/test_lifecycle_rotation.py -q
 python -m pytest tests/test_auto_deploy_safety.py -q
+python -m pytest tests/test_auto_deploy_safety.py tests/test_lifecycle_rotation.py tests/test_routing.py -q
 python -m pytest tests/ -q
 git diff --check
+```
+
+最新结果：
+
+```text
+57 passed in 1.02s
+261 passed, 4 warnings in 4.36s
+git diff --check 通过，仅有 Windows LF/CRLF 提示
 ```
 
 ## 风险与后续
 
 - 单账号、单 Claw 无法做到无感续命：如果上游不允许在同账号旧 Claw 存活时创建新 Claw，代码只能选择保留旧 Claw并跳过危险销毁，不能凭空产生接管容量。
-- 要彻底避免 `no backend mimo-v2.5-pro`，生产上至少需要两个可用账号/后端同时覆盖 `mimo-v2.5-pro`，让自动部署能先 drain 再销毁。
+- 要彻底避免 `no backend mimo-v2.5-pro`，生产上至少需要多个可用账号/后端同时覆盖 `mimo-v2.5-pro`；当前 6 账号目标状态是 6 个 healthy active，正常轮换期间通常保持 5 个可接管。
 - FastAPI `on_event` 弃用警告不是本次缺陷路径，后续可单独迁移到 lifespan。
