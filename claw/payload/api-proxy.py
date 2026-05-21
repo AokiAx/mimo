@@ -39,42 +39,72 @@ def log(msg: str):
 
 # ────────────── env bootstrap ──────────────
 
-def _bootstrap_env():
-    if os.environ.get("MIMO_API_KEY"):
-        return
+def _resolve_mimo_config() -> tuple:
+    """按优先级获取 MIMO_API_KEY 和 MIMO_API_ENDPOINT：
+    1. 从 OpenClaw Gateway 进程的 /proc/pid/environ 读取
+    2. 当前进程环境变量（手动 export 或 systemd 注入）
+    """
+    key = ""
+    ep = ""
+    source = ""
+
+    # --- 1. 从 Gateway 进程读取 ---
     try:
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit() or pid == str(os.getpid()):
-                continue
-            try:
-                with open(f"/proc/{pid}/environ", "rb") as f:
-                    env = dict(
-                        kv.split(b"=", 1)
-                        for kv in f.read().split(b"\x00")
-                        if b"=" in kv
-                    )
-                if b"MIMO_API_KEY" in env and env[b"MIMO_API_KEY"]:
-                    os.environ["MIMO_API_KEY"] = env[b"MIMO_API_KEY"].decode()
-                    if b"MIMO_API_ENDPOINT" in env and not os.environ.get("MIMO_API_ENDPOINT"):
-                        os.environ["MIMO_API_ENDPOINT"] = env[b"MIMO_API_ENDPOINT"].decode()
-                    log(f"bootstrapped env from /proc/{pid}")
-                    return
-            except OSError:
-                continue
+        import subprocess
+        gw_pid = subprocess.check_output(
+            ["pgrep", "-f", "openclaw-gateway"], text=True
+        ).strip().split("\n")[0]
+        if gw_pid:
+            with open(f"/proc/{gw_pid}/environ", "rb") as f:
+                env = dict(
+                    kv.split(b"=", 1)
+                    for kv in f.read().split(b"\x00")
+                    if b"=" in kv
+                )
+            key = key or env.get(b"MIMO_API_KEY", b"").decode()
+            ep = ep or env.get(b"MIMO_API_ENDPOINT", b"").decode()
+            if key or ep:
+                source = f"/proc/{gw_pid}/environ (Gateway)"
+                if key and ep:
+                    log(f"Config source: {source}")
+                    return key, ep
     except Exception:
         pass
-    log("WARNING: MIMO_API_KEY not found")
+
+    # --- 2. 环境变量 ---
+    env_used = False
+    env_key = os.environ.get("MIMO_API_KEY", "")
+    env_ep = os.environ.get("MIMO_API_ENDPOINT", "")
+    if not key and env_key:
+        key = env_key
+        env_used = True
+    if not ep and env_ep:
+        ep = env_ep
+        env_used = True
+
+    if source and env_used:
+        log(f"Config source: {source} + environment variables")
+    elif source:
+        log(f"Config source: {source}")
+    elif env_used:
+        log("Config source: environment variables")
+
+    return key, ep
 
 
-_bootstrap_env()
+API_KEY, _raw_ep = _resolve_mimo_config()
 
 # ────────────── 解析后端 ──────────────
 
-_raw_ep = os.environ.get("MIMO_API_ENDPOINT", "https://api-sgp-oc.xiaomimimo.com")
+if not _raw_ep:
+    _raw_ep = "https://api-sgp-oc.xiaomimimo.com"
+
 _parsed = urlparse(_raw_ep)
 # 只取 scheme + host，不带 path（客户端请求自带完整路径）
 API_BASE = f"{_parsed.scheme}://{_parsed.netloc}"
-API_KEY = os.environ.get("MIMO_API_KEY", "")
+
+if not API_KEY:
+    log("WARNING: MIMO_API_KEY not found anywhere, backend requests will fail")
 
 log(f"Backend: {API_BASE}")
 
@@ -97,7 +127,8 @@ async def _init_session():
         ttl_dns_cache=DNS_CACHE_TTL,
         ssl=_ssl_ctx,
         enable_cleanup_closed=True,
-        force_close=False,       # 保持 keep-alive
+        force_close=False,
+        keepalive_timeout=30,
     )
     _session = aiohttp.ClientSession(
         connector=_connector,
@@ -152,6 +183,8 @@ _CORS_HEADERS = {
 # ────────────── 认证 ──────────────
 
 def _check_auth(request: web.Request) -> bool:
+    if not AUTH_TOKEN:
+        return False
     auth = request.headers.get("Authorization", "")
     x_key = request.headers.get("X-Api-Key", "")
     return (
@@ -163,7 +196,6 @@ def _check_auth(request: web.Request) -> bool:
 # ────────────── 路由处理 ──────────────
 
 async def handle_health(request: web.Request):
-    global _req_count
     stats = {
         "status": "running",
         "uptime": int(time.time() - START_TIME),
@@ -215,9 +247,12 @@ async def handle_proxy(request: web.Request):
     path = request.path
     if path == "/v1/messages":
         path = "/anthropic/v1/messages"
-    
+
     # 路径：保留客户端原始路径 + query string（aiohttp 的 path_qs）
-    backend_url = f"{API_BASE}{path}?{request.query_string}" if request.query_string else f"{API_BASE}{path}"
+    if request.query_string:
+        backend_url = f"{API_BASE}{path}?{request.query_string}"
+    else:
+        backend_url = f"{API_BASE}{path}"
 
     t0 = time.monotonic()
     try:
@@ -229,6 +264,14 @@ async def handle_proxy(request: web.Request):
             ct = resp.headers.get("Content-Type", "")
             is_stream = "text/event-stream" in ct.lower()
 
+            # 透传后端的非标准 headers
+            passthrough = {}
+            for key in ("X-Request-Id", "X-RateLimit-Limit", "X-RateLimit-Remaining",
+                        "X-RateLimit-Reset", "Retry-After"):
+                val = resp.headers.get(key)
+                if val:
+                    passthrough[key] = val
+
             if is_stream:
                 # ─── SSE 流式转发 ───
                 response = web.StreamResponse(
@@ -237,20 +280,28 @@ async def handle_proxy(request: web.Request):
                         "Content-Type": ct,
                         "Access-Control-Allow-Origin": "*",
                         "Cache-Control": "no-cache",
+                        **passthrough,
                     },
                 )
                 await response.prepare(request)
 
                 deadline = time.monotonic() + STREAM_MAX_SECONDS
                 total_bytes = 0
+                timed_out = False
                 async for chunk in resp.content.iter_any():
                     if time.monotonic() > deadline:
+                        timed_out = True
                         break
                     total_bytes += len(chunk)
                     await response.write(chunk)
 
+                if timed_out:
+                    # 通知客户端流被超时截断
+                    await response.write(b'data: {"error":{"message":"Stream timeout","type":"proxy_error"}}\n\n')
+
                 latency_ms = (time.monotonic() - t0) * 1000
-                log(f"SSE {request.path} → {resp.status} {total_bytes}B ({latency_ms:.0f}ms)")
+                log(f"SSE {request.path} → {resp.status} {total_bytes}B"
+                    f"{' (timeout)' if timed_out else ''} ({latency_ms:.0f}ms)")
                 await response.write_eof()
                 return response
 
@@ -264,7 +315,7 @@ async def handle_proxy(request: web.Request):
                     status=resp.status,
                     body=resp_body,
                     content_type=ct,
-                    headers={"Access-Control-Allow-Origin": "*"},
+                    headers={"Access-Control-Allow-Origin": "*", **passthrough},
                 )
 
     except asyncio.TimeoutError:
