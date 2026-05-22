@@ -509,7 +509,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         self,
         body: bytes,
         *,
-        conversation_key: str | list[str],
+        conversation_key: str,
     ) -> list[InternalEvent]:
         """Parse a non-stream OpenAI Chat completion JSON into IES events.
 
@@ -545,7 +545,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
             events.append(ReasoningDelta(text=reasoning))
 
         tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
-        _remember_reasoning_scopes(reasoning, tool_call_ids, conversation_key)
+        _remember_reasoning_scope(reasoning, tool_call_ids, conversation_key)
 
         text = msg.get("content")
         if isinstance(text, str) and text:
@@ -581,7 +581,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         self,
         raw: AsyncIterator[bytes],
         *,
-        conversation_key: str | list[str],
+        conversation_key: str,
     ) -> AsyncIterator[InternalEvent]:
         """Parse OpenAI Chat SSE bytes into IES events.
 
@@ -668,7 +668,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     # still cache something useful even if the stream gets
                     # cut short before MessageEnd.
                     if reasoning_parts:
-                        _remember_reasoning_scopes(
+                        _remember_reasoning_scope(
                             "".join(reasoning_parts),
                             tool_id_by_idx.values(),
                             conversation_key,
@@ -697,7 +697,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         for ies_idx in sorted(tool_idx_map.values()):
             yield ContentBlockEnd(index=ies_idx)
 
-        _remember_reasoning_scopes(
+        _remember_reasoning_scope(
             "".join(reasoning_parts),
             tool_id_by_idx.values(),
             conversation_key,
@@ -906,15 +906,13 @@ def _gen_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
 
-def _remember_reasoning_scopes(
+def _remember_reasoning_scope(
     reasoning: str | None,
     tool_call_ids: Any,
-    conversation_key: str | list[str],
+    conversation_key: str,
 ) -> None:
     ids = list(tool_call_ids)
-    keys = conversation_key if isinstance(conversation_key, list) else [conversation_key]
-    for key in keys:
-        remember_reasoning(reasoning, ids, conversation_key=key)
+    remember_reasoning(reasoning, ids, conversation_key=conversation_key)
 
 
 def _parse_upstream_usage(u_dict: Any) -> Usage:

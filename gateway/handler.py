@@ -175,15 +175,7 @@ class GatewayHandler:
             tool_choice=req.tool_choice,
             thinking=req.metadata.get("thinking") if req.metadata else None,
         )
-        fallback_conversation_key = _conversation_key_for_request(
-            req.messages,
-            tools=req.tools,
-            tool_choice=req.tool_choice,
-            thinking=None,
-        )
-        conversation_key: str | list[str] = scoped_conversation_key
-        if fallback_conversation_key != scoped_conversation_key:
-            conversation_key = [scoped_conversation_key, fallback_conversation_key]
+        conversation_key = scoped_conversation_key
 
         if req.stream:
             return await self._handle_stream_with_retries(

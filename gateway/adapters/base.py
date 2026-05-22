@@ -67,12 +67,12 @@ class UpstreamCodec(Protocol):
         self,
         raw: AsyncIterator[bytes],
         *,
-        conversation_key: str | list[str],
+        conversation_key: str,
     ) -> AsyncIterator[InternalEvent]: ...
 
     def parse_upstream_response(
         self,
         body: bytes,
         *,
-        conversation_key: str | list[str],
+        conversation_key: str,
     ) -> list[InternalEvent]: ...

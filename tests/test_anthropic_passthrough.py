@@ -17,6 +17,7 @@ import pytest
 from gateway.anthropic_passthrough import (
     _conversation_key_from_body,
     _conversation_key_from_messages_up_to,
+    normalize_tool_choice,
     patch_request_thinking,
     scan_response_json,
     tee_stream_capture_thinking,
@@ -69,6 +70,18 @@ async def _drain(it: AsyncIterator[bytes]) -> bytes:
 
 
 # ───────── patch_request_thinking ─────────
+
+
+def test_normalize_tool_choice_none_disables_tool_surface():
+    body = {
+        "tool_choice": "none",
+        "tools": [{"name": "search", "input_schema": {"type": "object"}}],
+    }
+
+    normalize_tool_choice(body)
+
+    assert "tool_choice" not in body
+    assert "tools" not in body
 
 
 def test_patch_rehydrates_when_cache_has_matching_ids():

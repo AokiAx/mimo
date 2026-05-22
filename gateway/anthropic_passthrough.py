@@ -38,17 +38,21 @@ from gateway.reasoning_cache import (
 def normalize_tool_choice(body: dict[str, Any]) -> None:
     """Normalize common non-Anthropic tool_choice shorthands in place.
 
-    OpenAI-style ``"auto"`` / ``"required"`` / ``"none"`` are mapped to
-    their Anthropic equivalents so upstream doesn't reject with 400.
+    OpenAI-style ``"auto"`` / ``"required"`` are mapped to their Anthropic
+    equivalents so upstream doesn't reject with 400. ``"none"`` disables the
+    tool surface rather than allowing automatic tool calls.
     """
     tc = body.get("tool_choice")
     if tc is None:
         return
     if isinstance(tc, str):
+        if tc.lower() == "none":
+            body.pop("tool_choice", None)
+            body.pop("tools", None)
+            return
         mapping = {
             "auto": {"type": "auto"},
             "required": {"type": "any"},
-            "none": {"type": "auto"},
         }
         normalized = mapping.get(tc.lower())
         if normalized:
