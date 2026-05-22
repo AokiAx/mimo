@@ -520,7 +520,10 @@ def _step7_ssh_opts(known_hosts_file: str = "/dev/null") -> str:
 
 def _classify_step7_error(message: str) -> str:
     msg = message or ""
-    if "Identity file" in msg and "not accessible" in msg:
+    if (
+        "bootstrap identity missing or unreadable" in msg
+        or ("Identity file" in msg and "not accessible" in msg)
+    ):
         return "fatal_missing_identity"
     if "missing payload:" in msg:
         return "fatal_missing_payload"
@@ -689,40 +692,45 @@ async def _probe_api_endpoint(host: str, port: int, timeout_s: float = 5.0) -> t
     }
     payload = shlex.quote(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
     auth = shlex.quote(f"Authorization: Bearer {_PROXY_AUTH_TOKEN}")
-    cmd = (
-        f"curl -sS -m {int(timeout_s)} "
-        f"-H {auth} -H 'Content-Type: application/json' "
-        f"-o /tmp/mimo-deploy-chat-probe.json "
-        f"-w '%{{http_code}}' "
-        f"--data-binary {payload} "
-        f"http://127.0.0.1:{port}/v1/chat/completions"
-    )
-    stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=int(timeout_s) + 15)
-    code = stdout.strip()
-    if rc != 0:
-        return False, f"chat probe curl rc={rc}: {(stderr or code)[:200]}"
-    if not code.isdigit() or int(code) != 200:
-        detail_cmd = "tail -c 500 /tmp/mimo-deploy-chat-probe.json 2>/dev/null || true"
-        detail, _, _ = await _ssh_jump_async(detail_cmd, timeout=10)
-        return False, f"chat probe HTTP {code or 'no response'}: {detail[:300]}"
+    probe_file = f"/tmp/mimo-deploy-chat-probe-{port}-{uuid.uuid4().hex}.json"
+    probe_file_q = shlex.quote(probe_file)
+    try:
+        cmd = (
+            f"curl -sS -m {int(timeout_s)} "
+            f"-H {auth} -H 'Content-Type: application/json' "
+            f"-o {probe_file_q} "
+            f"-w '%{{http_code}}' "
+            f"--data-binary {payload} "
+            f"http://127.0.0.1:{port}/v1/chat/completions"
+        )
+        stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=int(timeout_s) + 15)
+        code = stdout.strip()
+        if rc != 0:
+            return False, f"chat probe curl rc={rc}: {(stderr or code)[:200]}"
+        if not code.isdigit() or int(code) != 200:
+            detail_cmd = f"tail -c 500 {probe_file_q} 2>/dev/null || true"
+            detail, _, _ = await _ssh_jump_async(detail_cmd, timeout=10)
+            return False, f"chat probe HTTP {code or 'no response'}: {detail[:300]}"
 
-    validate_py = (
-        "import json;"
-        "p='/tmp/mimo-deploy-chat-probe.json';"
-        "data=json.load(open(p,encoding='utf-8'));"
-        "choices=data.get('choices') or [];"
-        "msg=(choices[0].get('message') or {}) if choices else {};"
-        "content=msg.get('content') or '';"
-        "usage=data.get('usage') or {};"
-        "print(('OK content=%r usage=%s' % (content[:80], usage)) "
-        "if choices and isinstance(content,str) and content.strip() "
-        "else 'BAD response has no assistant content')"
-    )
-    validate_cmd = f"python3 -c {shlex.quote(validate_py)}"
-    detail, stderr, rc = await _ssh_jump_async(validate_cmd, timeout=15)
-    if rc == 0 and detail.startswith("OK "):
-        return True, f"chat probe HTTP 200 {_PROBE_API_CHAT_MODEL}: {detail.strip()[:180]}"
-    return False, f"chat probe invalid response: {(detail or stderr)[:200]}"
+        validate_py = (
+            "import json;"
+            f"p={json.dumps(probe_file)};"
+            "data=json.load(open(p,encoding='utf-8'));"
+            "choices=data.get('choices') or [];"
+            "msg=(choices[0].get('message') or {}) if choices else {};"
+            "content=msg.get('content') or '';"
+            "usage=data.get('usage') or {};"
+            "print(('OK content=%r usage=%s' % (content[:80], usage)) "
+            "if choices and isinstance(content,str) and content.strip() "
+            "else 'BAD response has no assistant content')"
+        )
+        validate_cmd = f"python3 -c {shlex.quote(validate_py)}"
+        detail, stderr, rc = await _ssh_jump_async(validate_cmd, timeout=15)
+        if rc == 0 and detail.startswith("OK "):
+            return True, f"chat probe HTTP 200 {_PROBE_API_CHAT_MODEL}: {detail.strip()[:180]}"
+        return False, f"chat probe invalid response: {(detail or stderr)[:200]}"
+    finally:
+        await _ssh_jump_async(f"rm -f {probe_file_q}", timeout=10)
 
 
 # ─── Core deploy flow ───
