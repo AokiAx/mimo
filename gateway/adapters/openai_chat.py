@@ -129,18 +129,37 @@ def _conversation_key_for_request(
     For OpenAI Chat there's no separate ``system`` field — system goes
     in ``messages[0]``, so it's already covered.
     """
-    msg_blob = b"[" + b",".join(_canonical_message_bytes(m) for m in messages) + b"]"
+    return _conversation_key_from_scope_blob(_request_scope_blob(
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        thinking=thinking,
+    ))
+
+
+def _request_scope_blob(
+    messages: list[InternalMessage],
+    *,
+    tools: list[InternalTool] | None = None,
+    tool_choice: Any = None,
+    thinking: Any = None,
+) -> bytes:
     tools_canonical = None
     if tools:
         tools_canonical = sorted(
             [{"n": t.name, "d": t.description, "p": t.input_schema} for t in tools],
             key=lambda d: d["n"],
         )
+    msg_blob = b"[" + b",".join(_canonical_message_bytes(m) for m in messages) + b"]"
     extra = json.dumps(
         {"tools": tools_canonical, "tool_choice": tool_choice, "thinking": thinking},
         sort_keys=True, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
-    return derive_conversation_key(msg_blob + b"|" + extra)
+    return msg_blob + b"|" + extra
+
+
+def _conversation_key_from_scope_blob(scope_blob: bytes) -> str:
+    return derive_conversation_key(scope_blob)
 
 
 # ────────────── SSE utility ──────────────
@@ -318,17 +337,22 @@ class OpenAIChatAdapter(ProtocolAdapter):
         # We compute incrementally so we don't re-canonicalize the prefix
         # every time, but the extras tail (tools/tool_choice/thinking)
         # is appended each turn so it stays part of the scope.
+        thinking = req.metadata.get("thinking") if req.metadata else None
         tools_canonical = None
         if req.tools:
             tools_canonical = sorted(
                 [{"n": t.name, "d": t.description, "p": t.input_schema} for t in req.tools],
                 key=lambda d: d["n"],
             )
-        thinking = req.metadata.get("thinking") if req.metadata else None
-        extras_blob = b"|" + json.dumps(
+        scoped_extra = json.dumps(
             {"tools": tools_canonical, "tool_choice": req.tool_choice, "thinking": thinking},
             sort_keys=True, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
+        fallback_extra = json.dumps(
+            {"tools": tools_canonical, "tool_choice": req.tool_choice, "thinking": None},
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        allow_fallback_lookup = not isinstance(thinking, dict)
 
         prefix_blob = b"["
         first = True
@@ -339,8 +363,12 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 # it was *before* the model produced this turn — i.e., all
                 # messages that came before, plus the request's tool surface
                 # (which shapes which reasoning the model emitted).
-                conv_key = derive_conversation_key(prefix_blob + b"]" + extras_blob)
-                serialized.append(self._serialize_message(m, conversation_key=conv_key))
+                conv_key = derive_conversation_key(prefix_blob + b"]|" + scoped_extra)
+                fallback_conv_key = derive_conversation_key(prefix_blob + b"]|" + fallback_extra)
+                keys = [conv_key]
+                if allow_fallback_lookup and fallback_conv_key != conv_key:
+                    keys.append(fallback_conv_key)
+                serialized.append(self._serialize_message(m, conversation_keys=keys))
             else:
                 serialized.append(self._serialize_message(m, conversation_key=None))
             piece = _canonical_message_bytes(m)
@@ -392,6 +420,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         m: InternalMessage,
         *,
         conversation_key: str | None = None,
+        conversation_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         """Serialize one IES message into MiMo's upstream chat shape.
 
@@ -417,17 +446,22 @@ class OpenAIChatAdapter(ProtocolAdapter):
             }
             if m.reasoning_content is not None:
                 out["reasoning_content"] = m.reasoning_content
-            elif tool_uses and conversation_key is not None:
+            elif tool_uses and (conversation_keys or conversation_key is not None):
                 # MiMo requires reasoning_content to be present in later
                 # thinking-mode tool-call turns. Rehydrate from the cache —
                 # scoped to *this* conversation only so a different
                 # conversation that happens to reuse the same tool id (or a
                 # forged id from a malicious request) can't read this
                 # conversation's reasoning.
-                cached_reasoning = lookup_reasoning(
-                    (t.tool_id for t in tool_uses),
-                    conversation_key=conversation_key,
-                )
+                keys = conversation_keys or [conversation_key or ""]
+                cached_reasoning = None
+                for key in keys:
+                    cached_reasoning = lookup_reasoning(
+                        (t.tool_id for t in tool_uses),
+                        conversation_key=key,
+                    )
+                    if cached_reasoning:
+                        break
                 if cached_reasoning:
                     out["reasoning_content"] = cached_reasoning
             if tool_uses:
@@ -511,7 +545,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
             events.append(ReasoningDelta(text=reasoning))
 
         tool_call_ids = [tc.get("id", "") for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
-        remember_reasoning(reasoning, tool_call_ids, conversation_key=conversation_key)
+        _remember_reasoning_scope(reasoning, tool_call_ids, conversation_key)
 
         text = msg.get("content")
         if isinstance(text, str) and text:
@@ -634,10 +668,10 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     # still cache something useful even if the stream gets
                     # cut short before MessageEnd.
                     if reasoning_parts:
-                        remember_reasoning(
+                        _remember_reasoning_scope(
                             "".join(reasoning_parts),
                             tool_id_by_idx.values(),
-                            conversation_key=conversation_key,
+                            conversation_key,
                         )
                 ies_idx = tool_idx_map[oai_idx]
                 fn = tc.get("function", {}) or {}
@@ -663,10 +697,10 @@ class OpenAIChatAdapter(ProtocolAdapter):
         for ies_idx in sorted(tool_idx_map.values()):
             yield ContentBlockEnd(index=ies_idx)
 
-        remember_reasoning(
+        _remember_reasoning_scope(
             "".join(reasoning_parts),
             tool_id_by_idx.values(),
-            conversation_key=conversation_key,
+            conversation_key,
         )
 
         yield MessageEnd(finish_reason=_map_finish(finish_reason), usage=usage)
@@ -870,6 +904,15 @@ _CONSUMED_KEYS = frozenset({
 
 def _gen_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+
+def _remember_reasoning_scope(
+    reasoning: str | None,
+    tool_call_ids: Any,
+    conversation_key: str,
+) -> None:
+    ids = list(tool_call_ids)
+    remember_reasoning(reasoning, ids, conversation_key=conversation_key)
 
 
 def _parse_upstream_usage(u_dict: Any) -> Usage:

@@ -213,7 +213,7 @@ def test_backend_routing_score_unobserved_uses_conservative_latency():
     """Fresh active backends should not look faster than warmed peers."""
     b = _backend()
     assert b.ewma_latency_ms == 0.0
-    assert b.routing_score() == pytest.approx(250.0)
+    assert b.routing_score() == pytest.approx(100.0)
 
 
 # ───────── Router score-based selection ─────────

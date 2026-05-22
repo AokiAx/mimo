@@ -10,9 +10,9 @@ the handler:
   4. Hands the upstream response back to the client adapter for
      serialization (streaming or non-streaming, as the request asked).
 
-The handler also drives load-balancer state on the Backend object: it
-inc/decs ``in_flight`` around the upstream call and records latency
-into the EWMA so subsequent routing decisions see real numbers.
+The handler only tracks per-request ``in_flight`` and metrics. Backend
+health, breaker state, and routing latency are owned by the runtime's active
+chat probes/readiness checks, not by user traffic.
 
 The handler owns the upstream lifecycle: the streaming AsyncIterator it
 returns transitively closes the httpx response when fully drained.
@@ -35,6 +35,7 @@ from typing import Any, Protocol
 
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
+    normalize_tool_choice,
     patch_request_thinking,
     scan_response_json,
     tee_stream_capture_thinking,
@@ -45,6 +46,7 @@ from gateway.core import (
     BadRequestError,
     GatewayError,
     InternalEvent,
+    InternalRequest,
     ModelNotFoundError,
     RequestContext,
     UpstreamError,
@@ -167,12 +169,13 @@ class GatewayHandler:
         # attacker who guesses a tool_id can't pull another conversation's
         # reasoning out of the cache.
         from gateway.adapters.openai_chat import _conversation_key_for_request
-        conversation_key = _conversation_key_for_request(
+        scoped_conversation_key = _conversation_key_for_request(
             req.messages,
             tools=req.tools,
             tool_choice=req.tool_choice,
             thinking=req.metadata.get("thinking") if req.metadata else None,
         )
+        conversation_key = scoped_conversation_key
 
         if req.stream:
             return await self._handle_stream_with_retries(
@@ -230,6 +233,7 @@ class GatewayHandler:
         # patch_request_thinking computes its own per-assistant-message
         # prefix hashes internally — it walks ``body["messages"]`` and
         # scopes each lookup to the prefix up to that turn.
+        normalize_tool_choice(body)
         patch_request_thinking(body)
 
         # Response-side capture uses one key derived from the full body we
@@ -272,7 +276,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -305,7 +309,7 @@ class GatewayHandler:
     async def _handle_anthropic_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -316,13 +320,11 @@ class GatewayHandler:
                     headers=headers, timeout_s=self._upstream_timeout_s,
                 )
             except GatewayError as e:
-                backend.record_failure(f"{e.error_code}: {e.message}")
                 self._record_metric(ctx, backend.backend_id, 0,
                                     (time.monotonic() - started) * 1000,
                                     error=e.message)
                 raise
             except Exception as e:
-                backend.record_failure(f"transport: {type(e).__name__}: {e}")
                 self._record_metric(ctx, backend.backend_id, 0,
                                     (time.monotonic() - started) * 1000,
                                     error=str(e))
@@ -331,8 +333,6 @@ class GatewayHandler:
             ctx.upstream_status = status
 
             if status >= 400:
-                if status >= 500:
-                    backend.record_failure(f"upstream http {status}")
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
@@ -342,8 +342,6 @@ class GatewayHandler:
                 )
 
             latency_ms = (time.monotonic() - started) * 1000
-            backend.record_success()
-            backend.record_latency(latency_ms)
 
             # Harvest thinking before returning bytes to client.
             scan_response_json(raw, conversation_key=conversation_key)
@@ -361,7 +359,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         model: str, upstream_body: dict[str, Any],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -394,7 +392,7 @@ class GatewayHandler:
     async def _handle_anthropic_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body: dict[str, Any], headers: dict[str, str],
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -404,14 +402,12 @@ class GatewayHandler:
                 headers=headers, timeout_s=self._upstream_timeout_s,
             )
         except GatewayError as e:
-            backend.record_failure(f"{e.error_code}: {e.message}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, 0,
                                 (time.monotonic() - started) * 1000,
                                 error=e.message)
             raise
         except Exception as e:
-            backend.record_failure(f"transport: {type(e).__name__}: {e}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, 0,
                                 (time.monotonic() - started) * 1000,
@@ -425,8 +421,6 @@ class GatewayHandler:
                     pass
             except Exception:
                 pass
-            if status >= 500:
-                backend.record_failure(f"upstream http {status}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
@@ -456,13 +450,9 @@ class GatewayHandler:
                 completed = True
             except Exception as e:
                 error = f"stream: {type(e).__name__}: {e}"
-                backend.record_failure(error)
                 raise
             finally:
                 latency_ms = (time.monotonic() - started) * 1000
-                if completed:
-                    backend.record_success()
-                    backend.record_latency(latency_ms)
                 backend.dec_in_flight()
                 if recorder is not None:
                     try:
@@ -513,7 +503,7 @@ class GatewayHandler:
 
     async def _handle_non_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
@@ -551,7 +541,7 @@ class GatewayHandler:
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -562,13 +552,11 @@ class GatewayHandler:
                     headers=headers, timeout_s=self._upstream_timeout_s,
                 )
             except GatewayError as e:
-                backend.record_failure(f"{e.error_code}: {e.message}")
                 self._record_metric(ctx, backend.backend_id, 0,
                                     (time.monotonic() - started) * 1000,
                                     error=e.message)
                 raise
             except Exception as e:
-                backend.record_failure(f"transport: {type(e).__name__}: {e}")
                 self._record_metric(ctx, backend.backend_id, 0,
                                     (time.monotonic() - started) * 1000,
                                     error=str(e))
@@ -580,8 +568,6 @@ class GatewayHandler:
                 # 4xx normally means the request payload/auth was rejected by
                 # upstream. Do not poison backend health or rotate traffic across
                 # otherwise healthy nodes for client/gateway request-shape bugs.
-                if status >= 500:
-                    backend.record_failure(f"upstream http {status}")
                 self._record_metric(ctx, backend.backend_id, status,
                                     (time.monotonic() - started) * 1000,
                                     error=f"http {status}")
@@ -591,8 +577,6 @@ class GatewayHandler:
                 )
 
             latency_ms = (time.monotonic() - started) * 1000
-            backend.record_success()
-            backend.record_latency(latency_ms)
 
             try:
                 events = self._codec.parse_upstream_response(
@@ -616,7 +600,7 @@ class GatewayHandler:
 
     async def _handle_stream_with_retries(
         self, ctx: RequestContext, adapter: ProtocolAdapter, model: str, upstream_body,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         """Stream with retry on pre-stream failures.
 
@@ -660,7 +644,7 @@ class GatewayHandler:
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
         backend, upstream_body, headers,
-        *, conversation_key: str,
+        *, conversation_key: str | list[str],
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         backend.inc_in_flight()
         started = time.monotonic()
@@ -670,14 +654,12 @@ class GatewayHandler:
                 headers=headers, timeout_s=self._upstream_timeout_s,
             )
         except GatewayError as e:
-            backend.record_failure(f"{e.error_code}: {e.message}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, 0,
                                 (time.monotonic() - started) * 1000,
                                 error=e.message)
             raise
         except Exception as e:
-            backend.record_failure(f"transport: {type(e).__name__}: {e}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, 0,
                                 (time.monotonic() - started) * 1000,
@@ -691,8 +673,6 @@ class GatewayHandler:
                     pass
             except Exception:
                 pass
-            if status >= 500:
-                backend.record_failure(f"upstream http {status}")
             backend.dec_in_flight()
             self._record_metric(ctx, backend.backend_id, status,
                                 (time.monotonic() - started) * 1000,
@@ -737,13 +717,9 @@ class GatewayHandler:
                 completed = True
             except Exception as e:
                 error = f"stream: {type(e).__name__}: {e}"
-                backend.record_failure(error)
                 raise
             finally:
                 latency_ms = (time.monotonic() - started) * 1000
-                if completed:
-                    backend.record_success()
-                    backend.record_latency(latency_ms)
                 backend.dec_in_flight()
                 if recorder is not None:
                     try:

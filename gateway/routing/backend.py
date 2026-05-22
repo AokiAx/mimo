@@ -57,6 +57,7 @@ class Backend:
     # Detection zone — fast-probe quarantine for flaky backends
     in_detection: bool = False
     detection_entered_at: float = 0.0
+    probe_consecutive_failures: int = 0
 
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
@@ -150,6 +151,7 @@ class Backend:
         self.in_detection = False
         self.detection_entered_at = 0.0
         self.consecutive_failures = 0
+        self.probe_consecutive_failures = 0
 
     # ───── health helpers ─────
 
@@ -159,6 +161,7 @@ class Backend:
         self.last_probe_at = n
         self.last_success_at = n
         self.consecutive_failures = 0
+        self.probe_consecutive_failures = 0
         self.last_error = ""
         self.reset_breaker()
 
@@ -182,10 +185,30 @@ class Backend:
         else:
             self.health = "degraded"
 
+    def record_probe_failure(
+        self,
+        error: str,
+        *,
+        now: float | None = None,
+        cooldown_s: float = 30.0,
+        threshold: int = 3,
+    ) -> None:
+        """Record a liveness/readiness probe failure separately from traffic."""
+        self.probe_consecutive_failures += 1
+        self.record_failure(
+            error,
+            now=now,
+            cooldown_s=cooldown_s,
+            threshold=threshold,
+        )
+
     def is_selectable(self, now: float | None = None) -> bool:
         if not self.enabled:
             return False
-        if self.lifecycle != "active":
+        if self.lifecycle == "warming":
+            if self.readiness_successes <= 0:
+                return False
+        elif self.lifecycle != "active":
             return False
         if self.in_detection:
             return False
@@ -221,5 +244,10 @@ class Backend:
         Unobserved latency is deliberately conservative so a newly promoted
         backend does not steal all traffic before readiness probes seed EWMA.
         """
-        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 250.0
-        return base * (1 + self.in_flight) / max(self.weight, 1)
+        base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 100.0
+        samples = self.total_requests + self.total_failures
+        reliability_penalty = 1.0
+        if samples >= 5 and self.total_failures > 0:
+            failure_rate = self.total_failures / max(samples, 1)
+            reliability_penalty += failure_rate * 4.0
+        return base * (1 + self.in_flight) * reliability_penalty / max(self.weight, 1)
