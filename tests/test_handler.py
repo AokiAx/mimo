@@ -126,3 +126,50 @@ def test_non_stream_4xx_does_not_mark_backend_failure(monkeypatch):
     assert backend.total_failures == 0
     assert backend.health == "alive"
     assert metrics.rows[0]["status_code"] == 400
+
+
+def test_user_request_5xx_does_not_mark_backend_failure(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["m"])
+    backend.record_success()
+    before_successes = backend.total_requests
+    transport = FakeTransport({"http://a/v1/chat/completions": (500, b"bad gateway")})
+    metrics = FakeMetrics()
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=transport,
+        metrics=metrics,
+    )
+
+    from gateway.core import UpstreamError
+    with pytest.raises(UpstreamError):
+        asyncio.run(handler.handle(RequestContext(), OpenAIChatAdapter(), _body()))
+
+    assert backend.total_failures == 0
+    assert backend.consecutive_failures == 0
+    assert backend.health == "alive"
+    assert backend.total_requests == before_successes
+    assert metrics.rows[0]["status_code"] == 500
+
+
+def test_user_request_success_does_not_update_backend_rating(monkeypatch):
+    monkeypatch.setattr("gateway.model_groups_store.resolve", lambda model, proto: model)
+    backend = Backend(backend_id="a", base_url="http://a", models=["m"])
+    backend.record_success()
+    backend.ewma_latency_ms = 123.0
+    before_successes = backend.total_requests
+    handler = GatewayHandler(
+        router=Router(BackendRegistry([backend])),
+        transport=FakeTransport({"http://a/v1/chat/completions": (200, _payload())}),
+    )
+
+    content_type, stream, body = asyncio.run(
+        handler.handle(RequestContext(), OpenAIChatAdapter(), _body())
+    )
+
+    assert content_type == "application/json"
+    assert stream is None
+    assert json.loads(body)["choices"][0]["message"]["content"] == "ok"
+    assert backend.health == "alive"
+    assert backend.total_requests == before_successes
+    assert backend.ewma_latency_ms == 123.0

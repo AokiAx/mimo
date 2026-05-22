@@ -111,6 +111,26 @@ class FakeTransport:
         return 200, chunks()
 
 
+def test_probe_one_uses_chat_completion_not_models(monkeypatch):
+    fake = FakeTransport()
+    monkeypatch.setattr(runtime, "_transport", fake)
+    backend = _backend("candidate", lifecycle="active")
+
+    ok, reason = asyncio.run(
+        runtime._run_one_readiness_check(
+            backend,
+            "probe",
+            runtime._readiness_non_stream_body(backend),
+        )
+    )
+
+    assert ok is True
+    assert reason == "ok"
+    assert len(fake.json_bodies) == 1
+    assert fake.json_bodies[0]["messages"][0]["content"] == runtime._READINESS_PROMPT
+    assert fake.json_bodies[0]["stream"] is False
+
+
 def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
     fake = FakeTransport()
     monkeypatch.setattr(runtime, "_transport", fake)
@@ -129,18 +149,18 @@ def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
     assert fake.json_bodies[1]["tool_choice"]["function"]["name"] == "gateway_readiness_ping"
 
 
-def test_tool_readiness_parses_json_instead_of_raw_byte_search():
-    ok, reason = runtime._raw_response_has_tool_call(
+def test_tool_readiness_accepts_structural_json_response():
+    ok, reason = runtime._raw_response_is_valid(
         b'{"choices":[{"message":{"tool_calls":[{"id":"call_1"}]}}]}'
     )
     assert ok is True
     assert reason == "ok"
 
-    ok, reason = runtime._raw_response_has_tool_call(
+    ok, reason = runtime._raw_response_is_valid(
         b'{"choices":[{"message":{"content":"no tool"}}]}'
     )
-    assert ok is False
-    assert reason == "no tool call in response"
+    assert ok is True
+    assert reason == "ok"
 
 
 def test_readiness_without_models_fails_explicitly(monkeypatch):
