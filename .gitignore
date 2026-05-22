@@ -64,3 +64,6 @@ gateway.yaml
 
 # Application log files
 logs/
+verification.md
+.codex/
+deploy_logs/

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -134,6 +135,11 @@ def _notify_gateway_deploy_failed(account_filename: str, api_port: int, error: s
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
 
+# 上游 Claw 连接约 1 小时会被硬断，提前轮换给 5-10 分钟冷启动留余量。
+_ROTATION_TARGET_AGE_S = 40 * 60
+_ROTATION_CRITICAL_AGE_S = 50 * 60
+_ROTATION_HARD_EXPIRY_AGE_S = 55 * 60
+
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
 _DESTROY_POLL_MAX_ITERS = 12  # → up to 60s wait
@@ -146,6 +152,14 @@ _CREATE_429_RETRY_BUDGET_S = 30 * 60        # 总预算 30 分钟
 _CREATE_429_JITTER_MAX_S = 5.0              # 每次重试前 0–5s 随机抖动
 _PROBE_API_INTERVAL_S = 5
 _PROBE_API_MAX_ITERS = 36     # → up to 180s wait (Claw 异步建隧道有时晚到 100s+)
+_PROBE_API_CHAT_MODEL = "mimo-v2.5-pro"
+_PROBE_API_CHAT_TIMEOUT_S = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_TIMEOUT", "240"))
+_PROBE_API_CHAT_MAX_TOKENS = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_MAX_TOKENS", "2048"))
+_PROBE_API_CHAT_THINKING_BUDGET = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_THINKING_BUDGET", "8000"))
+_PROBE_API_CHAT_MAX_ITERS = int(os.environ.get("MIMO_DEPLOY_CHAT_PROBE_MAX_ITERS", "3"))
+_PROXY_AUTH_TOKEN = os.environ.get("MIMO_PROXY_AUTH_TOKEN", "sk-Aoki-MiMo")
+_CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS = 3
+_STEP7_MAX_ATTEMPTS = 3
 
 # In-memory log size cap; on-disk log is rotated past this many bytes.
 _LOG_LINES_MAX = 2000
@@ -328,6 +342,107 @@ def _gc_active_deploys() -> None:
         _active_deploys.pop(acc, None)
 
 
+# ─── Rotation status helpers (read-only) ───
+
+def _rotation_policy(enabled_count: int) -> dict:
+    enabled = max(0, int(enabled_count or 0))
+    if enabled <= 0:
+        return {"desired_active": 0, "normal_min_active": 0, "emergency_min_active": 0}
+    normal_min = min(enabled, max(3, int(math.ceil(enabled * 0.80))))
+    emergency_min = min(enabled, max(3, int(math.floor(enabled * 0.67))))
+    return {
+        "desired_active": enabled,
+        "normal_min_active": normal_min,
+        "emergency_min_active": emergency_min,
+    }
+
+
+def _rotation_reason(age_s: float) -> str:
+    if age_s >= _ROTATION_HARD_EXPIRY_AGE_S:
+        return "hard_expiry_age"
+    if age_s >= _ROTATION_CRITICAL_AGE_S:
+        return "critical_age"
+    if age_s >= _ROTATION_TARGET_AGE_S:
+        return "target_age"
+    return "fresh"
+
+
+def _load_rotation_status(cfg: dict) -> dict:
+    """Compute per-account rotation status from gateway backends (read-only)."""
+    accounts_cfg = cfg.get("accounts", {}) or {}
+    enabled_accounts = [
+        acc for acc, acc_cfg in accounts_cfg.items()
+        if acc_cfg.get("enabled", False)
+    ]
+    enabled_count = len(enabled_accounts)
+    policy = _rotation_policy(enabled_count)
+
+    backends: list[dict] = []
+    try:
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+    except Exception:
+        pass
+
+    def _backend_url_port(backend: dict) -> int | None:
+        m = re.search(r":(\d+)(?:/)?$", str(backend.get("url") or "").rstrip("/"))
+        return int(m.group(1)) if m else None
+
+    def _account_match_keys(filename: str) -> set[str]:
+        raw = (filename or "").strip()
+        keys = {raw} if raw else set()
+        if raw.endswith(".json"):
+            keys.add(raw[:-5])
+        elif raw:
+            keys.add(f"{raw}.json")
+        return keys
+
+    active_selectable = 0
+    account_status: dict[str, dict] = {}
+
+    for account in enabled_accounts:
+        acc_cfg = accounts_cfg.get(account, {})
+        keys = _account_match_keys(account)
+        api_port = acc_cfg.get("api_port")
+        matches = [
+            b for b in backends
+            if (str(b.get("account") or "") in keys)
+            or (api_port is not None and _backend_url_port(b) == api_port)
+        ]
+        selectable = [
+            b for b in matches
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+        ]
+        age_s = max((float(b.get("active_for_s") or 0) for b in selectable), default=0.0)
+        reason = _rotation_reason(age_s)
+        status = {
+            "enabled": True,
+            "api_port": api_port,
+            "active": bool(selectable),
+            "backend_count": len(matches),
+            "selectable_backend_count": len(selectable),
+            "age_s": int(age_s),
+            "age_min": round(age_s / 60.0, 1) if age_s else 0,
+            "next_rotation_reason": reason,
+            "skip_reason": "" if selectable else ("no_selectable_backend" if matches else "skipped_unmatched"),
+        }
+        account_status[account] = status
+        if selectable:
+            active_selectable += 1
+
+    return {
+        "policy": policy,
+        "counts": {
+            "enabled_accounts": enabled_count,
+            "desired_active": policy["desired_active"],
+            "active_selectable": active_selectable,
+            "normal_min_active": policy["normal_min_active"],
+            "emergency_min_active": policy["emergency_min_active"],
+        },
+        "accounts": account_status,
+    }
+
+
 def get_deploy_status(account_filename: str = None) -> dict:
     _gc_active_deploys()
     if account_filename:
@@ -428,11 +543,21 @@ def _load_account_cookies(account_filename: str) -> Optional[list]:
 # ─── SSH key parsing ───
 
 _SSH_KEY_RE = re.compile(r'(ssh-(?:rsa|ed25519|ecdsa)\s+[A-Za-z0-9+/=]+(?:\s+[\w@.\-]+)?)')
+_CLAW_SAFETY_REFUSAL_RE = re.compile(
+    r"(安全策略|安全协议|无法满足|没法满足|不能读取或输出|不能修改|"
+    r"不能代你执行|不能执行|无法自动执行|敏感凭证|安全红线|外部 SSH|"
+    r"反向隧道|authorized_keys)",
+    re.IGNORECASE,
+)
 
 
 def _parse_ssh_key(text: str) -> Optional[str]:
     match = _SSH_KEY_RE.search(text or "")
     return match.group(1).strip() if match else None
+
+
+def _is_claw_safety_refusal(text: str) -> bool:
+    return bool(_CLAW_SAFETY_REFUSAL_RE.search(text or ""))
 
 
 def _check_port_conflict(account_filename: str, api_port: int, ssh_port: int) -> Optional[str]:
@@ -492,14 +617,75 @@ _ECS_FINALIZE_SH = PAYLOAD_DIR / "ecs_finalize.sh"
 _API_PROXY_PY = PAYLOAD_DIR / "api-proxy.py"
 
 
-async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> tuple[bool, str]:
-    """SCP api-proxy.py into the ECS and run ecs_finalize.sh on it via the
-    jump-server-side reverse tunnel. Returns (ok, message)."""
-    ssh_opts = (
-        f"-o StrictHostKeyChecking=no -o ConnectTimeout=15 "
-        f"-o ServerAliveInterval=10 -o BatchMode=yes "
+def _step7_ssh_opts(known_hosts_file: str = "/dev/null") -> str:
+    return (
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile={known_hosts_file} "
+        f"-o ConnectTimeout=15 -o ServerAliveInterval=10 -o BatchMode=yes "
         f"-i {_BOOTSTRAP_PRIVKEY}"
     )
+
+
+def _classify_step7_error(message: str) -> str:
+    msg = message or ""
+    if (
+        "bootstrap identity missing or unreadable" in msg
+        or ("Identity file" in msg and "not accessible" in msg)
+    ):
+        return "fatal_missing_identity"
+    if "missing payload:" in msg:
+        return "fatal_missing_payload"
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in msg:
+        return "known_hosts"
+    if "Permission denied" in msg:
+        return "auth_denied"
+    if (
+        "Connection refused" in msg
+        or "Connection timed out during banner exchange" in msg
+        or "Connection closed" in msg
+        or "SSH timeout" in msg
+        or "local exec timeout" in msg
+    ):
+        return "tunnel_not_ready"
+    if "set: -" in msg and "invalid option" in msg:
+        return "fatal_script_format"
+    return "retryable"
+
+
+async def _step7_preflight(ssh_port: int, logger: DeployLogger) -> tuple[bool, str]:
+    check_key_cmd = (
+        f"test -r {shlex.quote(_BOOTSTRAP_PRIVKEY)} "
+        f"&& echo KEY_OK || echo KEY_MISSING"
+    )
+    stdout, stderr, rc = await _ssh_jump_async(check_key_cmd, timeout=10)
+    if rc != 0 or "KEY_OK" not in stdout:
+        return False, (
+            f"bootstrap identity missing or unreadable: {_BOOTSTRAP_PRIVKEY} "
+            f"{stderr.strip()}"
+        )
+
+    await _ssh_jump_async(f"ssh-keygen -R '[127.0.0.1]:{ssh_port}' >/dev/null 2>&1 || true", timeout=10)
+
+    listen_cmd = f"ss -tln 2>/dev/null | awk '$4 ~ /:{ssh_port}$/ {{found=1}} END {{print found ? \"LISTEN\" : \"NO_LISTEN\"}}'"
+    stdout, stderr, rc = await _ssh_jump_async(listen_cmd, timeout=10)
+    if rc != 0 or "LISTEN" not in stdout:
+        return False, f"ssh tunnel port {ssh_port} is not listening: {stderr.strip() or stdout.strip()}"
+
+    ssh_cmd = (
+        f"ssh -p {ssh_port} {_step7_ssh_opts()} root@127.0.0.1 "
+        f"'echo STEP7_SSH_OK'"
+    )
+    stdout, stderr, rc = await _ssh_jump_async(ssh_cmd, timeout=25)
+    if rc != 0 or "STEP7_SSH_OK" not in stdout:
+        return False, f"ssh tunnel probe failed: rc={rc} {stderr[:200]}"
+
+    logger.log("Step 7 preflight: SSH 隧道和 bootstrap key 检查通过")
+    return True, "ok"
+
+
+async def _ecs_finalize_once(ssh_port: int, api_port: int, logger: DeployLogger) -> tuple[bool, str]:
+    """SCP api-proxy.py into the ECS and run ecs_finalize.sh on it via the
+    jump-server-side reverse tunnel. Returns (ok, message)."""
+    ssh_opts = _step7_ssh_opts()
 
     if not _API_PROXY_PY.exists():
         return False, f"missing payload: {_API_PROXY_PY}"
@@ -534,22 +720,124 @@ async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> t
     return True, "ecs_finalize.sh ok"
 
 
-# ─── Endpoint probe (Step 8) ───
+async def _ecs_finalize(ssh_port: int, api_port: int, logger: DeployLogger) -> tuple[bool, str]:
+    last_msg = ""
+    for attempt in range(1, _STEP7_MAX_ATTEMPTS + 1):
+        logger.log(f"Step 7 attempt {attempt}/{_STEP7_MAX_ATTEMPTS}: preflight + finalize")
+        preflight_ok, preflight_msg = await _step7_preflight(ssh_port, logger)
+        if not preflight_ok:
+            last_msg = preflight_msg
+            action = _classify_step7_error(preflight_msg)
+            if action.startswith("fatal"):
+                return False, preflight_msg
+            logger.log(f"⚠️ Step 7 preflight 未通过: {preflight_msg}；等待后重试")
+            await asyncio.sleep(min(5 * attempt, 20))
+            continue
 
-async def _probe_api_endpoint(host: str, port: int, timeout_s: float = 5.0) -> tuple[bool, str]:
-    """Verify API endpoint via ssh-into-jump-server + curl 127.0.0.1:<port>.
-    Tunnels now bind to 127.0.0.1 (sshd GatewayPorts=no), so the endpoint
-    is only reachable from inside the jump server. ``host`` is ignored —
-    we always probe through ``ssh_jump``."""
+        ok, msg = await _ecs_finalize_once(ssh_port, api_port, logger)
+        if ok:
+            return True, msg
+
+        last_msg = msg
+        action = _classify_step7_error(msg)
+        if action.startswith("fatal"):
+            return False, msg
+        if action == "known_hosts":
+            logger.log("⚠️ Step 7 known_hosts 冲突，清理后重试")
+            await _ssh_jump_async(f"ssh-keygen -R '[127.0.0.1]:{ssh_port}' >/dev/null 2>&1 || true", timeout=10)
+        elif action == "auth_denied":
+            logger.log("⚠️ Step 7 公钥认证失败，等待隧道/authorized_keys 收敛后重试")
+        elif action == "tunnel_not_ready":
+            logger.log("⚠️ Step 7 隧道暂不可用，等待后重试")
+        else:
+            logger.log(f"⚠️ Step 7 可重试失败: {msg}")
+        await asyncio.sleep(min(5 * attempt, 20))
+
+    return False, f"Step 7 failed after {_STEP7_MAX_ATTEMPTS} attempts: {last_msg}"
+
+
+# ─── Chat probe (Step 8) ───
+
+async def _probe_api_health(port: int, timeout_s: float = 5.0) -> tuple[bool, str]:
     cmd = (
         f"curl -sS -m {int(timeout_s)} -o /dev/null "
-        f"-w '%{{http_code}}' http://127.0.0.1:{port}/ 2>&1"
+        f"-w '%{{http_code}}' http://127.0.0.1:{port}/health 2>&1"
     )
     stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=int(timeout_s) + 5)
     code = stdout.strip()
-    if rc == 0 and code.isdigit() and 200 <= int(code) < 500:
-        return True, f"HTTP {code}"
-    return False, f"HTTP {code or 'no response'} (rc={rc})"
+    if rc == 0 and code.isdigit() and int(code) == 200:
+        return True, "health HTTP 200"
+    return False, f"health HTTP {code or 'no response'} (rc={rc}, stderr={stderr[:120]})"
+
+
+async def _probe_api_endpoint(host: str, port: int, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """Verify the deployed proxy with a real OpenAI-compatible chat call.
+
+    ``/`` and ``/v1/models`` can return successfully even when the MiMo
+    upstream key, model path, or streaming/chat path is broken. A non-stream
+    chat completion against mimo-v2.5-pro proves the API tunnel, proxy auth,
+    upstream auth, model routing, and response parsing all work. ``host`` is
+    ignored because jump-side tunnels bind to 127.0.0.1.
+    """
+    del host
+    body = {
+        "model": _PROBE_API_CHAT_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "部署健康检查。请只回复一个短句：MIMO_DEPLOY_PROBE_OK。"
+                ),
+            }
+        ],
+        "max_tokens": _PROBE_API_CHAT_MAX_TOKENS,
+        "stream": False,
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": _PROBE_API_CHAT_THINKING_BUDGET,
+        },
+    }
+    payload = shlex.quote(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+    auth = shlex.quote(f"Authorization: Bearer {_PROXY_AUTH_TOKEN}")
+    probe_file = f"/tmp/mimo-deploy-chat-probe-{port}-{uuid.uuid4().hex}.json"
+    probe_file_q = shlex.quote(probe_file)
+    try:
+        cmd = (
+            f"curl -sS -m {int(timeout_s)} "
+            f"-H {auth} -H 'Content-Type: application/json' "
+            f"-o {probe_file_q} "
+            f"-w '%{{http_code}}' "
+            f"--data-binary {payload} "
+            f"http://127.0.0.1:{port}/v1/chat/completions"
+        )
+        stdout, stderr, rc = await _ssh_jump_async(cmd, timeout=int(timeout_s) + 15)
+        code = stdout.strip()
+        if rc != 0:
+            return False, f"chat probe curl rc={rc}: {(stderr or code)[:200]}"
+        if not code.isdigit() or int(code) != 200:
+            detail_cmd = f"tail -c 500 {probe_file_q} 2>/dev/null || true"
+            detail, _, _ = await _ssh_jump_async(detail_cmd, timeout=10)
+            return False, f"chat probe HTTP {code or 'no response'}: {detail[:300]}"
+
+        validate_py = (
+            "import json;"
+            f"p={json.dumps(probe_file)};"
+            "data=json.load(open(p,encoding='utf-8'));"
+            "choices=data.get('choices') or [];"
+            "msg=(choices[0].get('message') or {}) if choices else {};"
+            "content=msg.get('content') or '';"
+            "usage=data.get('usage') or {};"
+            "print(('OK content=%r usage=%s' % (content[:80], usage)) "
+            "if choices and isinstance(content,str) and content.strip() "
+            "else 'BAD response has no assistant content')"
+        )
+        validate_cmd = f"python3 -c {shlex.quote(validate_py)}"
+        detail, stderr, rc = await _ssh_jump_async(validate_cmd, timeout=15)
+        if rc == 0 and detail.startswith("OK "):
+            return True, f"chat probe HTTP 200 {_PROBE_API_CHAT_MODEL}: {detail.strip()[:180]}"
+        return False, f"chat probe invalid response: {(detail or stderr)[:200]}"
+    finally:
+        await _ssh_jump_async(f"rm -f {probe_file_q}", timeout=10)
 
 
 # ─── Core deploy flow ───
@@ -773,44 +1061,54 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         attachments: list[dict] = []
 
         set_state("step3_send")
-        session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
         framed_message = deploy_text
         log.log(
             f"Step 3: 发送部署文案到 Claw ({len(framed_message)} 字符)..."
         )
-        reply3, err3 = await claw_ws_chat(
-            framed_message, session_key, cookies=cookies,
-            attachments=attachments or None,
-        )
-        if err3:
-            log.log(f"❌ Claw 通信失败: {err3}")
-            mark_finished("error", history_status="error")
-            return
-        log.log(f"Claw 回复: {_fmt_claw_reply(reply3)}")
+        reply3 = ""
+        session_key = ""
+        public_key = None
+        for attempt in range(1, _CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS + 1):
+            session_key = f"agent:main:auto-{account_filename}-{uuid.uuid4().hex[:8]}"
+            log.log(
+                f"Step 3 attempt {attempt}/{_CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS}: "
+                f"新 Claw 会话原文发送"
+            )
+            reply_attempt, err3 = await claw_ws_chat(
+                framed_message, session_key, cookies=cookies,
+                attachments=attachments or None,
+            )
+            if err3:
+                log.log(f"⚠️ Claw 通信失败: {err3}")
+                if attempt < _CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS:
+                    await asyncio.sleep(3 * attempt)
+                    continue
+                log.log(f"❌ Claw 通信失败: {err3}")
+                mark_finished("error", history_status="error")
+                return
+            reply3 = reply_attempt or ""
+            log.log(f"Claw 回复: {_fmt_claw_reply(reply3)}")
+            public_key = _parse_ssh_key(reply3)
+            if public_key:
+                break
+            if _is_claw_safety_refusal(reply3):
+                log.log("⚠️ Claw 触发安全拒绝/敏感操作拒绝，丢弃会话并原文重发")
+            else:
+                log.log("⚠️ Claw 回复未包含 SSH 公钥，丢弃会话并原文重发")
+            if attempt < _CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS:
+                await asyncio.sleep(3 * attempt)
         if cancelled():
             mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 4: Capture SSH public key. Retry with a fresh session if the
-        # first reply doesn't contain a key (#7 fix).
+        # Step 4: Capture SSH public key. Step 3 already retries by opening a
+        # fresh Claw conversation and re-sending the original deploy_text.
         set_state("step4_capture")
         log.log("Step 4: 从回复中提取 SSH 公钥...")
-        public_key = _parse_ssh_key(reply3)
         if not public_key:
-            log.log("未找到 SSH key，换新会话再问一次...")
-            retry_session = f"agent:main:auto-{account_filename}-retry-{uuid.uuid4().hex[:8]}"
-            reply_retry, err_retry = await claw_ws_chat(
-                "请把你的 SSH 公钥发给我，格式为 ssh-ed25519 或 ssh-rsa 开头的完整公钥。",
-                retry_session, cookies=cookies,
+            log.log(
+                f"❌ 无法从 {_CLAW_BOOTSTRAP_SESSION_MAX_ATTEMPTS} 个新 Claw 会话中提取 SSH 公钥"
             )
-            if err_retry:
-                log.log(f"❌ 重试 Claw 通信失败: {err_retry}")
-                mark_finished("error", history_status="error")
-                return
-            log.log(f"Claw 回复: {_fmt_claw_reply(reply_retry)}")
-            public_key = _parse_ssh_key(reply_retry)
-        if not public_key:
-            log.log("❌ 无法从 Claw 回复中提取 SSH 公钥")
             mark_finished("error", history_status="error")
             return
         log.log(f"✅ 提取到 SSH 公钥: {public_key[:50]}...")
@@ -881,31 +1179,66 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 8: Verify the API endpoint is up on the jump server. The
-        # tunnel may take a few seconds to come up; poll for ~60s.
+        # Step 8: Verify the API path with a real chat completion. Each probe
+        # has a long timeout so mimo-v2.5-pro can finish thinking/output.
         set_state("step8_verify")
-        log.log(f"Step 8: 验证 API 端点 http://{JUMP_SERVER}:{api_port}/ ...")
-        endpoint_ok = False
+        log.log(
+            f"Step 8: chat 探测 http://{JUMP_SERVER}:{api_port}/v1/chat/completions "
+            f"(model={_PROBE_API_CHAT_MODEL}, thinking_budget={_PROBE_API_CHAT_THINKING_BUDGET}, "
+            f"timeout={_PROBE_API_CHAT_TIMEOUT_S}s) ..."
+        )
+        health_ok = False
+        chat_ok = False
         last_reason = ""
         for i in range(_PROBE_API_MAX_ITERS):
             if cancelled():
                 mark_finished("cancelled", history_status="cancelled")
                 return
             await asyncio.sleep(_PROBE_API_INTERVAL_S)
-            ok, reason = await _probe_api_endpoint(JUMP_SERVER, api_port)
+            ok, reason = await _probe_api_health(api_port)
             last_reason = reason
             if ok:
-                endpoint_ok = True
-                log.log(f"✅ API 端点已就绪: {reason}")
+                health_ok = True
+                log.log(f"✅ API health 已就绪: {reason}")
                 break
-            log.log(f"  等待端点... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
+            log.log(f"  等待 API health... ({(i + 1) * _PROBE_API_INTERVAL_S}s, {reason})")
+        else:
+            log.log(f"⚠️ API health 等待超时 (最后状态: {last_reason})")
 
-        if endpoint_ok:
+        if health_ok:
+            for i in range(_PROBE_API_CHAT_MAX_ITERS):
+                if cancelled():
+                    mark_finished("cancelled", history_status="cancelled")
+                    return
+                ok, reason = await _probe_api_endpoint(
+                    JUMP_SERVER,
+                    api_port,
+                    timeout_s=_PROBE_API_CHAT_TIMEOUT_S,
+                )
+                last_reason = reason
+                if ok:
+                    chat_ok = True
+                    log.log(f"✅ API chat 探测通过: {reason}")
+                    break
+                log.log(
+                    f"  chat 探测失败 {i + 1}/{_PROBE_API_CHAT_MAX_ITERS}: {reason}"
+                )
+                if i + 1 < _PROBE_API_CHAT_MAX_ITERS:
+                    await asyncio.sleep(_PROBE_API_INTERVAL_S)
+
+        if health_ok:
             _notify_gateway_deploy_done(account_filename, api_port, log)
-            log.log("=== ✅ 部署完成 ===")
+            if chat_ok:
+                log.log("=== ✅ 部署完成 ===")
+            else:
+                log.log(
+                    f"⚠️ API chat 探测超时/失败 (最后状态: {last_reason})，"
+                    "基础部署已完成，模型链路暂不可用/待后续探测恢复"
+                )
+                log.log("=== ✅ 部署完成（chat 探测 warning）===")
             mark_finished("done", history_status="done")
         else:
-            log.log(f"⚠️ 端点验证超时 (最后状态: {last_reason})，Claw 已就绪但隧道可能尚未生效")
+            log.log(f"⚠️ API health 探测超时/失败 (最后状态: {last_reason})，Claw 已就绪但 API 端点不可用")
             mark_finished("error", history_status="error")
 
     except asyncio.CancelledError:
@@ -1018,10 +1351,19 @@ def get_scheduler_status() -> dict:
     accounts = cfg.get("accounts", {})
     schedule_info = {}
     now = datetime.now()
+    rotation = _load_rotation_status(cfg)
+    rotation_accounts = rotation.get("accounts") or {}
 
     for acc_filename, acc_cfg in accounts.items():
+        rotation_info = rotation_accounts.get(acc_filename, {})
         if not acc_cfg.get("enabled", False):
-            schedule_info[acc_filename] = {"enabled": False}
+            schedule_info[acc_filename] = {
+                "enabled": False,
+                "age_s": 0,
+                "age_min": 0,
+                "next_rotation_reason": "disabled",
+                "skip_reason": "disabled",
+            }
             continue
         cron_expr = acc_cfg.get("cron", "0 3 * * *")
         last_run = acc_cfg.get("last_run", 0)
@@ -1032,6 +1374,7 @@ def get_scheduler_status() -> dict:
             schedule_info[acc_filename] = {
                 "enabled": True, "cron": cron_expr,
                 "error": "Cron 表达式格式错误",
+                **rotation_info,
             }
             continue
         schedule_info[acc_filename] = {
@@ -1042,9 +1385,13 @@ def get_scheduler_status() -> dict:
                 if last_run else "从未运行"
             ),
             "next_run": next_run.strftime("%Y-%m-%d %H:%M"),
+            **rotation_info,
         }
 
     return {
         "scheduler_running": _scheduler_running,
+        "schedule_mode": "adaptive",
+        "policy": rotation.get("policy", {}),
+        "counts": rotation.get("counts", {}),
         "accounts": schedule_info,
     }

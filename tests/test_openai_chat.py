@@ -1049,6 +1049,46 @@ def test_reasoning_cache_isolates_different_thinking_configs():
     assert key_b != key_c
 
 
+def test_reasoning_write_does_not_populate_no_thinking_fallback_scope():
+    """Fallback lookup is read-only compatibility, not a second write scope."""
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    from gateway.reasoning_cache import clear_reasoning_cache, lookup_reasoning
+
+    clear_reasoning_cache()
+
+    messages = [
+        InternalMessage(role="user", content=[InternalContent(type="text", text="ask")]),
+    ]
+    scoped_key = _conversation_key_for_request(
+        messages,
+        thinking={"type": "enabled", "budget_tokens": 8000},
+    )
+    fallback_key = _conversation_key_for_request(messages, thinking=None)
+
+    body = json.dumps({
+        "id": "chatcmpl-test",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "scoped reasoning",
+                "tool_calls": [{
+                    "id": "call_shared",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode()
+
+    _adapter().parse_upstream_response(body, conversation_key=scoped_key)
+
+    assert lookup_reasoning(["call_shared"], conversation_key=scoped_key) == "scoped reasoning"
+    assert lookup_reasoning(["call_shared"], conversation_key=fallback_key) is None
+
+
 def test_remember_reasoning_rejects_empty_conversation_key():
     """Fail loud, not silent: caller passing an empty string for
     conversation_key is a bug, not a "use the default scope" instruction."""

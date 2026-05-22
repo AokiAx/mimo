@@ -79,7 +79,9 @@ class Router:
             if not b.is_selectable(now):
                 if not b.enabled:
                     excluded[b.backend_id] = "disabled"
-                elif getattr(b, "lifecycle", "active") != "active":
+                elif getattr(b, "lifecycle", "active") == "warming" and b.readiness_successes <= 0:
+                    excluded[b.backend_id] = "warming, no readiness success yet"
+                elif getattr(b, "lifecycle", "active") not in ("active", "warming"):
                     excluded[b.backend_id] = f"lifecycle={b.lifecycle}"
                 elif b.is_temporarily_disabled(now):
                     excluded[b.backend_id] = (
