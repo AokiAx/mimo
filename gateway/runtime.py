@@ -50,7 +50,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 _PROBE_INTERVAL_S = 30.0
-_PROBE_TIMEOUT_S = 5.0
+_PROBE_TIMEOUT_S = _env_float("GATEWAY_PROBE_TIMEOUT_S", 20.0)
 _PROBE_FAILURE_THRESHOLD = 3
 _PROBE_COOLDOWN_S = 30.0
 _PROBE_CONCURRENCY = 10
@@ -69,8 +69,9 @@ _DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
 _ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
 
 _READINESS_MAX_STREAM_CHUNKS = 32
-_READINESS_MAX_STREAM_SECONDS = 20.0
+_READINESS_MAX_STREAM_SECONDS = _env_float("GATEWAY_READINESS_STREAM_TIMEOUT_S", _PROBE_TIMEOUT_S)
 _READINESS_PROMPT = "ping"
+_READINESS_MODEL = os.environ.get("GATEWAY_READINESS_MODEL", "mimo-v2-flash")
 
 # ────────────── singleton state ──────────────
 
@@ -807,6 +808,8 @@ def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
 def _readiness_model(backend: Backend) -> str:
     if not backend.models:
         raise ValueError("backend has no configured models for readiness checks")
+    if _READINESS_MODEL in backend.models:
+        return _READINESS_MODEL
     return backend.models[0]
 
 

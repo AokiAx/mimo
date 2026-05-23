@@ -43,6 +43,9 @@ bash run.sh
 - `MIMO_DEPLOY_CHAT_PROBE_MAX_TOKENS` — Step 8 chat 探测最大输出 token（默认 `2048`）
 - `MIMO_DEPLOY_CHAT_PROBE_MAX_ITERS` — Step 8 chat 探测最多重试次数（默认 `3`）
 - `GATEWAY_DRAIN_TIMEOUT_S`、`GATEWAY_DEPLOY_DRAIN_GRACE_S`、`GATEWAY_ROTATION_LOOP_INTERVAL_S` — Gateway 后端 drain、部署切换等待和轮换循环间隔
+- `GATEWAY_PROBE_TIMEOUT_S` — Gateway 后台非流式 chat 健康/热身探测超时（默认 `20` 秒）
+- `GATEWAY_READINESS_STREAM_TIMEOUT_S` — Gateway 流式热身探测超时（默认跟随 `GATEWAY_PROBE_TIMEOUT_S`）
+- `GATEWAY_READINESS_MODEL` — Gateway 健康/热身探测优先使用的模型（默认 `mimo-v2-flash`，后端未配置时回退到该后端第一个模型）
 - `MIMO_REASONING_CACHE_DB` — reasoning / thinking 兜底缓存 SQLite 路径（默认 `data/reasoning_cache.db`）
 - `MIMO_PROBE_DUMP` — 调试用：把 gateway 入站/出站请求追加写入 JSONL 文件
 - `MIMO_TRUST_PROXY_HEADERS=1` — 信任 `X-Forwarded-For` 头作为客户端 IP（默认 **关闭**，用 socket peer 地址）。仅在面板部署在 nginx / Cloudflare / Caddy 等反向代理之后时启用，否则攻击者可以伪造 IP 来污染审计日志（`login_failure` / `auth_bad_cookie` / `path_traversal_blocked` 等事件）。
