@@ -31,7 +31,7 @@ def _backend(backend_id: str, *, lifecycle: str = "active") -> Backend:
     b = Backend(
         backend_id=backend_id,
         base_url=f"http://{backend_id}.example",
-        models=["mimo-v2.5-pro"],
+        models=["mimo-v2.5-pro", "mimo-v2-flash"],
         account_id=backend_id,
         lifecycle=lifecycle,
     )
@@ -94,15 +94,19 @@ class FakeTransport:
     def __init__(self):
         self.json_bodies = []
         self.stream_bodies = []
+        self.json_timeouts = []
+        self.stream_timeouts = []
 
     async def post_json(self, url, body, *, headers=None, timeout_s=60.0):
         self.json_bodies.append(body)
+        self.json_timeouts.append(timeout_s)
         if body.get("tools"):
             return 200, b'{"choices":[{"message":{"tool_calls":[{"id":"call_1"}]}}]}'
         return 200, b'{"choices":[{"message":{"content":"ok"}}]}'
 
     async def post_stream(self, url, body, *, headers=None, timeout_s=600.0):
         self.stream_bodies.append(body)
+        self.stream_timeouts.append(timeout_s)
 
         async def chunks() -> AsyncIterator[bytes]:
             yield b'data: {"choices":[{"delta":{"content":"o"}}]}\n\n'
@@ -128,7 +132,9 @@ def test_probe_one_uses_chat_completion_not_models(monkeypatch):
     assert reason == "ok"
     assert len(fake.json_bodies) == 1
     assert fake.json_bodies[0]["messages"][0]["content"] == runtime._READINESS_PROMPT
+    assert fake.json_bodies[0]["model"] == "mimo-v2-flash"
     assert fake.json_bodies[0]["stream"] is False
+    assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S]
 
 
 def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
@@ -144,9 +150,21 @@ def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
     assert len(fake.json_bodies) == 2
     assert len(fake.stream_bodies) == 1
     assert fake.json_bodies[0]["stream"] is False
+    assert fake.json_bodies[0]["model"] == "mimo-v2-flash"
+    assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S, runtime._PROBE_TIMEOUT_S]
     assert fake.stream_bodies[0]["stream"] is True
+    assert fake.stream_bodies[0]["model"] == "mimo-v2-flash"
+    assert fake.stream_timeouts == [runtime._READINESS_MAX_STREAM_SECONDS]
+    assert fake.json_bodies[1]["model"] == "mimo-v2-flash"
     assert fake.json_bodies[1]["tools"][0]["function"]["name"] == "gateway_readiness_ping"
     assert fake.json_bodies[1]["tool_choice"]["function"]["name"] == "gateway_readiness_ping"
+
+
+def test_readiness_model_falls_back_when_flash_unavailable():
+    backend = _backend("candidate")
+    backend.models = ["mimo-v2.5-pro"]
+
+    assert runtime._readiness_model(backend) == "mimo-v2.5-pro"
 
 
 def test_tool_readiness_accepts_structural_json_response():
