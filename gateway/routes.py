@@ -25,17 +25,52 @@ _GATEWAY_PATHS = {"/v1/chat/completions", "/v1/audio/speech", "/v1/messages", "/
 
 def _translate_audio_speech_request(payload: AudioSpeechRequest) -> dict[str, object]:
     input_text = payload.input.strip()
+    model = map_openai_tts_model(payload.model)
     messages: list[dict[str, str]] = []
+    audio: dict[str, object] = {"format": payload.response_format.lower()}
+
+    if model == "mimo-v2.5-tts-voiceclone":
+        sample_b64 = (payload.voice_sample_base64 or "").strip()
+        sample_mime = (payload.voice_sample_mime_type or "").strip()
+        if not sample_b64:
+            raise ValueError("`voice_sample_base64` 是 mimo-v2.5-tts-voiceclone 的必填字段")
+        if not sample_mime:
+            raise ValueError("`voice_sample_mime_type` 是 mimo-v2.5-tts-voiceclone 的必填字段")
+        if isinstance(payload.instructions, str) and payload.instructions.strip():
+            messages.append({"role": "user", "content": payload.instructions.strip()})
+        messages.append({"role": "assistant", "content": input_text})
+        audio["voice"] = f"data:{sample_mime};base64,{sample_b64}"
+        return {
+            "model": model,
+            "messages": messages,
+            "audio": audio,
+            "stream": False,
+        }
+
+    if model == "mimo-v2.5-tts-voicedesign":
+        voice_description = (payload.voice_description or "").strip()
+        if not voice_description:
+            raise ValueError("`voice_description` 是 mimo-v2.5-tts-voicedesign 的必填字段")
+        messages.append({"role": "user", "content": voice_description})
+        messages.append({"role": "assistant", "content": input_text})
+        audio["voice"] = map_openai_tts_voice(payload.voice)
+        if payload.optimize_text_preview is not None:
+            audio["optimize_text_preview"] = payload.optimize_text_preview
+        return {
+            "model": model,
+            "messages": messages,
+            "audio": audio,
+            "stream": False,
+        }
+
     if isinstance(payload.instructions, str) and payload.instructions.strip():
-        messages.append({"role": "user", "content": payload.instructions})
+        messages.append({"role": "user", "content": payload.instructions.strip()})
     messages.append({"role": "assistant", "content": input_text})
+    audio["voice"] = map_openai_tts_voice(payload.voice)
     return {
-        "model": map_openai_tts_model(payload.model),
+        "model": model,
         "messages": messages,
-        "audio": {
-            "format": payload.response_format.lower(),
-            "voice": map_openai_tts_voice(payload.voice),
-        },
+        "audio": audio,
         "stream": False,
     }
 
@@ -107,7 +142,10 @@ def register_gateway_routes(app: FastAPI, *, auth_cookie: str) -> None:
                     return JSONResponse({"error": {"message": "`input` 不能为空"}}, status_code=400)
 
                 from gateway.runtime import dispatch_with_body_override
-                translated = _translate_audio_speech_request(payload)
+                try:
+                    translated = _translate_audio_speech_request(payload)
+                except ValueError as e:
+                    return JSONResponse({"error": {"message": str(e)}}, status_code=400)
                 upstream_resp = await dispatch_with_body_override("openai_chat", request, translated)
                 if upstream_resp.status_code >= 400:
                     return upstream_resp

@@ -11,6 +11,10 @@ class AudioSpeechRequest(BaseModel):
     voice: str | None = None
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm16", "pcm"] = "wav"
     instructions: str | None = None
+    voice_description: str | None = None
+    voice_sample_base64: str | None = None
+    voice_sample_mime_type: str | None = None
+    optimize_text_preview: bool | None = None
 
 
 def map_openai_tts_voice(voice: str | None) -> str:

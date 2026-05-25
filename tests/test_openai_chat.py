@@ -996,6 +996,99 @@ def test_translate_audio_speech_request_builds_chat_payload():
     }
 
 
+def test_translate_audio_speech_request_supports_mimo_v2_tts():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2-tts",
+        voice="mimo_meet",
+        response_format="mp3",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2-tts",
+        "messages": [
+            {"role": "assistant", "content": "你好"},
+        ],
+        "audio": {"format": "mp3", "voice": "mimo_meet"},
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_supports_voice_design_model():
+    payload = AudioSpeechRequest(
+        input="你好，今天过得怎么样？",
+        model="mimo-v2.5-tts-voicedesign",
+        voice_description="年轻女声，温柔一点，像朋友聊天",
+        voice="alloy",
+        response_format="wav",
+        optimize_text_preview=True,
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts-voicedesign",
+        "messages": [
+            {"role": "user", "content": "年轻女声，温柔一点，像朋友聊天"},
+            {"role": "assistant", "content": "你好，今天过得怎么样？"},
+        ],
+        "audio": {
+            "format": "wav",
+            "voice": "mimo_default",
+            "optimize_text_preview": True,
+        },
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_voice_design_requires_voice_description():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voicedesign",
+    )
+    with pytest.raises(ValueError, match="voice_description"):
+        _translate_audio_speech_request(payload)
+
+
+def test_translate_audio_speech_request_supports_voice_clone_model():
+    payload = AudioSpeechRequest(
+        input="你好，来试一下克隆音色",
+        model="mimo-v2.5-tts-voiceclone",
+        instructions="语气平稳一些",
+        voice_sample_base64="QUJDRA==",
+        voice_sample_mime_type="audio/wav",
+        response_format="flac",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts-voiceclone",
+        "messages": [
+            {"role": "user", "content": "语气平稳一些"},
+            {"role": "assistant", "content": "你好，来试一下克隆音色"},
+        ],
+        "audio": {
+            "format": "flac",
+            "voice": "data:audio/wav;base64,QUJDRA==",
+        },
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_voice_clone_requires_sample_fields():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voiceclone",
+    )
+    with pytest.raises(ValueError, match="voice_sample_base64"):
+        _translate_audio_speech_request(payload)
+
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voiceclone",
+        voice_sample_base64="QUJDRA==",
+    )
+    with pytest.raises(ValueError, match="voice_sample_mime_type"):
+        _translate_audio_speech_request(payload)
+
+
 def test_extract_audio_response_bytes_reads_message_audio():
     payload = {
         "choices": [{
