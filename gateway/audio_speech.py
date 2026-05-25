@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
 class AudioSpeechRequest(BaseModel):
     input: str = Field(min_length=1)
-    model: str | None = None
-    voice: str | None = None
+    model: Optional[str] = None
+    voice: Optional[str] = None
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm16", "pcm"] = "wav"
-    instructions: str | None = None
-    voice_description: str | None = None
-    voice_sample_base64: str | None = None
-    voice_sample_mime_type: str | None = None
-    optimize_text_preview: bool | None = None
+    instructions: Optional[str] = None
+    voice_description: Optional[str] = None
+    voice_sample_base64: Optional[str] = None
+    voice_sample_mime_type: Optional[str] = None
+    optimize_text_preview: Optional[bool] = None
 
 
-def map_openai_tts_voice(voice: str | None) -> str:
+def map_openai_tts_voice(voice: Optional[str]) -> str:
     default_voice_map = {
         "alloy": "mimo_default",
         "ash": "mimo_default",
@@ -36,7 +36,7 @@ def map_openai_tts_voice(voice: str | None) -> str:
     return default_voice_map.get(voice, voice)
 
 
-def map_openai_tts_model(model: str | None) -> str:
+def map_openai_tts_model(model: Optional[str]) -> str:
     if not model:
         return "mimo-v2.5-tts"
     model_map = {
