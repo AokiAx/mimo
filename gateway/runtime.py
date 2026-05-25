@@ -148,7 +148,6 @@ def _ensure_initialized() -> None:
     )
 
 
-
 def _bootstrap_active_lifecycles() -> None:
     """Seed active timers while preserving all active backends for load balancing."""
     assert _registry is not None
@@ -241,17 +240,12 @@ def _has_active_peer(candidate: Backend) -> bool:
 # ────────────── dispatch (used by /v1/* routes) ──────────────
 
 
-async def dispatch(adapter_name: str, request: Request) -> Response:
-    """Run a single request through the pipeline and return a FastAPI Response."""
+async def _dispatch_preparsed(adapter_name: str, request: Request, body: dict[str, Any]) -> Response:
+    """Run a request through the pipeline using a caller-supplied JSON body."""
     global _total_requests
     _ensure_initialized()
     assert _handler is not None
     adapter = _adapters[adapter_name]
-
-    try:
-        body = await _read_json_body(request)
-    except BadRequestError as e:
-        return _error_response(adapter, e)
 
     from gateway.probe_dump import dump_inbound, dump_outbound, tee_stream
     dump_inbound(adapter_name, body)
@@ -278,6 +272,26 @@ async def dispatch(adapter_name: str, request: Request) -> Response:
         )
     dump_outbound(adapter_name, body_bytes)
     return Response(content=body_bytes, media_type=content_type, status_code=200, headers=headers)
+
+
+async def dispatch(adapter_name: str, request: Request) -> Response:
+    """Run a single request through the pipeline and return a FastAPI Response."""
+    _ensure_initialized()
+    adapter = _adapters[adapter_name]
+    try:
+        body = await _read_json_body(request)
+    except BadRequestError as e:
+        return _error_response(adapter, e)
+    return await _dispatch_preparsed(adapter_name, request, body)
+
+
+async def dispatch_with_body_override(adapter_name: str, request: Request, body: dict[str, Any]) -> Response:
+    """Variant of dispatch() for routes that translate one protocol into another first."""
+    _ensure_initialized()
+    adapter = _adapters[adapter_name]
+    if not isinstance(body, dict):
+        return _error_response(adapter, BadRequestError("Request body must be a JSON object"))
+    return await _dispatch_preparsed(adapter_name, request, body)
 
 
 # ────────────── status helpers (used by panel) ──────────────
@@ -1001,6 +1015,7 @@ def _error_response(adapter: ProtocolAdapter, err: GatewayError) -> Response:
 
 __all__ = [
     "dispatch",
+    "dispatch_with_body_override",
     "reload_backends",
     "get_router_status",
     "get_all_backends",

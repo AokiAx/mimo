@@ -55,6 +55,10 @@ class InternalMessage:
     # MiMo/OpenAI-style hidden reasoning that must round-trip when assistant
     # history contains tool calls in thinking mode.
     reasoning_content: str | None = None
+    # Optional TTS payload attached to assistant messages in OpenAI/MiMo chat
+    # completions responses. Needed so audio-only assistant turns can round-trip
+    # through history without being degraded into whitespace placeholders.
+    audio: dict[str, Any] | None = None
 
 
 # ────────────── Tool definitions (request-side) ──────────────
@@ -117,7 +121,6 @@ class Usage:
 
 FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "error"]
 
-
 @dataclass
 class InternalEvent:
     """Marker base. Adapters dispatch on concrete type via isinstance."""
@@ -127,6 +130,13 @@ class InternalEvent:
 class MessageStart(InternalEvent):
     message_id: str
     model: str
+
+
+@dataclass
+class AudioDelta(InternalEvent):
+    """Incremental or whole audio payload for TTS chat-completions responses."""
+    data: str
+    format: str | None = None
 
 
 @dataclass

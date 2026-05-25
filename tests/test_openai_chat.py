@@ -1,4 +1,4 @@
-"""Unit tests for gateway.adapters.openai_chat.
+"""Unit tests for gateway.adapters.openai_chat and gateway.routes TTS helpers.
 
 Covered:
   * iter_sse_data — chunk boundary, keepalive, tail flush
@@ -10,10 +10,12 @@ Covered:
   * serialize_response — non-stream collected JSON
   * finish_reason mapping — function_call → tool_calls
   * error_envelope — OpenAI {error:{message,type,code}} shape
+  * /v1/audio/speech helper translation / extraction
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import AsyncIterator
 
@@ -25,7 +27,9 @@ from gateway.adapters.openai_chat import (
     _map_finish,
     iter_sse_data,
 )
+from gateway.audio_speech import AudioSpeechRequest
 from gateway.core import (
+    AudioDelta,
     BadRequestError,
     ContentBlockEnd,
     ContentBlockStart,
@@ -41,6 +45,7 @@ from gateway.core import (
     ToolCallDelta,
     Usage,
 )
+from gateway.routes import _extract_audio_response_bytes, _translate_audio_speech_request
 
 
 # ───────── helpers ─────────
@@ -160,6 +165,41 @@ def test_parse_request_preserves_assistant_reasoning_content_with_tool_calls():
     assert msg.role == "assistant"
     assert msg.reasoning_content == "I should call the tool."
     assert msg.content[0].tool_id == "call_1"
+
+
+def test_parse_request_preserves_assistant_audio_payload():
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    msg = req.messages[0]
+    assert msg.role == "assistant"
+    assert msg.audio == {"data": "QUJD", "format": "wav"}
+
+
+def test_conversation_key_hash_includes_assistant_audio_payload():
+    audio_req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    no_audio_req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+        }],
+    })
+    assert _adapter().serialize_to_upstream(audio_req)["messages"][0]["audio"] == {"data": "QUJD", "format": "wav"}
+    from gateway.adapters.openai_chat import _conversation_key_for_request
+    assert _conversation_key_for_request(audio_req.messages) != _conversation_key_for_request(no_audio_req.messages)
 
 
 def test_parse_request_missing_model_raises():
@@ -549,6 +589,26 @@ def test_parse_upstream_response_preserves_reasoning_content():
     assert any(isinstance(e, ReasoningDelta) and e.text == "thinking" for e in events)
 
 
+def test_parse_upstream_response_preserves_audio_payload():
+    payload = json.dumps({
+        "id": "chatcmpl-audio",
+        "model": "mimo-v2.5-tts",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "audio": {"data": "QUJD", "format": "wav"},
+            },
+            "finish_reason": "stop",
+        }],
+    }).encode()
+    events = _adapter().parse_upstream_response(payload, conversation_key="test-conv")
+    audio = next(e for e in events if isinstance(e, AudioDelta))
+    assert audio.data == "QUJD"
+    assert audio.format == "wav"
+
+
 # ───────── parse_upstream_stream ─────────
 
 
@@ -679,6 +739,30 @@ def test_parse_upstream_stream_preserves_reasoning_content_delta():
     assert "answer" == "".join(e.text for e in events if isinstance(e, TextDelta))
 
 
+def test_parse_upstream_stream_collects_audio_delta_payload():
+    chunks_payloads = [
+        {"id": "x1", "model": "mimo-v2.5-tts",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"audio": {"data": "QU", "format": "pcm16"}}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"audio": {"data": "JD"}}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    bytes_stream = b"".join(_sse(p) for p in chunks_payloads) + b"data: [DONE]\n\n"
+
+    async def run():
+        return await _events(_adapter().parse_upstream_stream(_gen([bytes_stream]), conversation_key="test-conv"))
+
+    events = _run(run())
+    audio_deltas = [e for e in events if isinstance(e, AudioDelta)]
+    assert len(audio_deltas) == 2
+    assert audio_deltas[0].data == "QU"
+    assert audio_deltas[0].format == "pcm16"
+    assert audio_deltas[1].data == "JD"
+    assert audio_deltas[1].format == "pcm16"
+    end = events[-1]
+    assert isinstance(end, MessageEnd) and end.finish_reason == "stop"
+
+
 # ───────── serialize_response_stream (IES → OpenAI SSE) ─────────
 
 
@@ -730,6 +814,24 @@ def test_serialize_response_stream_emits_reasoning_content_delta():
         if c and c != b"data: [DONE]" and c.startswith(b"data: ")
     ]
     assert {"reasoning_content": "think"} in [p["choices"][0]["delta"] for p in payloads]
+
+
+def test_serialize_response_stream_emits_audio_delta_chunk():
+    async def feed() -> AsyncIterator[InternalEvent]:
+        yield MessageStart(message_id="x", model="mimo-v2.5-tts")
+        yield AudioDelta(data="QUJD", format="pcm16")
+        yield MessageEnd(finish_reason="stop", usage=Usage())
+
+    raw = _run(_drain(_adapter().serialize_response_stream(feed())))
+    payloads = [
+        json.loads(c[6:].decode())
+        for c in raw.split(b"\n\n")
+        if c and c != b"data: [DONE]" and c.startswith(b"data: ")
+    ]
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert payloads[1]["choices"][0]["delta"] == {
+        "audio": {"data": "QUJD", "format": "pcm16"},
+    }
 
 
 def test_serialize_response_stream_tool_call_delta():
@@ -797,6 +899,19 @@ def test_serialize_response_collects_reasoning_content():
     assert body["choices"][0]["message"]["reasoning_content"] == "hidden"
 
 
+def test_serialize_response_collects_audio_payload():
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-a", model="mimo-v2.5-tts"),
+        AudioDelta(data="QU", format="wav"),
+        AudioDelta(data="JD"),
+        MessageEnd(finish_reason="stop", usage=Usage()),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    msg = body["choices"][0]["message"]
+    assert msg["audio"] == {"data": "QUJD", "format": "wav"}
+    assert msg["content"] is None
+
+
 def test_serialize_response_collects_tool_calls():
     events: list[InternalEvent] = [
         MessageStart(message_id="chatcmpl-2", model="m"),
@@ -830,6 +945,18 @@ def test_serialize_response_backfills_empty_assistant_content():
     assert "reasoning_content" not in msg
 
 
+def test_serialize_response_does_not_backfill_whitespace_when_audio_present():
+    events: list[InternalEvent] = [
+        MessageStart(message_id="chatcmpl-audio-only", model="mimo-v2.5-tts"),
+        AudioDelta(data="QUJD", format="wav"),
+        MessageEnd(finish_reason="stop", usage=Usage(input_tokens=1, output_tokens=0)),
+    ]
+    body = json.loads(_adapter().serialize_response(events).decode())
+    msg = body["choices"][0]["message"]
+    assert msg["audio"] == {"data": "QUJD", "format": "wav"}
+    assert msg["content"] is None
+
+
 # ───────── finish_reason mapping ─────────
 
 
@@ -844,6 +971,158 @@ def test_finish_reason_legacy_function_call_maps_to_tool_calls():
 
 def test_finish_reason_ies_to_openai_error_demotes_to_stop():
     assert _IES_TO_OPENAI_FINISH["error"] == "stop"
+
+
+# ───────── /v1/audio/speech helpers ─────────
+
+
+def test_translate_audio_speech_request_builds_chat_payload():
+    payload = AudioSpeechRequest(
+        input="你好，世界",
+        model="tts-1",
+        voice="alloy",
+        response_format="wav",
+        instructions="用开心一点的语气",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts",
+        "messages": [
+            {"role": "user", "content": "用开心一点的语气"},
+            {"role": "assistant", "content": "你好，世界"},
+        ],
+        "audio": {"format": "wav", "voice": "mimo_default"},
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_supports_mimo_v2_tts():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2-tts",
+        voice="mimo_meet",
+        response_format="mp3",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2-tts",
+        "messages": [
+            {"role": "assistant", "content": "你好"},
+        ],
+        "audio": {"format": "mp3", "voice": "mimo_meet"},
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_supports_voice_design_model():
+    payload = AudioSpeechRequest(
+        input="你好，今天过得怎么样？",
+        model="mimo-v2.5-tts-voicedesign",
+        voice_description="年轻女声，温柔一点，像朋友聊天",
+        voice="alloy",
+        response_format="wav",
+        optimize_text_preview=True,
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts-voicedesign",
+        "messages": [
+            {"role": "user", "content": "年轻女声，温柔一点，像朋友聊天"},
+            {"role": "assistant", "content": "你好，今天过得怎么样？"},
+        ],
+        "audio": {
+            "format": "wav",
+            "voice": "mimo_default",
+            "optimize_text_preview": True,
+        },
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_voice_design_requires_voice_description():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voicedesign",
+    )
+    with pytest.raises(ValueError, match="voice_description"):
+        _translate_audio_speech_request(payload)
+
+
+def test_translate_audio_speech_request_supports_voice_clone_model():
+    payload = AudioSpeechRequest(
+        input="你好，来试一下克隆音色",
+        model="mimo-v2.5-tts-voiceclone",
+        instructions="语气平稳一些",
+        voice_sample_base64="QUJDRA==",
+        voice_sample_mime_type="audio/wav",
+        response_format="flac",
+    )
+    translated = _translate_audio_speech_request(payload)
+    assert translated == {
+        "model": "mimo-v2.5-tts-voiceclone",
+        "messages": [
+            {"role": "user", "content": "语气平稳一些"},
+            {"role": "assistant", "content": "你好，来试一下克隆音色"},
+        ],
+        "audio": {
+            "format": "flac",
+            "voice": "data:audio/wav;base64,QUJDRA==",
+        },
+        "stream": False,
+    }
+
+
+def test_translate_audio_speech_request_voice_clone_requires_sample_fields():
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voiceclone",
+    )
+    with pytest.raises(ValueError, match="voice_sample_base64"):
+        _translate_audio_speech_request(payload)
+
+    payload = AudioSpeechRequest(
+        input="你好",
+        model="mimo-v2.5-tts-voiceclone",
+        voice_sample_base64="QUJDRA==",
+    )
+    with pytest.raises(ValueError, match="voice_sample_mime_type"):
+        _translate_audio_speech_request(payload)
+
+
+def test_extract_audio_response_bytes_reads_message_audio():
+    payload = {
+        "choices": [{
+            "message": {
+                "audio": {
+                    "data": base64.b64encode(b"abc").decode(),
+                    "format": "mp3",
+                }
+            }
+        }]
+    }
+    audio_bytes, audio_format = _extract_audio_response_bytes(payload, fallback_format="wav")
+    assert audio_bytes == b"abc"
+    assert audio_format == "mp3"
+
+
+def test_extract_audio_response_bytes_uses_fallback_format_when_missing():
+    payload = {
+        "choices": [{
+            "message": {
+                "audio": {
+                    "data": base64.b64encode(b"xyz").decode(),
+                }
+            }
+        }]
+    }
+    audio_bytes, audio_format = _extract_audio_response_bytes(payload, fallback_format="wav")
+    assert audio_bytes == b"xyz"
+    assert audio_format == "wav"
+
+
+def test_extract_audio_response_bytes_raises_when_audio_missing():
+    with pytest.raises(ValueError, match="没有音频数据"):
+        _extract_audio_response_bytes({"choices": [{"message": {}}]}, fallback_format="wav")
 
 
 # ───────── error_envelope ─────────
@@ -1135,6 +1414,20 @@ def test_serialize_to_upstream_ignores_non_dict_thinking_metadata():
     })
     upstream = _adapter().serialize_to_upstream(body)
     assert "thinking" not in upstream
+
+
+def test_serialize_to_upstream_preserves_assistant_audio_payload():
+    req = _adapter().parse_request({
+        "model": "mimo-v2.5-tts",
+        "messages": [{
+            "role": "assistant",
+            "content": None,
+            "audio": {"data": "QUJD", "format": "wav"},
+        }],
+    })
+    upstream = _adapter().serialize_to_upstream(req)
+    assert upstream["messages"][0]["audio"] == {"data": "QUJD", "format": "wav"}
+    assert upstream["messages"][0]["content"] is None
 
 
 def test_reasoning_cache_commits_mid_stream_on_first_tool_id():

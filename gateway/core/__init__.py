@@ -12,6 +12,7 @@ from .errors import (
     UpstreamTimeoutError,
 )
 from .types import (
+    AudioDelta,
     ContentBlockEnd,
     ContentBlockStart,
     ContentType,
@@ -56,6 +57,7 @@ __all__ = [
     # types — streaming events
     "InternalEvent",
     "MessageStart",
+    "AudioDelta",
     "ContentBlockStart",
     "TextDelta",
     "ReasoningDelta",

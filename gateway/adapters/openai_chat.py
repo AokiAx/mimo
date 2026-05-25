@@ -5,7 +5,7 @@ Dual role:
   * Client-facing adapter for /v1/chat/completions
   * UpstreamCodec — talks to the MiMo OpenAI-compatible upstream
 
-Streaming uses ``data: <json>\\n\\n`` chunks terminating with ``data: [DONE]``.
+Streaming uses ``data: <json>\n\n`` chunks terminating with ``data: [DONE]``.
 Tool calls stream as incremental ``tool_calls[i].function.arguments`` deltas.
 """
 from __future__ import annotations
@@ -23,6 +23,7 @@ from gateway.reasoning_cache import (
 )
 from gateway.core import (
     AdapterError,
+    AudioDelta,
     BadRequestError,
     ContentBlockEnd,
     ContentBlockStart,
@@ -101,6 +102,8 @@ def _canonical_message_bytes(m: InternalMessage) -> bytes:
             blocks.append({"t": "image", "mime": c.image_mime or "", "d": c.image_data or ""})
         # NOTE: "thinking" blocks deliberately omitted — see docstring.
     payload = {"role": m.role, "content": blocks}
+    if m.audio is not None:
+        payload["audio"] = m.audio
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -167,7 +170,7 @@ def _conversation_key_from_scope_blob(scope_blob: bytes) -> str:
 async def iter_sse_data(raw: AsyncIterator[bytes]) -> AsyncIterator[str]:
     """Yield the JSON payload from each ``data:`` line in an SSE byte stream.
 
-    Handles arbitrary chunk boundaries by buffering until ``\\n``. Skips empty
+    Handles arbitrary chunk boundaries by buffering until ``\n``. Skips empty
     data lines (used as keepalive). Tail without trailing newline is flushed.
     """
     buf = b""
@@ -288,10 +291,12 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     tool_input=tool_input or {},
                 ))
             reasoning = m.get("reasoning_content")
+            audio = m.get("audio")
             return InternalMessage(
                 role="assistant",
                 content=content_blocks,
                 reasoning_content=reasoning if isinstance(reasoning, str) else None,
+                audio=audio if isinstance(audio, dict) else None,
             )
 
         # user / system: string OR list of content blocks
@@ -444,6 +449,8 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 "role": "assistant",
                 "content": "".join(text_parts) if text_parts else None,
             }
+            if m.audio is not None:
+                out["audio"] = m.audio
             if m.reasoning_content is not None:
                 out["reasoning_content"] = m.reasoning_content
             elif tool_uses and (conversation_keys or conversation_key is not None):
@@ -477,13 +484,15 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     for tu in tool_uses
                 ]
             # MiMo rejects assistant messages that supply none of content /
-            # reasoning_content / tool_calls. Claude Code occasionally re-sends
-            # historical {role: assistant, content: null} stubs; backfill a
-            # whitespace placeholder so history can round-trip instead of 400.
+            # reasoning_content / tool_calls / audio. Claude Code occasionally
+            # re-sends historical {role: assistant, content: null} stubs;
+            # backfill a whitespace placeholder so history can round-trip
+            # instead of 400.
             if (
                 out["content"] is None
                 and "reasoning_content" not in out
                 and "tool_calls" not in out
+                and "audio" not in out
             ):
                 out["content"] = " "
             return out
@@ -539,6 +548,13 @@ class OpenAIChatAdapter(ProtocolAdapter):
 
         events: list[InternalEvent] = [MessageStart(message_id=message_id, model=model)]
         next_idx = 0
+
+        audio = msg.get("audio")
+        if isinstance(audio, dict):
+            audio_data = audio.get("data")
+            audio_format = audio.get("format")
+            if isinstance(audio_data, str) and audio_data:
+                events.append(AudioDelta(data=audio_data, format=audio_format if isinstance(audio_format, str) else None))
 
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
@@ -598,6 +614,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         tool_idx_map: dict[int, int] = {}        # OpenAI idx → IES idx
         tool_id_by_idx: dict[int, str] = {}      # IES idx → tool_id
         reasoning_parts: list[str] = []
+        audio_format = ""
         next_block = 0
         finish_reason: str | None = None
         usage = Usage()
@@ -631,6 +648,15 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     model=last_model,
                 )
                 message_started = True
+
+            delta_audio = delta.get("audio")
+            if isinstance(delta_audio, dict):
+                chunk_data = delta_audio.get("data")
+                chunk_format = delta_audio.get("format")
+                if isinstance(chunk_format, str) and chunk_format:
+                    audio_format = chunk_format
+                if isinstance(chunk_data, str) and chunk_data:
+                    yield AudioDelta(data=chunk_data, format=audio_format or (chunk_format if isinstance(chunk_format, str) else None))
 
             reasoning = delta.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning:
@@ -734,6 +760,19 @@ class OpenAIChatAdapter(ProtocolAdapter):
                         "finish_reason": None,
                     }],
                 })
+            elif isinstance(ev, AudioDelta):
+                delta: dict[str, Any] = {"data": ev.data}
+                if ev.format:
+                    delta["format"] = ev.format
+                yield self._sse_chunk({
+                    "id": message_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"audio": delta},
+                        "finish_reason": None,
+                    }],
+                })
             elif isinstance(ev, TextDelta):
                 yield self._sse_chunk({
                     "id": message_id, "object": "chat.completion.chunk",
@@ -826,11 +865,17 @@ class OpenAIChatAdapter(ProtocolAdapter):
         tool_calls_by_idx: dict[int, dict[str, Any]] = {}
         finish: FinishReason = "stop"
         usage = Usage()
+        audio_parts: list[str] = []
+        audio_format = ""
 
         for ev in events:
             if isinstance(ev, MessageStart):
                 message_id = ev.message_id
                 model = ev.model
+            elif isinstance(ev, AudioDelta):
+                audio_parts.append(ev.data)
+                if ev.format:
+                    audio_format = ev.format
             elif isinstance(ev, ContentBlockStart) and ev.block_type == "tool_use":
                 tool_calls_by_idx[ev.index] = {
                     "id": ev.tool_id or "",
@@ -852,6 +897,10 @@ class OpenAIChatAdapter(ProtocolAdapter):
             "role": "assistant",
             "content": "".join(text_parts) if text_parts else None,
         }
+        if audio_parts:
+            msg["audio"] = {"data": "".join(audio_parts)}
+            if audio_format:
+                msg["audio"]["format"] = audio_format
         if reasoning_parts:
             msg["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls_by_idx:
@@ -861,7 +910,12 @@ class OpenAIChatAdapter(ProtocolAdapter):
         # re-send it on the next turn, which MiMo then rejects with 400. A
         # whitespace placeholder breaks that feedback loop without changing
         # the message semantics.
-        if msg["content"] is None and "tool_calls" not in msg and "reasoning_content" not in msg:
+        if (
+            msg["content"] is None
+            and "tool_calls" not in msg
+            and "reasoning_content" not in msg
+            and "audio" not in msg
+        ):
             msg["content"] = " "
 
         body = {
