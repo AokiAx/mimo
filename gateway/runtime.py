@@ -276,6 +276,7 @@ async def _dispatch_preparsed(adapter_name: str, request: Request, body: dict[st
 
 async def dispatch(adapter_name: str, request: Request) -> Response:
     """Run a single request through the pipeline and return a FastAPI Response."""
+    _ensure_initialized()
     adapter = _adapters[adapter_name]
     try:
         body = await _read_json_body(request)
@@ -286,6 +287,7 @@ async def dispatch(adapter_name: str, request: Request) -> Response:
 
 async def dispatch_with_body_override(adapter_name: str, request: Request, body: dict[str, Any]) -> Response:
     """Variant of dispatch() for routes that translate one protocol into another first."""
+    _ensure_initialized()
     adapter = _adapters[adapter_name]
     if not isinstance(body, dict):
         return _error_response(adapter, BadRequestError("Request body must be a JSON object"))
