@@ -34,10 +34,11 @@ import json
 import os
 import re
 import threading
-from pathlib import Path
 from typing import Any
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "model_groups.json"
+from project_paths import MODEL_GROUPS_PATH
+
+DATA_PATH = MODEL_GROUPS_PATH
 
 VALID_PROTOCOLS = ("openai", "anthropic")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,32}$")

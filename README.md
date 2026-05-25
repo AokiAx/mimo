@@ -56,15 +56,29 @@ bash run.sh
 
 ```
 mimo/
-├── app.py                  # FastAPI 入口：管理面板、认证中间件、注册 gateway 路由
+├── app.py                  # 薄入口：创建 ASGI app，保留 python app.py 启动方式和旧导出
+├── app_factory.py          # FastAPI 应用工厂：集中注册 Claw、面板、Gateway、生命周期
+├── app_lifecycle.py        # startup / shutdown 任务 wiring
+├── app_compat.py           # app.py 旧 helper 导出兼容层
+├── project_paths.py        # BASE_DIR / DATA_DIR / LOG_DIR 等共享路径
 ├── run.sh                  # 启动脚本
 ├── requirements.txt
 │
 ├── claw/                   # MiMo 自动化
+│   ├── account_store.py    # 账号 Cookie 文件读写
+│   ├── account_routes.py   # 账号相关 API 聚合注册
+│   ├── account_helpers.py  # 账号 API 共享 helper
+│   ├── account_cookie_routes.py # Cookie 状态、浏览器 Cookie 同步
+│   ├── account_login_routes.py # 账号 SSO 登录 / 验证
+│   ├── account_claw_routes.py # 单账号 Claw 状态、刷新、聊天
+│   ├── account_crud_routes.py # 账号列表、新增、切换、删除
+│   ├── client.py           # MiMo HTTP/WebSocket/FDS 客户端封装
+│   ├── management_routes.py # 管理面板的 Claw 聊天、部署文档、文件上传 API
+│   ├── auto_deploy_routes.py # 自动部署配置、历史、日志 API
 │   ├── mimo_auth.py        # 小米 SSO 登录 + Cookie 管理
 │   ├── mimo_chat.py        # HTTP/SSE 对话客户端
 │   ├── mimo_ws_client.py   # WebSocket 对话客户端
-│   ├── auto_deploy.py      # 定时部署调度器
+│   ├── auto_deploy.py      # 定时部署调度器（暂保留单文件实现）
 │   └── payload/
 │       ├── api-proxy.py         # 部署到 ECS 的独立 aiohttp 代理
 │       ├── ecs_finalize.sh      # Step 7 远端 finalize 脚本
@@ -87,6 +101,13 @@ mimo/
 │   ├── probe_registry.py   # VPS probe 节点与最新心跳
 │   ├── probe_dump.py       # MIMO_PROBE_DUMP 请求调试输出
 │   ├── logging_setup.py    # 应用日志轮转、tail、列表
+│   ├── panel_auth.py       # 面板登录、登出、cookie 鉴权
+│   ├── panel_routes.py     # 面板 API 聚合注册
+│   ├── panel_page_routes.py # 面板页面、静态统计页、日志/部署文档读取
+│   ├── panel_backend_routes.py # Gateway 后端 CRUD、启停、激活、重载
+│   ├── panel_metrics_routes.py # 指标、状态、API key 管理
+│   ├── panel_model_group_routes.py # 模型分组 CRUD
+│   ├── panel_probe_routes.py # VPS probe 节点状态和刷新
 │   │
 │   ├── adapters/           # 协议双向适配器
 │   │   ├── base.py             # ProtocolAdapter / UpstreamCodec 接口
@@ -130,6 +151,8 @@ mimo/
     └── <email>.json
 ```
 
+入口边界保持简单：`app.py` 只负责创建 `app` 和兼容旧 import，`app_factory.py` 负责把各模块注册到 FastAPI 并挂载 lifespan；`app_compat.py` 保留 `claw/auto_deploy.py` 等旧代码仍在使用的 helper 导出；`claw/account_routes.py` 和 `gateway/panel_routes.py` 只聚合拆分后的路由模块。
+
 ---
 
 ## Gateway 架构
@@ -139,7 +162,7 @@ OpenAI Chat / Responses 走 IES 适配链路：
 ```
 client request
    ↓
-app.py /v1/{path:path}
+gateway.routes /v1/{path:path}
    ↓ Bearer / x-api-key / api-key / 面板 cookie 鉴权
 gateway.runtime.dispatch(adapter_name, request)
    ↓

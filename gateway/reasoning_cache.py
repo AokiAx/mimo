@@ -37,12 +37,13 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
+from project_paths import REASONING_CACHE_DB_PATH
 
 logger = logging.getLogger(__name__)
 
 # ────────────── tunables ──────────────
 
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "data" / "reasoning_cache.db"
+_DEFAULT_DB_PATH = REASONING_CACHE_DB_PATH
 _MAX_ENTRIES = 4096           # memory LRU cap (preserved name for monkeypatch in tests)
 _TTL_S = 7 * 24 * 3600        # 7 days
 _WRITE_QUEUE_MAX = 1024
@@ -197,12 +198,15 @@ def reset_for_tests() -> None:
 def _writer_loop() -> None:
     """Background worker: pull entries off the queue and batch-write."""
     path = _db_path()
+    queue_ref = _write_queue
+    if queue_ref is None:
+        return
     conn = sqlite3.connect(str(path), check_same_thread=False)
     last_purge = time.time()
     try:
         while True:
             try:
-                first = _write_queue.get(timeout=_WORKER_DRAIN_TIMEOUT_S)  # type: ignore[union-attr]
+                first = queue_ref.get(timeout=_WORKER_DRAIN_TIMEOUT_S)
             except queue.Empty:
                 if _writer_stop.is_set():
                     return
@@ -212,14 +216,16 @@ def _writer_loop() -> None:
                     last_purge = time.time()
                 continue
             if first is None:
+                queue_ref.task_done()
                 return
 
             batch = [first]
+            task_count = 1
             # Drain any other pending items so we commit them in one
             # transaction — turns N requests into 1 fsync.
             while True:
                 try:
-                    nxt = _write_queue.get_nowait()  # type: ignore[union-attr]
+                    nxt = queue_ref.get_nowait()
                 except queue.Empty:
                     break
                 if nxt is None:
@@ -235,8 +241,12 @@ def _writer_loop() -> None:
                         conn.commit()
                     except sqlite3.DatabaseError as e:
                         logger.warning("reasoning_cache flush on shutdown failed: %s", e)
+                    finally:
+                        for _ in range(task_count + 1):
+                            queue_ref.task_done()
                     return
                 batch.append(nxt)
+                task_count += 1
 
             try:
                 conn.executemany(
@@ -251,6 +261,9 @@ def _writer_loop() -> None:
                 # disk issues.
                 logger.warning("reasoning_cache write failed (%d items): %s",
                                len(batch), e)
+            finally:
+                for _ in range(task_count):
+                    queue_ref.task_done()
     finally:
         conn.close()
 
@@ -514,9 +527,16 @@ def clear_reasoning_cache() -> None:
 
 
 def flush(timeout_s: float = 2.0) -> None:
-    """Wait for the writer queue to drain. Used by tests and graceful shutdown."""
-    if _write_queue is None:
+    """Wait for queued writes to be committed.
+
+    ``Queue.empty()`` is not enough here: the writer can already have pulled a
+    batch off the queue while SQLite is still committing it.
+    """
+    queue_ref = _write_queue
+    if queue_ref is None:
         return
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline and not _write_queue.empty():
+    while time.monotonic() < deadline:
+        if queue_ref.unfinished_tasks == 0:
+            return
         time.sleep(0.01)

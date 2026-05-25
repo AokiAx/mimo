@@ -14,9 +14,10 @@ import json
 import secrets
 import threading
 import time
-from pathlib import Path
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "probe_nodes.json"
+from project_paths import PROBE_NODES_PATH
+
+DATA_PATH = PROBE_NODES_PATH
 OFFLINE_AFTER_S = 30  # 3x the default 10s report interval
 
 _lock = threading.Lock()

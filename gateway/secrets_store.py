@@ -16,9 +16,10 @@ import json
 import os
 import secrets as _secrets_mod
 from dataclasses import dataclass, field
-from pathlib import Path
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "secrets.json"
+from project_paths import SECRETS_PATH
+
+DATA_PATH = SECRETS_PATH
 
 
 @dataclass

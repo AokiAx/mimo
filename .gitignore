@@ -4,7 +4,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.cache/
 .pytest_cache/
+.pytest-tmp/
 .coverage
 htmlcov/
 
@@ -33,6 +35,7 @@ accounts/
 claw/mimo_cookies.json
 
 # Runtime data (databases, deploy state, logs)
+tmp/
 data/*.db
 data/*.db-shm
 data/*.db-wal
