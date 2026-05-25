@@ -18,10 +18,11 @@ import queue
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).parent.parent / "data" / "metrics.db"
+from project_paths import METRICS_DB_PATH
+
+DB_PATH = METRICS_DB_PATH
 
 
 def _get_conn() -> sqlite3.Connection:

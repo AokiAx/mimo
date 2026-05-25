@@ -7,15 +7,15 @@ installations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from fastapi import Request
 
 from gateway.config import APIKeyRecord, APIKeyStore
 from gateway.core import AuthError
 from gateway.secrets_store import secrets
+from project_paths import API_KEYS_DB_PATH
 
-API_KEYS_DB = Path(__file__).parent.parent / "data" / "api_keys.db"
+API_KEYS_DB = API_KEYS_DB_PATH
 
 
 @dataclass(frozen=True)

@@ -40,12 +40,11 @@ import time
 import subprocess
 import uuid
 import requests
-from pathlib import Path
 from datetime import datetime, timedelta
+from project_paths import ACCOUNTS_DIR, AUTH_CONFIG_PATH
 
 # 路径配置
-ACCOUNTS_DIR = Path(__file__).resolve().parent.parent / "accounts"
-AUTH_CONFIG = Path(__file__).resolve().parent.parent / "tmp" / "mimo_auth_config.json"
+AUTH_CONFIG = AUTH_CONFIG_PATH
 MIMO_BASE = "https://aistudio.xiaomimimo.com"
 XIAOMI_LOGIN = "https://account.xiaomi.com/pass/serviceLogin"
 XIAOMI_AUTH = "https://account.xiaomi.com/pass/serviceLoginAuth2"

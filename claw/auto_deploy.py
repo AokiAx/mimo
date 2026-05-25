@@ -37,12 +37,19 @@ from pathlib import Path
 from typing import Optional
 
 from croniter import croniter
+from project_paths import (
+    ACCOUNTS_DIR,
+    AUTO_DEPLOY_CONFIG_PATH,
+    CLAW_PAYLOAD_DIR,
+    DEPLOY_HISTORY_DIR,
+    DEPLOY_LOG_DIR,
+)
 
-CONFIG_PATH = Path(__file__).parent.parent / "data" / "auto_deploy.json"
-LOG_DIR = Path(__file__).parent.parent / "data" / "deploy_logs"
-HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
+CONFIG_PATH = AUTO_DEPLOY_CONFIG_PATH
+LOG_DIR = DEPLOY_LOG_DIR
+HISTORY_DIR = DEPLOY_HISTORY_DIR
 INCIDENT_DIR = LOG_DIR / "incidents"
-PAYLOAD_DIR = Path(__file__).parent / "payload"
+PAYLOAD_DIR = CLAW_PAYLOAD_DIR
 
 JUMP_SERVER = "149.88.90.137"
 JUMP_USER = "root"
@@ -539,8 +546,7 @@ def _get_app_module():
 def _load_account_cookies(account_filename: str) -> Optional[list]:
     """Read the account's saved cookies without touching global state.
     Returns None if the account file is missing or has no cookies."""
-    accounts_dir = Path(__file__).parent.parent / "accounts"
-    path = accounts_dir / f"{account_filename}.json"
+    path = ACCOUNTS_DIR / f"{account_filename}.json"
     if not path.exists():
         return None
     try:

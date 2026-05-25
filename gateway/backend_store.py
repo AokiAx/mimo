@@ -15,10 +15,11 @@ import json
 import os
 import secrets
 import threading
-from pathlib import Path
 from typing import Any
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "backends.json"
+from project_paths import BACKENDS_PATH
+
+DATA_PATH = BACKENDS_PATH
 
 _lock = threading.Lock()
 
