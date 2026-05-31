@@ -115,6 +115,9 @@ async def auth_middleware(request: Request, call_next):
     # Probe agent uses its own X-Probe-Token header
     if path == "/api/probe/report":
         return await call_next(request)
+    # Claw-worker (mainland NAS) uses its own X-Worker-Token header
+    if path == "/api/claw-worker/sync":
+        return await call_next(request)
     # Probe install assets (agent.py + install.sh) are public — token is in URL
     if path.startswith("/probe/"):
         return await call_next(request)
@@ -1841,6 +1844,83 @@ async def probe_report(request: Request):
     if not ok:
         return JSONResponse({"error": "unknown token"}, status_code=401)
     return {"ok": True}
+
+
+# ──────────── Claw-worker (mainland NAS distributed deploy) ────────────
+# A worker container on a mainland-IP host does the region-gated MiMo parts
+# (create claw + WS chat); the panel does the rest. See agent/worker/ and
+# gateway/claw_worker_registry.py. Worker management is panel-authed; the
+# /sync data channel uses its own X-Worker-Token (exempted in auth_middleware).
+
+@app.get("/api/claw-worker/nodes")
+async def claw_worker_list():
+    """Panel-only: list workers (with tokens) + current in-flight jobs."""
+    from gateway.claw_worker_registry import list_workers, list_jobs
+    return {"workers": list_workers(include_token=True), "jobs": list_jobs()}
+
+
+@app.post("/api/claw-worker/nodes/add")
+async def claw_worker_add(request: Request):
+    """Body: {name}. Returns {id, name, token}."""
+    from gateway.claw_worker_registry import add_worker
+    body = await request.json()
+    try:
+        return add_worker(body.get("name", ""))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/claw-worker/nodes/{worker_id}/delete")
+async def claw_worker_delete(worker_id: str):
+    from gateway.claw_worker_registry import delete_worker
+    ok = delete_worker(worker_id)
+    return {"success": ok} if ok else JSONResponse(
+        {"success": False, "error": "worker 不存在"}, status_code=404)
+
+
+@app.post("/api/claw-worker/nodes/{worker_id}/regen-token")
+async def claw_worker_regen(worker_id: str):
+    from gateway.claw_worker_registry import regenerate_token
+    token = regenerate_token(worker_id)
+    return {"token": token} if token else JSONResponse(
+        {"error": "worker 不存在"}, status_code=404)
+
+
+@app.post("/api/claw-worker/sync")
+async def claw_worker_sync(request: Request):
+    """Worker data channel. Auth via X-Worker-Token. phase = poll|claw_ready|
+    notified|report (see agent/worker/README.md)."""
+    from gateway.claw_worker_registry import (
+        touch, claim_job, on_claw_ready, on_notified, on_report,
+    )
+    token = request.headers.get("X-Worker-Token", "")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    worker = touch(token, body.get("worker") or {})
+    if not worker:
+        return JSONResponse({"error": "unknown token"}, status_code=401)
+
+    phase = body.get("phase")
+    if phase == "poll":
+        egress = (body.get("worker") or {}).get("egress") or {}
+        if not egress.get("cn"):
+            # Region guard: never dispatch claw work to a non-mainland egress.
+            return {"action": "idle", "note": "worker egress not mainland"}
+        job = claim_job(worker["id"])
+        return {"action": "deploy", "job": job} if job else {"action": "idle"}
+    if phase == "claw_ready":
+        ok, msg = await on_claw_ready(
+            body.get("job_id"), body.get("public_key", ""), body.get("log", ""))
+        return {"ok": True} if ok else {"ok": False, "error": msg}
+    if phase == "notified":
+        ok, detail = await on_notified(body.get("job_id"))
+        return {"ok": True, "detail": detail} if ok else {"ok": False, "error": detail}
+    if phase == "report":
+        on_report(body.get("job_id"), body.get("status", "error"), body.get("log", ""))
+        return {"ok": True}
+    return JSONResponse({"error": "bad phase"}, status_code=400)
 
 
 # ──────────── Probe public install assets ────────────

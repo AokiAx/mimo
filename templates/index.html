@@ -253,6 +253,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <div class="nav-item" data-page="vps" onclick="switchPage('vps')">
       <span class="icon">🛰️</span><span>VPS 监控</span>
     </div>
+    <div class="nav-item" data-page="claw-workers" onclick="switchPage('claw-workers')">
+      <span class="icon">🤖</span><span>Claw Workers</span>
+    </div>
     <div class="nav-item" data-page="api-docs" onclick="switchPage('api-docs')">
       <span class="icon">📖</span><span>API 文档</span>
     </div>
@@ -634,6 +637,63 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <div class="vps-grid" id="vpsGrid"></div>
     </div>
 
+    <!-- ════ Claw Workers (mainland NAS distributed deploy) ════ -->
+    <div class="page" id="page-claw-workers">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <h2 style="margin:0">Claw Workers</h2>
+          <div id="cwSummary" style="color:var(--text3);font-size:0.8rem;margin-top:4px">加载中…</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="cwToggleAdd()">添加 Worker</button>
+          <button class="btn btn-primary" onclick="refreshClawWorkers()">刷新</button>
+        </div>
+      </div>
+
+      <div class="section" style="font-size:0.82rem;color:var(--text2);line-height:1.6">
+        Worker 是跑在<strong>中国大陆 IP</strong> 设备(NAS/Docker)上的小服务,只负责
+        <strong>创建 claw + 与 claw 对话</strong>(MiMo 这两步按源 IP 限大陆)。其余(加公钥、SSH 进 claw、finalize)仍在本面板。
+        镜像:<code>ghcr.io/aoki2008/mimo-claw-worker</code>。
+      </div>
+
+      <div class="section" id="cwAddPanel" style="display:none">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">新增 Worker</h3>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+          <input type="text" id="cwNewName" placeholder="Worker 名（如 nas-mainland-01）"
+                 style="flex:1;padding:8px;background:#0d1b2a;border:1px solid var(--border);border-radius:6px;color:var(--text)">
+          <button class="btn btn-primary" onclick="cwAddWorker()">创建并生成 token</button>
+        </div>
+        <div id="cwAddResult" style="font-size:0.78rem;color:var(--text2)"></div>
+      </div>
+
+      <div class="section">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">Worker 节点</h3>
+        <table class="data-table">
+          <thead><tr><th>名称</th><th>状态</th><th>出口 IP / 归属地</th><th>版本</th><th>上次上报</th><th>操作</th></tr></thead>
+          <tbody id="cwWorkersBody"></tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">进行中的部署任务</h3>
+        <table class="data-table">
+          <thead><tr><th>Job</th><th>账号</th><th>状态</th><th>Worker</th><th>开始</th></tr></thead>
+          <tbody id="cwJobsBody"></tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">账号 → Worker 部署托管</h3>
+        <div style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">
+          勾选后该账号的部署由 Worker 在大陆执行(独立于本地调度的"启用"开关),按 Worker Cron 触发。
+        </div>
+        <table class="data-table">
+          <thead><tr><th>账号</th><th>Worker 托管</th><th>Worker Cron</th><th>上次 Worker 部署</th></tr></thead>
+          <tbody id="cwAccountsBody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- ════ API Docs ════ -->
     <div class="page" id="page-api-docs">
       <div class="section">
@@ -749,6 +809,7 @@ function switchPage(name) {
   if (name === 'mappings') refreshMappings();
   if (name === 'metrics') refreshMetrics();
   if (name === 'vps') refreshVps();
+  if (name === 'claw-workers') refreshClawWorkers();
 }
 
 function pageFromHash() {
@@ -2133,6 +2194,154 @@ window.vpsAddNode = vpsAddNode;
 window.vpsShowInstall = vpsShowInstall;
 window.vpsRegenToken = vpsRegenToken;
 window.vpsDeleteNode = vpsDeleteNode;
+
+// ══════════════════════════════════════════════════════
+// Claw Workers (mainland NAS distributed deploy)
+// ══════════════════════════════════════════════════════
+function _cwComposeHint(token) {
+  var base = window.location.origin;
+  return 'PANEL_URL=' + base + '\nWORKER_TOKEN=' + token +
+         '\n# docker compose up -d  (镜像 ghcr.io/aoki2008/mimo-claw-worker)';
+}
+
+function refreshClawWorkers() {
+  Promise.all([
+    api('GET', '/api/claw-worker/nodes'),
+    api('GET', '/api/auto-deploy/config'),
+  ]).then(function(res) {
+    var data = res[0] || {}, cfg = res[1] || {};
+    var workers = data.workers || [], jobs = data.jobs || [];
+    var online = workers.filter(function(w){return w.online;}).length;
+    var mainland = workers.filter(function(w){return w.online && w.meta && w.meta.egress && w.meta.egress.cn;}).length;
+    document.getElementById('cwSummary').textContent =
+      '共 ' + workers.length + ' 个 · 在线 ' + online + ' · 大陆出口 ' + mainland +
+      '（180s 无上报判离线）';
+
+    // workers table
+    var wb = '';
+    if (workers.length === 0) {
+      wb = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:18px">暂无 Worker。点右上角"添加 Worker"。</td></tr>';
+    } else {
+      workers.forEach(function(w) {
+        var eg = (w.meta && w.meta.egress) || {};
+        var egStr = eg.ip ? (eg.ip + ' / ' + (eg.country || '?') + (eg.cn ? ' ✅大陆' : ' ⚠️非大陆')) : '—';
+        var last = w.last_seen ? new Date(w.last_seen*1000).toLocaleTimeString('zh-CN',{hour12:false}) : '从未';
+        var pill = w.online ? '<span class="pill up">在线</span>' : '<span class="pill down">离线</span>';
+        wb += '<tr>' +
+          '<td>' + escapeHtml(w.name) + '</td>' +
+          '<td>' + pill + '</td>' +
+          '<td style="font-size:0.8rem">' + escapeHtml(egStr) + '</td>' +
+          '<td>' + escapeHtml((w.meta && w.meta.version) || '—') + '</td>' +
+          '<td>' + last + '</td>' +
+          '<td><button class="icon-btn" onclick="cwShowEnv(\'' + escapeHtml(w.token||'') + '\')">配置</button> ' +
+              '<button class="icon-btn" onclick="cwRegen(\'' + w.id + '\')">换token</button> ' +
+              '<button class="icon-btn" onclick="cwDelete(\'' + w.id + '\',\'' + escapeHtml(w.name) + '\')">删除</button></td>' +
+          '</tr>';
+      });
+    }
+    document.getElementById('cwWorkersBody').innerHTML = wb;
+
+    // jobs table
+    var jb = '';
+    if (jobs.length === 0) {
+      jb = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px">无进行中的任务</td></tr>';
+    } else {
+      jobs.forEach(function(j) {
+        var st = j.started ? new Date(j.started*1000).toLocaleTimeString('zh-CN',{hour12:false}) : '—';
+        jb += '<tr><td><code>' + escapeHtml(j.job_id) + '</code></td><td>' + escapeHtml(j.account) +
+          '</td><td>' + escapeHtml(j.status) + '</td><td>' + escapeHtml(j.worker_id) + '</td><td>' + st + '</td></tr>';
+      });
+    }
+    document.getElementById('cwJobsBody').innerHTML = jb;
+
+    // per-account worker-deploy table
+    var accs = (cfg.accounts) || {};
+    var ab = '';
+    var names = Object.keys(accs);
+    if (names.length === 0) {
+      ab = '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:14px">无账号配置</td></tr>';
+    } else {
+      names.forEach(function(acc) {
+        var c = accs[acc] || {};
+        var on = !!c.worker_deploy;
+        var cron = c.worker_cron || c.cron || '0 3 * * *';
+        var lastWr = c.worker_last_run ? new Date(c.worker_last_run*1000).toLocaleString('zh-CN',{hour12:false}) : '从未';
+        var accJs = acc.replace(/'/g, "\\'");
+        ab += '<tr>' +
+          '<td>' + escapeHtml(acc) + '</td>' +
+          '<td><input type="checkbox" ' + (on?'checked':'') + ' onchange="cwToggleAccount(\'' + escapeHtml(accJs) + '\',this.checked)"></td>' +
+          '<td><input type="text" value="' + escapeHtml(cron) + '" style="width:120px;padding:4px;background:#0d1b2a;border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.8rem" ' +
+              'onchange="cwSetCron(\'' + escapeHtml(accJs) + '\',this.value)"></td>' +
+          '<td style="font-size:0.8rem;color:var(--text3)">' + lastWr + '</td>' +
+          '</tr>';
+      });
+    }
+    document.getElementById('cwAccountsBody').innerHTML = ab;
+  }).catch(function() {
+    document.getElementById('cwSummary').textContent = '加载失败';
+  });
+}
+
+function cwToggleAdd() {
+  var p = document.getElementById('cwAddPanel');
+  p.style.display = p.style.display === 'none' ? '' : 'none';
+}
+
+function cwAddWorker() {
+  var name = (document.getElementById('cwNewName').value || '').trim();
+  if (!name) { toast('请填写名称', 'error'); return; }
+  api('POST', '/api/claw-worker/nodes/add', {name: name}).then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
+    document.getElementById('cwNewName').value = '';
+    document.getElementById('cwAddResult').innerHTML =
+      '已创建。NAS 上 .env 写入:<div class="install-block">' + escapeHtml(_cwComposeHint(d.token)) + '</div>';
+    toast('Worker 已添加', 'success');
+    refreshClawWorkers();
+  }).catch(function() { toast('添加失败', 'error'); });
+}
+
+function cwShowEnv(token) {
+  if (!token) { toast('无 token', 'error'); return; }
+  document.getElementById('cwAddPanel').style.display = '';
+  document.getElementById('cwAddResult').innerHTML =
+    'NAS .env:<div class="install-block">' + escapeHtml(_cwComposeHint(token)) + '</div>';
+}
+
+function cwRegen(id) {
+  if (!confirm('换 token 后旧 Worker 会失效,确定？')) return;
+  api('POST', '/api/claw-worker/nodes/' + id + '/regen-token').then(function(d) {
+    if (d.token) { cwShowEnv(d.token); toast('token 已更新', 'success'); refreshClawWorkers(); }
+    else { toast('失败', 'error'); }
+  }).catch(function() { toast('失败', 'error'); });
+}
+
+function cwDelete(id, name) {
+  if (!confirm('删除 Worker ' + name + '？')) return;
+  api('POST', '/api/claw-worker/nodes/' + id + '/delete').then(function() {
+    toast('已删除', 'success'); refreshClawWorkers();
+  }).catch(function() { toast('删除失败', 'error'); });
+}
+
+function cwToggleAccount(acc, on) {
+  api('POST', '/api/auto-deploy/account/' + encodeURIComponent(acc), {worker_deploy: on}).then(function() {
+    toast(on ? '已托管给 Worker' : '已取消托管', 'success');
+  }).catch(function() { toast('保存失败', 'error'); });
+}
+
+function cwSetCron(acc, cron) {
+  api('POST', '/api/auto-deploy/account/' + encodeURIComponent(acc), {worker_cron: cron}).then(function() {
+    toast('Worker Cron 已保存', 'success');
+  }).catch(function() { toast('保存失败', 'error'); });
+}
+
+window.refreshClawWorkers = refreshClawWorkers;
+window.cwToggleAdd = cwToggleAdd;
+window.cwAddWorker = cwAddWorker;
+window.cwShowEnv = cwShowEnv;
+window.cwRegen = cwRegen;
+window.cwDelete = cwDelete;
+window.cwToggleAccount = cwToggleAccount;
+window.cwSetCron = cwSetCron;
 
 // ══════════════════════════════════════════════════════
 // Clock & Init
