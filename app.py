@@ -1854,9 +1854,10 @@ async def probe_report(request: Request):
 
 @app.get("/api/claw-worker/nodes")
 async def claw_worker_list():
-    """Panel-only: list workers (with tokens) + current in-flight jobs."""
-    from gateway.claw_worker_registry import list_workers, list_jobs
-    return {"workers": list_workers(include_token=True), "jobs": list_jobs()}
+    """Panel-only: list workers (with tokens) + in-flight jobs + recent results."""
+    from gateway.claw_worker_registry import list_workers, list_jobs, list_recent
+    return {"workers": list_workers(include_token=True), "jobs": list_jobs(),
+            "recent": list_recent()}
 
 
 @app.post("/api/claw-worker/nodes/add")

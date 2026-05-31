@@ -43,14 +43,17 @@ def _ad():
 # ─── worker registry (token == id, like probe) ───
 
 def _empty():
-    return {"workers": {}}
+    return {"workers": {}, "recent": []}
 
 
 def _load() -> dict:
     if not DATA_PATH.exists():
         return _empty()
     try:
-        return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        d = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        d.setdefault("workers", {})
+        d.setdefault("recent", [])
+        return d
     except (OSError, json.JSONDecodeError):
         return _empty()
 
@@ -235,7 +238,8 @@ async def on_notified(job_id: str):
 
 
 def on_report(job_id: str, status: str, worker_log: str = "") -> None:
-    """Final report from worker. Persist run history + clear in-flight."""
+    """Final report from worker. Persist run history + clear in-flight +
+    record a recent-result row so the panel can show success/failure."""
     job = _jobs.pop(job_id, None)
     if not job:
         return
@@ -246,6 +250,12 @@ def on_report(job_id: str, status: str, worker_log: str = "") -> None:
             log.lines.append(f"[worker] {line}")
     log.log(f"=== 部署结束: {status} ===")
     hist_status = "success" if status == "done" else "error"
+    summary = ""
+    for ln in reversed(log.lines):
+        s = ln.split("] ", 1)[-1].strip()
+        if s and not s.startswith("==="):
+            summary = s[:160]
+            break
     try:
         ad._save_run_history(job["account"], hist_status, log.lines[:])
         if status == "done":
@@ -255,7 +265,24 @@ def on_report(job_id: str, status: str, worker_log: str = "") -> None:
                 ad.save_config(cfg)
     except Exception:
         pass
+    _record_recent(job["account"], status, job["worker_id"], job_id, summary)
     _inflight.pop(job["account"], None)
+
+
+def _record_recent(account: str, status: str, worker_id: str, job_id: str, summary: str) -> None:
+    with _lock:
+        data = _load()
+        data["recent"].insert(0, {
+            "account": account, "status": status, "worker_id": worker_id[:8],
+            "job_id": job_id, "summary": summary, "finished_at": time.time(),
+        })
+        data["recent"] = data["recent"][:30]
+        _save(data)
+
+
+def list_recent() -> list[dict]:
+    with _lock:
+        return _load().get("recent", [])
 
 
 def list_jobs() -> list[dict]:

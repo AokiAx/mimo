@@ -683,6 +683,14 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       </div>
 
       <div class="section">
+        <h3 style="margin:0 0 10px 0;font-size:0.95rem">最近部署结果</h3>
+        <table class="data-table">
+          <thead><tr><th>结果</th><th>账号</th><th>说明</th><th>Worker</th><th>完成时间</th></tr></thead>
+          <tbody id="cwRecentBody"></tbody>
+        </table>
+      </div>
+
+      <div class="section">
         <h3 style="margin:0 0 10px 0;font-size:0.95rem">账号 → Worker 部署托管</h3>
         <div style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">
           勾选后该账号的部署由 Worker 在大陆执行(独立于本地调度的"启用"开关),按 Worker Cron 触发。
@@ -2253,6 +2261,24 @@ function refreshClawWorkers() {
       });
     }
     document.getElementById('cwJobsBody').innerHTML = jb;
+
+    // recent results table — so you can actually see success/failure
+    var recent = data.recent || [];
+    var rb = '';
+    if (recent.length === 0) {
+      rb = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px">暂无部署记录</td></tr>';
+    } else {
+      recent.forEach(function(r) {
+        var ok = r.status === 'done';
+        var badge = ok ? '<span class="pill up">✅ 成功</span>'
+          : '<span class="pill down">❌ ' + escapeHtml(r.status || 'error') + '</span>';
+        var t = r.finished_at ? new Date(r.finished_at*1000).toLocaleString('zh-CN',{hour12:false}) : '—';
+        rb += '<tr><td>' + badge + '</td><td>' + escapeHtml(r.account) +
+          '</td><td style="font-size:0.8rem;color:var(--text2)">' + escapeHtml(r.summary || '') +
+          '</td><td>' + escapeHtml(r.worker_id || '') + '</td><td>' + t + '</td></tr>';
+      });
+    }
+    document.getElementById('cwRecentBody').innerHTML = rb;
 
     // per-account worker-deploy table
     var accs = (cfg.accounts) || {};
