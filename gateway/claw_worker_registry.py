@@ -1,18 +1,24 @@
-"""Claw-worker registry + distributed deploy state machine.
+"""Claw-worker registry + distributed deploy state machine (WS tunnel mode).
 
 The worker (a mainland-IP container, see agent/worker/) does the region-gated
-MiMo parts: create claw + WS chat. The panel does everything else (add key to
-jump server, ssh into claw, finalize, verify). This module is the panel side:
+MiMo parts: create claw + WS chat (template reset + inject the ws-bridge). The
+bridge then dials back to this gateway's /ws. The panel does dispatch, drain,
+verification (is the account's bridge node online?) and warmup. No jump server,
+no SSH — the panel never touches the claw machine directly.
 
   * worker registry  — token-issued workers, online state (like probe nodes)
   * job dispatch      — picks a due ``worker_deploy`` account, hands a job out
-  * step handlers     — claw_ready / notified / report, reusing auto_deploy's
-                        server-side helpers (_deploy_ssh_key / _ecs_finalize)
+                        (reset message + the per-account bridge inject prompt)
+  * step handlers     — verify / report
 
 Worker-managed accounts are flagged ``worker_deploy: true`` in
 data/auto_deploy.json and scheduled by ``worker_cron`` / ``worker_last_run``.
 They are INDEPENDENT of the local scheduler's ``enabled`` flag, so the two
 deploy paths never collide and the local scheduler is untouched.
+
+Live logs: a job's DeployLogger is registered into ``auto_deploy._active_deploys``
+under the account, so the existing /api/auto-deploy/status/<account> endpoint and
+the panel deploy-log modal stream worker progress just like a local deploy.
 """
 from __future__ import annotations
 
@@ -29,10 +35,9 @@ DATA_PATH = Path(__file__).parent.parent / "data" / "claw_workers.json"
 OFFLINE_AFTER_S = 180          # 3x the default 60s poll interval
 JOB_STALE_AFTER_S = 30 * 60    # reclaim accounts whose worker died mid-job
 WORKER_FIRE_WINDOW_S = 180     # only fire within this window after a cron boundary
-DEFAULT_NOTIFY = "密钥已添加完成，请执行后续连接操作。"
 
 _lock = threading.Lock()
-_jobs: dict[str, dict] = {}        # job_id -> {account, worker_id, ssh_port, api_port, logger, status, started}
+_jobs: dict[str, dict] = {}        # job_id -> {account, worker_id, logger, status, started}
 _inflight: dict[str, str] = {}     # account -> job_id
 _force: set[str] = set()           # accounts queued for an immediate (manual) deploy
 
@@ -191,8 +196,11 @@ def force_deploy(account: str) -> bool:
 
 def claim_job(worker_id: str) -> dict | None:
     """Pick a forced or cron-due worker-managed account, mark in-flight + mark
-    the cron boundary fired (worker_last_run=now), build a job."""
+    the cron boundary fired (worker_last_run=now), build a WS deploy job."""
     ad = _ad()
+    if not getattr(ad, "_WS_PUBLIC_URL", ""):
+        # No public /ws URL configured → a bridge would have nowhere to dial.
+        return None
     with _lock:
         _reap_stale()
         cfg = ad.load_config()
@@ -217,69 +225,83 @@ def claim_job(worker_id: str) -> dict | None:
         cfg["accounts"][acc]["worker_last_run"] = time.time()
         ad.save_config(cfg)
         job_id = uuid.uuid4().hex[:12]
-        ssh_port = acc_cfg.get("ssh_port", 8022)
-        api_port = acc_cfg.get("api_port", 8800)
         logger = ad.DeployLogger(acc)
-        logger.log(f"=== worker 分布式部署 (worker={worker_id[:8]}, job={job_id}) ===")
+        logger.log(f"=== worker 分布式部署 (WS, worker={worker_id[:8]}, job={job_id}) ===")
+        _register_active(acc, logger)
+        _set_active_state(acc, "worker:dispatched")
         _inflight[acc] = job_id
         _jobs[job_id] = {
-            "account": acc, "worker_id": worker_id, "ssh_port": ssh_port,
-            "api_port": api_port, "logger": logger, "status": "dispatched",
-            "started": time.time(),
+            "account": acc, "worker_id": worker_id, "logger": logger,
+            "status": "dispatched", "started": time.time(), "log_len": 0,
         }
+        # Panel: drain the soon-to-be-replaced backend before the worker
+        # recreates the claw. Best-effort.
+        try:
+            ad._notify_gateway_deploy_start(acc, logger)
+        except Exception as e:  # noqa: BLE001
+            logger.log(f"⚠️ Gateway 预切换异常(忽略): {e}")
         return {
-            "job_id": job_id, "account": acc,
-            "deploy_text": acc_cfg.get("deploy_text", ""),
-            "cookies": cookies, "ssh_port": ssh_port, "api_port": api_port,
-            "notify_text": acc_cfg.get("notify_text", DEFAULT_NOTIFY),
+            "job_id": job_id,
+            "account": acc,
+            "cookies": cookies,
+            "reset_message": ad._CLAW_TEMPLATE_RESET_MESSAGE,
+            "inject_prompt": ad._bridge_inject_prompt(acc),
         }
 
 
-async def on_claw_ready(job_id: str, public_key: str, worker_log: str = ""):
-    """Worker got the ECS pubkey. Add it to jump server + clean tunnel ports."""
+def _absorb_worker_log(job: dict, worker_log: str) -> None:
+    """Append only the new tail of the worker's cumulative log to the job
+    logger (the worker resends its full buffer each sync)."""
+    if not worker_log:
+        return
+    lines = worker_log.splitlines()
+    seen = job.get("log_len", 0)
+    for line in lines[seen:]:
+        job["logger"].lines.append(f"[worker] {line}")
+    job["log_len"] = len(lines)
+
+
+def on_verify(job_id: str, worker_log: str = "") -> tuple[bool, bool]:
+    """Worker injected the bridge and is asking whether the account's node has
+    dialed back to /ws yet. Returns (job_known, connected)."""
     job = _jobs.get(job_id)
     if not job:
-        return False, "unknown job"
-    ad = _ad()
-    log = job["logger"]
-    if not public_key:
-        return False, "no public_key"
-    ok, msg = await ad._deploy_ssh_key(public_key, log)
-    if not ok:
-        job["status"] = "error"
-        return False, msg
+        return False, False
+    _absorb_worker_log(job, worker_log)
+    account = job["account"]
     try:
-        cmd = ad._clean_tunnel_ports_cmd([job["ssh_port"], job["api_port"]])
-        await ad._ssh_jump_async(cmd)
-    except Exception as e:
-        log.log(f"端口清理异常(忽略): {e}")
-    job["status"] = "key_added"
-    return True, "key added"
-
-
-async def on_notified(job_id: str):
-    """Worker notified claw → tunnel up. SSH into claw + finalize + verify."""
-    job = _jobs.get(job_id)
-    if not job:
-        return False, "unknown job"
-    ad = _ad()
-    log = job["logger"]
-    ok, msg = await ad._ecs_finalize(job["ssh_port"], job["api_port"], log)
-    job["status"] = "finalized" if ok else "error"
-    return ok, msg
+        from gateway.ws_tunnel import tunnel
+        connected = tunnel.has_account(account)
+    except Exception:
+        connected = False
+    job["status"] = "verifying" if not connected else "node_online"
+    _set_active_state(account, "worker:verifying" if not connected else "worker:node_online")
+    if connected:
+        job["logger"].log(f"✅ bridge 节点已接入 /ws (account={account})")
+    return True, connected
 
 
 def on_report(job_id: str, status: str, worker_log: str = "") -> None:
-    """Final report from worker. Persist run history + clear in-flight +
-    record a recent-result row so the panel can show success/failure."""
+    """Final report from worker. On success kick the gateway warmup; on failure
+    release the failed backend. Persist run history + clear in-flight + record a
+    recent-result row so the panel can show success/failure."""
     job = _jobs.pop(job_id, None)
     if not job:
         return
     ad = _ad()
     log = job["logger"]
-    if worker_log:
-        for line in worker_log.splitlines():
-            log.lines.append(f"[worker] {line}")
+    _absorb_worker_log(job, worker_log)
+    account = job["account"]
+    if status == "done":
+        try:
+            ad._notify_gateway_deploy_done(account, log)
+        except Exception as e:  # noqa: BLE001
+            log.log(f"⚠️ Gateway 热身触发异常: {e}")
+    else:
+        try:
+            ad._notify_gateway_deploy_failed(account, status, log)
+        except Exception:
+            pass
     log.log(f"=== 部署结束: {status} ===")
     hist_status = "success" if status == "done" else "error"
     summary = ""
@@ -289,11 +311,38 @@ def on_report(job_id: str, status: str, worker_log: str = "") -> None:
             summary = s[:160]
             break
     try:
-        ad._save_run_history(job["account"], hist_status, log.lines[:])
+        ad._save_run_history(account, hist_status, log.lines[:])
     except Exception:
         pass
-    _record_recent(job["account"], status, job["worker_id"], job_id, summary)
-    _inflight.pop(job["account"], None)
+    _record_recent(account, status, job["worker_id"], job_id, summary)
+    _set_active_state(account, "done" if status == "done" else "error", finished=True)
+    _inflight.pop(account, None)
+
+
+# ─── live-log bridge into auto_deploy._active_deploys ───
+
+def _register_active(account: str, logger) -> None:
+    """Expose a worker job through the same map the local deploy UI reads, so
+    /api/auto-deploy/status/<account> streams worker progress live."""
+    import threading as _t
+    _ad()._active_deploys[account] = {
+        "thread": None,
+        "logger": logger,
+        "state": "worker:starting",
+        "cancel": _t.Event(),
+        "started_at": datetime.now().isoformat(),
+        "started_ts": time.time(),
+        "finished_ts": None,
+    }
+
+
+def _set_active_state(account: str, state: str, *, finished: bool = False) -> None:
+    entry = _ad()._active_deploys.get(account)
+    if not entry:
+        return
+    entry["state"] = state
+    if finished:
+        entry["finished_ts"] = time.time()
 
 
 def _record_recent(account: str, status: str, worker_id: str, job_id: str, summary: str) -> None:

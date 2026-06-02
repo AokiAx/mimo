@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -44,8 +45,8 @@ from gateway.secrets_store import secrets as _secrets
 AUTH_COOKIE = "mimo_panel_auth"
 # Panel session token is SEPARATE from the public API token, so a leaked API
 # token (handed to /v1 clients) can't be replayed as an admin session cookie.
-AUTH_TOKEN = _secrets.panel_session_token
-PANEL_PASSWORD = _secrets.panel_password
+# These are read LIVE off the _secrets singleton (not captured) so editing them
+# from the panel takes effect immediately, without a restart.
 
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -88,10 +89,10 @@ async def do_login(request: Request):
     from urllib.parse import parse_qs
     params = parse_qs(body.decode())
     pwd = params.get("password", [""])[0]
-    if pwd == PANEL_PASSWORD:
+    if pwd == _secrets.panel_password:
         _audit("login_success", request)
         resp = RedirectResponse("/", status_code=302)
-        resp.set_cookie(AUTH_COOKIE, AUTH_TOKEN, max_age=86400*30, httponly=True)
+        resp.set_cookie(AUTH_COOKIE, _secrets.panel_session_token, max_age=86400*30, httponly=True)
         return resp
     _audit("login_failure", request, pwd_len=len(pwd))
     return RedirectResponse("/login?err=1", status_code=302)
@@ -131,10 +132,11 @@ async def auth_middleware(request: Request, call_next):
     # Probe install assets (agent.py + install.sh) are public — token is in URL
     if path.startswith("/probe/"):
         return await call_next(request)
-    # Publicly readable endpoints (no auth — safe to expose)
-    if path in ("/stats", "/api/public/stats"):
+    # Public status endpoint — key-gated inside the handler (separate token),
+    # so it's exempt from the panel cookie/login here.
+    if path == "/api/public/status":
         return await call_next(request)
-    if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
+    if request.cookies.get(AUTH_COOKIE) != _secrets.panel_session_token:
         # Don't audit every redirect (browsers retry, gets noisy), only the
         # ones with an *attempted* but wrong cookie value — that's the
         # interesting signal.
@@ -165,11 +167,12 @@ async def startup_event():
     # repo, so any deployment that keeps it = open admin. We don't *force*
     # a change here because some operators may genuinely run on a private
     # network, but the warning makes the risk visible in logs.
-    if PANEL_PASSWORD == "Aoki-MiMo":
+    if _secrets.panel_password == "Aoki-MiMo":
         logger.warning(
             "[startup] SECURITY: panel password is the public default "
             "'Aoki-MiMo'. If this panel is reachable from the internet, "
-            "anyone scanning can log in. Change it via data/secrets.json."
+            "anyone scanning can log in. Change it on the panel's 密钥管理 page "
+            "or in data/secrets.json."
         )
     # Set DISABLE_SCHEDULER=1 in the systemd unit to keep the scheduler off
     # (e.g. when first deploying to a new host — operators usually want to
@@ -230,11 +233,11 @@ _ACCOUNTS_DIR_RESOLVED: Path | None = None
 
 def _is_public_path(path: str) -> bool:
     """Paths reachable from ANY ip (not gated by the panel IP allowlist):
-    the public API, token-authed worker/probe channels, stats and health."""
+    the public API, token-authed worker/probe/status channels and health."""
     if path.startswith(("/v1/", "/static", "/probe/")):
         return True
     return path in (
-        "/health", "/gateway/status", "/stats", "/api/public/stats",
+        "/health", "/gateway/status", "/api/public/status",
         "/api/probe/report", "/api/claw-worker/sync", "/ws",
     )
 
@@ -1673,14 +1676,39 @@ async def gateway_metrics_status(hours: int = 24):
         return {"distribution": {}}
 
 
-@app.get("/api/public/stats")
-async def public_stats():
-    """All-time totals — safe to expose without auth."""
+@app.get("/api/public/status")
+async def public_status(request: Request, key: str = ""):
+    """Key-gated status feed for an externally-hosted status page.
+
+    Requires the dedicated ``status_api_token`` (NOT the API or panel token),
+    via ``Authorization: Bearer <token>`` / ``X-Status-Key`` header or ``?key=``.
+    Returns only curated, non-sensitive aggregates — no backend names or keys."""
+    expected = _secrets.status_api_token
+    auth = request.headers.get("authorization", "")
+    bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    supplied = key or request.headers.get("x-status-key", "") or bearer
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
         from gateway.metrics import get_public_totals
-        return get_public_totals()
+        data = get_public_totals()
     except ImportError:
-        return {"total_requests": 0, "total_tokens": 0}
+        data = {"total_requests": 0, "total_tokens": 0}
+    # Operational summary (counts only — never expose backend identities).
+    operational, online = True, 0
+    try:
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+        online = sum(
+            1 for b in backends
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+        )
+        operational = online > 0
+    except Exception:
+        pass
+    data["status"] = "operational" if operational else "degraded"
+    data["backends_online"] = online
+    return data
 
 
 @app.get("/api/gateway/vps")
@@ -1869,9 +1897,16 @@ async def probe_report(request: Request):
 
 # ──────────── Claw-worker (mainland NAS distributed deploy) ────────────
 # A worker container on a mainland-IP host does the region-gated MiMo parts
-# (create claw + WS chat); the panel does the rest. See agent/worker/ and
+# (create claw + WS chat to inject the bridge); the panel dispatches, verifies
+# the bridge node, and warms up. See agent/worker/ and
 # gateway/claw_worker_registry.py. Worker management is panel-authed; the
 # /sync data channel uses its own X-Worker-Token (exempted in auth_middleware).
+
+# Long-poll window: how long a worker's poll request is held open waiting for a
+# job, and how often it re-checks. Kept under typical 30s proxy idle timeouts.
+_WORKER_LONGPOLL_HOLD_S = float(os.environ.get("MIMO_WORKER_LONGPOLL_HOLD_S", "25"))
+_WORKER_LONGPOLL_TICK_S = 1.0
+
 
 @app.get("/api/claw-worker/nodes")
 async def claw_worker_list():
@@ -1944,13 +1979,64 @@ async def panel_acl_set(request: Request):
     return {"allowed_ips": saved}
 
 
+# ──────────── Secrets management (panel-authed) ────────────
+
+@app.get("/api/secrets")
+async def secrets_get():
+    """Current credential values + which fields are locked by env vars."""
+    from gateway.secrets_store import view
+    return view()
+
+
+@app.post("/api/secrets")
+async def secrets_set(request: Request):
+    """Body: {secrets:{field:value,...}}. Updates editable, non-env-locked
+    fields. Keeps the admin session alive if the session token changes."""
+    from gateway import secrets_store
+    body = await request.json()
+    changes = body.get("secrets") if isinstance(body.get("secrets"), dict) else body
+    result = secrets_store.update(changes if isinstance(changes, dict) else {})
+    _audit("secrets_update", request, fields=",".join(result.get("changed", [])))
+    resp = JSONResponse(result)
+    if "panel_session_token" in result.get("changed", []):
+        resp.set_cookie(
+            AUTH_COOKIE, secrets_store.secrets.panel_session_token,
+            max_age=86400 * 30, httponly=True)
+    if "upstream_api_key" in result.get("changed", []):
+        try:
+            from gateway.runtime import reload_backends
+            reload_backends()
+        except Exception:
+            pass
+    return resp
+
+
+@app.post("/api/secrets/rotate")
+async def secrets_rotate(request: Request):
+    """Body: {field}. Regenerate a token field to a fresh random value."""
+    from gateway import secrets_store
+    body = await request.json()
+    field = body.get("field", "")
+    value = secrets_store.rotate(field)
+    if value is None:
+        return JSONResponse(
+            {"error": "该字段不可轮换或被环境变量锁定"}, status_code=400)
+    _audit("secrets_rotate", request, field=field)
+    resp = JSONResponse({"field": field, "value": value})
+    if field == "panel_session_token":
+        resp.set_cookie(AUTH_COOKIE, value, max_age=86400 * 30, httponly=True)
+    return resp
+
+
 @app.post("/api/claw-worker/sync")
 async def claw_worker_sync(request: Request):
-    """Worker data channel. Auth via X-Worker-Token. phase = poll|claw_ready|
-    notified|report (see agent/worker/README.md)."""
-    from gateway.claw_worker_registry import (
-        touch, claim_job, on_claw_ready, on_notified, on_report,
-    )
+    """Worker data channel. Auth via X-Worker-Token. phase = poll|verify|report
+    (see agent/worker/README.md).
+
+    ``poll`` long-polls: it holds the request up to ~25s, returning as soon as a
+    job becomes claimable. That turns the panel's manual "立即部署" trigger into a
+    near-instant command instead of waiting a whole idle poll interval."""
+    from gateway.claw_worker_registry import touch, claim_job, on_verify, on_report
     token = request.headers.get("X-Worker-Token", "")
     try:
         body = await request.json()
@@ -1966,15 +2052,21 @@ async def claw_worker_sync(request: Request):
         if not egress.get("cn"):
             # Region guard: never dispatch claw work to a non-mainland egress.
             return {"action": "idle", "note": "worker egress not mainland"}
-        job = claim_job(worker["id"])
-        return {"action": "deploy", "job": job} if job else {"action": "idle"}
-    if phase == "claw_ready":
-        ok, msg = await on_claw_ready(
-            body.get("job_id"), body.get("public_key", ""), body.get("log", ""))
-        return {"ok": True} if ok else {"ok": False, "error": msg}
-    if phase == "notified":
-        ok, detail = await on_notified(body.get("job_id"))
-        return {"ok": True, "detail": detail} if ok else {"ok": False, "error": detail}
+        # Long-poll: return immediately if a job is ready, else wait for one to
+        # appear (manual trigger / cron boundary) up to the hold window.
+        deadline = time.monotonic() + _WORKER_LONGPOLL_HOLD_S
+        while True:
+            job = claim_job(worker["id"])
+            if job:
+                return {"action": "deploy", "job": job}
+            if time.monotonic() >= deadline or await request.is_disconnected():
+                return {"action": "idle"}
+            await asyncio.sleep(_WORKER_LONGPOLL_TICK_S)
+    if phase == "verify":
+        known, connected = on_verify(body.get("job_id"), body.get("log", ""))
+        if not known:
+            return {"ok": False, "error": "unknown job"}
+        return {"ok": True, "connected": connected}
     if phase == "report":
         on_report(body.get("job_id"), body.get("status", "error"), body.get("log", ""))
         return {"ok": True}
@@ -2097,11 +2189,6 @@ fi
     return PlainTextResponse(script, media_type="text/x-shellscript")
 
 
-@app.get("/stats", response_class=HTMLResponse)
-async def public_stats_page():
-    """Public stats page — no auth, safe to share."""
-    html_file = BASE_DIR / "templates" / "stats.html"
-    return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
 
 
 # ──────────── Gateway Proxy Routes ────────────

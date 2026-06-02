@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import time
 import uuid
 from urllib.parse import quote
@@ -28,13 +27,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # the same LAN). Leave unset when the host itself already has a mainland IP.
 PROXY = os.environ.get("MIMO_PROXY") or None
 
-_SSH_KEY_RE = re.compile(r"(ssh-(?:rsa|ed25519|ecdsa)\s+[A-Za-z0-9+/=]+(?:\s+[\w@.\-]+)?)")
 _DEFLECTION_MARKERS = ("无法回答", "换个话题")
-
-
-def parse_ssh_key(text: str):
-    m = _SSH_KEY_RE.search(text or "")
-    return m.group(1).strip() if m else None
 
 
 def is_region_blocked(reply: str) -> bool:

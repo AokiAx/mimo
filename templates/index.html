@@ -234,6 +234,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <div class="nav-item" data-page="panel-acl" onclick="switchPage('panel-acl')">
       <span class="icon">🔒</span><span>访问控制</span>
     </div>
+    <div class="nav-item" data-page="secrets" onclick="switchPage('secrets')">
+      <span class="icon">🔑</span><span>密钥管理</span>
+    </div>
   </div>
 
   <div class="nav-sep"></div>
@@ -717,14 +720,14 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
             <tr><td><code>/v1/responses</code></td><td>POST</td><td>Bearer</td><td>Responses 格式 → OpenAI</td></tr>
             <tr><td><code>/v1/models</code></td><td>GET</td><td>Bearer</td><td>列出可用模型</td></tr>
             <tr><td><code>/health</code></td><td>GET</td><td>无</td><td>公开健康检查</td></tr>
-            <tr><td><code>/stats</code></td><td>GET</td><td>无</td><td>公开统计页</td></tr>
+            <tr><td><code>/api/public/status</code></td><td>GET</td><td>Status Key</td><td>状态页数据（需独立 status_api_token）</td></tr>
           </tbody>
         </table>
       </div>
       <div class="section">
         <h2>认证</h2>
         <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p>所有 API 端点（<code>/health</code> 与 <code>/stats</code> 除外）都需要：</p>
+          <p>所有 API 端点（<code>/health</code> 除外）都需要：</p>
           <pre style="background:#0d1b2a;padding:12px;border-radius:6px;margin:10px 0;font-size:0.82rem;color:var(--text)">Authorization: Bearer sk-Aoki-MiMo</pre>
           <p>网关会自动注入后端 API key，客户端只需提供网关 token。</p>
         </div>
@@ -757,6 +760,24 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
         <div class="btn-group">
           <button class="btn btn-primary" id="aclSaveBtn" onclick="savePanelAcl()">保存</button>
           <button class="btn btn-ghost" onclick="refreshPanelAcl()">重新加载</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ Secrets management ════ -->
+    <div class="page" id="page-secrets">
+      <div class="section">
+        <h2>🔑 密钥管理</h2>
+        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
+          <p>在此查看 / 修改 / 轮换面板与接口密钥（持久化到 <code>data/secrets.json</code>，改完即时生效，无需重启）。</p>
+          <p style="margin-top:6px;color:var(--yellow)">⚠️ 轮换<strong>公开 API token</strong> 会让现有客户端失效；修改<strong>面板会话 token</strong> 仅当前浏览器会自动续上 cookie，其它已登录会话会掉线。被<span style="color:var(--text)">环境变量锁定</span>的字段不可在此修改。</p>
+        </div>
+      </div>
+      <div class="section">
+        <div id="secretsBody"></div>
+        <div class="btn-group" style="margin-top:14px">
+          <button class="btn btn-primary" id="secretsSaveBtn" onclick="saveSecrets()">保存修改</button>
+          <button class="btn btn-ghost" onclick="refreshSecrets()">重新加载</button>
         </div>
       </div>
     </div>
@@ -817,7 +838,7 @@ var PAGE_TITLES = {
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
-  vps: 'VPS 监控', 'api-docs': 'API 文档', 'panel-acl': '访问控制'
+  vps: 'VPS 监控', 'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
 };
 
 function switchPage(name) {
@@ -844,6 +865,7 @@ function switchPage(name) {
   if (name === 'vps') refreshVps();
   if (name === 'claw-workers') refreshClawWorkers();
   if (name === 'panel-acl') refreshPanelAcl();
+  if (name === 'secrets') refreshSecrets();
 }
 
 function pageFromHash() {
@@ -2321,7 +2343,8 @@ function refreshClawWorkers() {
           '<td><input type="text" value="' + escapeHtml(cron) + '" style="width:120px;padding:4px;background:#0d1b2a;border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.8rem" ' +
               'onchange="cwSetCron(\'' + escapeHtml(accJs) + '\',this.value)"></td>' +
           '<td style="font-size:0.8rem;color:var(--text3)">' + lastWr + '</td>' +
-          '<td><button class="icon-btn" onclick="cwTriggerNow(\'' + escapeHtml(accJs) + '\')">立即部署</button></td>' +
+          '<td><button class="icon-btn" onclick="cwTriggerNow(\'' + escapeHtml(accJs) + '\')">立即部署</button> ' +
+          '<button class="icon-btn" onclick="showDeployLog(\'' + escapeHtml(accJs) + '\')">日志</button></td>' +
           '</tr>';
       });
     }
@@ -2364,7 +2387,82 @@ function savePanelAcl() {
   }).catch(function() { btn.disabled = false; toast('保存失败', 'error'); });
 }
 
-function cwToggleAdd() {
+// ── Secrets management ──
+var SECRET_FIELDS = [
+  {key: 'panel_password', label: '面板登录密码', rotatable: false},
+  {key: 'public_api_token', label: '公开 API token (/v1 客户端)', rotatable: true},
+  {key: 'status_api_token', label: '状态页 token (/api/public/status)', rotatable: true},
+  {key: 'panel_session_token', label: '面板会话 token (cookie)', rotatable: true},
+  {key: 'upstream_api_key', label: '上游默认 API key (后端无 key 时兜底)', rotatable: false}
+];
+var _secretsEnvLocked = [];
+
+function refreshSecrets() {
+  api('GET', '/api/secrets').then(function(d) {
+    _secretsEnvLocked = d.env_locked || [];
+    var sec = d.secrets || {};
+    var html = '';
+    SECRET_FIELDS.forEach(function(f) {
+      var locked = _secretsEnvLocked.indexOf(f.key) !== -1;
+      var val = sec[f.key] || '';
+      var id = 'secret_' + f.key;
+      html += '<div style="margin-bottom:16px">';
+      html += '<label style="font-size:0.85rem;color:var(--text2);display:block;margin-bottom:5px">' +
+        escapeHtml(f.label) + ' <code style="color:var(--text3)">' + escapeHtml(f.key) + '</code>' +
+        (locked ? ' <span class="pill down" style="margin-left:6px">环境变量锁定</span>' : '') + '</label>';
+      html += '<div style="display:flex;gap:8px;align-items:center">';
+      html += '<input type="password" id="' + id + '" value="' + escapeHtml(val) + '" ' +
+        (locked ? 'disabled ' : '') +
+        'style="flex:1;font-family:monospace' + (locked ? ';opacity:0.6' : '') + '">';
+      html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="secretReveal(\'' + id + '\')">👁</button>';
+      html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="secretCopy(\'' + id + '\')">复制</button>';
+      if (f.rotatable && !locked)
+        html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="rotateSecret(\'' + f.key + '\')">轮换</button>';
+      html += '</div></div>';
+    });
+    document.getElementById('secretsBody').innerHTML = html;
+  }).catch(function() { toast('加载密钥失败', 'error'); });
+}
+
+function secretReveal(id) {
+  var el = document.getElementById(id);
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+function secretCopy(id) {
+  var el = document.getElementById(id);
+  navigator.clipboard.writeText(el.value).then(function() { toast('已复制', 'success'); },
+    function() { toast('复制失败', 'error'); });
+}
+
+function rotateSecret(key) {
+  if (!confirm('确定轮换 ' + key + '？现有使用旧值的客户端/会话会失效。')) return;
+  api('POST', '/api/secrets/rotate', {field: key}).then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
+    var el = document.getElementById('secret_' + key);
+    if (el) { el.value = d.value; el.type = 'text'; }
+    toast('已轮换 ' + key, 'success');
+  }).catch(function() { toast('轮换失败', 'error'); });
+}
+
+function saveSecrets() {
+  var changes = {};
+  SECRET_FIELDS.forEach(function(f) {
+    if (_secretsEnvLocked.indexOf(f.key) !== -1) return;
+    var el = document.getElementById('secret_' + f.key);
+    if (el) changes[f.key] = el.value;
+  });
+  var btn = document.getElementById('secretsSaveBtn');
+  btn.disabled = true;
+  api('POST', '/api/secrets', {secrets: changes}).then(function(d) {
+    btn.disabled = false;
+    var n = (d.changed || []).length;
+    toast(n ? ('已保存 ' + n + ' 项') : '无修改', n ? 'success' : 'info');
+    if ((d.changed || []).indexOf('panel_password') !== -1) toast('面板密码已更新', 'success');
+  }).catch(function() { btn.disabled = false; toast('保存失败', 'error'); });
+}
+
+
   var p = document.getElementById('cwAddPanel');
   p.style.display = p.style.display === 'none' ? '' : 'none';
 }
