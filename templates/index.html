@@ -838,7 +838,7 @@ var PAGE_TITLES = {
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
-  vps: 'VPS 监控', 'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
+  vps: 'VPS 监控', 'claw-workers': 'Claw Worker', 'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
 };
 
 function switchPage(name) {
@@ -2462,7 +2462,7 @@ function saveSecrets() {
   }).catch(function() { btn.disabled = false; toast('保存失败', 'error'); });
 }
 
-
+function cwToggleAdd() {
   var p = document.getElementById('cwAddPanel');
   p.style.display = p.style.display === 'none' ? '' : 'none';
 }
