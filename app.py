@@ -1996,6 +1996,9 @@ async def secrets_set(request: Request):
     body = await request.json()
     changes = body.get("secrets") if isinstance(body.get("secrets"), dict) else body
     result = secrets_store.update(changes if isinstance(changes, dict) else {})
+    if result.get("errors"):
+        _audit("secrets_update_rejected", request, fields=",".join(result["errors"].keys()))
+        return JSONResponse(result, status_code=400)
     _audit("secrets_update", request, fields=",".join(result.get("changed", [])))
     resp = JSONResponse(result)
     if "panel_session_token" in result.get("changed", []):

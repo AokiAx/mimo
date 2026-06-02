@@ -59,7 +59,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .btn-ghost:hover{border-color:var(--text2);color:var(--text)}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
 .btn-group{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-input[type=text],input[type=number],select,textarea{background:#0d1b2a;border:1px solid #1a3a5c;color:var(--text);padding:9px 12px;border-radius:6px;font-size:0.88rem;outline:none;width:100%;transition:border-color .2s}
+input[type=text],input[type=password],input[type=number],select,textarea{background:#0d1b2a;border:1px solid #1a3a5c;color:var(--text);padding:9px 12px;border-radius:6px;font-size:0.88rem;outline:none;width:100%;transition:border-color .2s}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 textarea{resize:vertical;min-height:56px;font-family:inherit}
 select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238899aa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
@@ -124,6 +124,28 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
 .addtab{padding:6px 12px;font-size:0.82rem}
 .addtab.active{background:rgba(59,130,246,.1);color:var(--accent);border:1px solid var(--accent)}
 .addtab-pane{padding-top:6px}
+
+/* Secrets management */
+.secret-stack{display:flex;flex-direction:column;gap:12px}
+.secret-row{border:1px solid var(--border);border-radius:8px;padding:14px;background:#0d1b2a}
+.secret-row.error{border-color:var(--red);box-shadow:0 0 0 1px rgba(239,68,68,.18)}
+.secret-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
+.secret-label{font-size:.88rem;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.secret-label code{color:var(--text3);font-weight:500}
+.secret-help{font-size:.76rem;color:var(--text3);line-height:1.5;margin-top:3px}
+.secret-control{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+.secret-input{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.secret-actions{display:flex;gap:6px;flex-wrap:wrap}
+.secret-actions .btn{min-height:36px;padding:7px 10px}
+.secret-error{font-size:.76rem;color:var(--red);margin-top:7px;min-height:1em}
+.secret-status{font-size:.8rem;color:var(--text3);margin-top:10px;min-height:1.2em}
+.secret-status.error{color:var(--red)}
+.secret-status.success{color:var(--green)}
+.secret-status.warning{color:var(--yellow)}
+@media(max-width:768px){
+  .secret-control{grid-template-columns:1fr}
+  .secret-actions .btn{flex:1}
+}
 
 /* Tables */
 .data-table{width:100%;border-collapse:collapse;font-size:0.85rem}
@@ -775,6 +797,7 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       </div>
       <div class="section">
         <div id="secretsBody"></div>
+        <div id="secretsStatus" class="secret-status" role="status" aria-live="polite"></div>
         <div class="btn-group" style="margin-top:14px">
           <button class="btn btn-primary" id="secretsSaveBtn" onclick="saveSecrets()">保存修改</button>
           <button class="btn btn-ghost" onclick="refreshSecrets()">重新加载</button>
@@ -812,7 +835,14 @@ function statusBadge(s) {
   var cls = s === 'ok' || s === 'AVAILABLE' ? 'ok' : (s === 'error' || s === 'down' || s === 'DESTROYED') ? 'error' : 'warning';
   return '<span class="status-text ' + cls + '">' + (STATUS_MAP[s] || s) + '</span>';
 }
-function escapeHtml(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escapeHtml(t) {
+  return String(t == null ? '' : t)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
 function renderMarkdown(text) {
   var h = escapeHtml(text);
   h = h.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
@@ -2389,77 +2419,276 @@ function savePanelAcl() {
 
 // ── Secrets management ──
 var SECRET_FIELDS = [
-  {key: 'panel_password', label: '面板登录密码', rotatable: false},
-  {key: 'public_api_token', label: '公开 API token (/v1 客户端)', rotatable: true},
-  {key: 'status_api_token', label: '状态页 token (/api/public/status)', rotatable: true},
-  {key: 'panel_session_token', label: '面板会话 token (cookie)', rotatable: true},
-  {key: 'upstream_api_key', label: '上游默认 API key (后端无 key 时兜底)', rotatable: false}
+  {key: 'panel_password', label: '面板登录密码', rotatable: false, required: true,
+    help: '用于登录管理面板。保存后立即生效。'},
+  {key: 'public_api_token', label: '公开 API token (/v1 客户端)', rotatable: true, required: true,
+    help: '兼容旧客户端的全局 API token。轮换会让现有客户端失效。'},
+  {key: 'status_api_token', label: '状态页 token (/api/public/status)', rotatable: true, required: true,
+    help: '只用于公开状态接口，建议与 /v1 token 分开保存。'},
+  {key: 'panel_session_token', label: '面板会话 token (cookie)', rotatable: true, required: true,
+    help: '控制已登录面板会话。保存或轮换后当前浏览器会自动续上 cookie。'},
+  {key: 'upstream_api_key', label: '上游默认 API key', rotatable: false, required: false,
+    help: '可留空；仅当后端没有单独配置 API key 时作为兜底。'}
 ];
 var _secretsEnvLocked = [];
+var _secretsOriginal = {};
+
+function getSecretField(key) {
+  for (var i = 0; i < SECRET_FIELDS.length; i++) {
+    if (SECRET_FIELDS[i].key === key) return SECRET_FIELDS[i];
+  }
+  return null;
+}
+
+function secretInputId(key) { return 'secret_' + key; }
+function secretErrorId(key) { return 'secret_error_' + key; }
+
+function setSecretsStatus(msg, type) {
+  var el = document.getElementById('secretsStatus');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'secret-status ' + (type || '');
+}
+
+function setSecretFieldError(key, msg) {
+  var row = document.querySelector('.secret-row[data-key="' + key + '"]');
+  var err = document.getElementById(secretErrorId(key));
+  if (row) row.classList.toggle('error', !!msg);
+  if (err) err.textContent = msg || '';
+}
+
+function validateSecretValue(field, value) {
+  var v = String(value == null ? '' : value);
+  if (field.required && !v.trim()) return field.label + '不能为空';
+  if (v.indexOf('\n') !== -1 || v.indexOf('\r') !== -1) return field.label + '不能包含换行';
+  if (field.key !== 'panel_password' && /\s/.test(v)) return field.label + '不能包含空白字符';
+  return '';
+}
+
+function makeSecretButton(text, title, onClick) {
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost';
+  btn.textContent = text;
+  btn.title = title;
+  btn.setAttribute('aria-label', title);
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function renderSecretRow(field, value, locked) {
+  var row = document.createElement('div');
+  row.className = 'secret-row';
+  row.dataset.key = field.key;
+
+  var head = document.createElement('div');
+  head.className = 'secret-head';
+
+  var labelWrap = document.createElement('div');
+  var label = document.createElement('label');
+  label.className = 'secret-label';
+  label.htmlFor = secretInputId(field.key);
+  label.appendChild(document.createTextNode(field.label));
+  var code = document.createElement('code');
+  code.textContent = field.key;
+  label.appendChild(code);
+  if (locked) {
+    var lock = document.createElement('span');
+    lock.className = 'status-text warning';
+    lock.textContent = '环境变量锁定';
+    label.appendChild(lock);
+  }
+  var help = document.createElement('div');
+  help.className = 'secret-help';
+  help.id = secretInputId(field.key) + '_help';
+  help.textContent = field.help || '';
+  labelWrap.appendChild(label);
+  labelWrap.appendChild(help);
+  head.appendChild(labelWrap);
+
+  var control = document.createElement('div');
+  control.className = 'secret-control';
+
+  var input = document.createElement('input');
+  input.type = 'password';
+  input.className = 'secret-input';
+  input.id = secretInputId(field.key);
+  input.value = value || '';
+  input.disabled = locked;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.setAttribute('aria-describedby', help.id + ' ' + secretErrorId(field.key));
+  input.addEventListener('input', function() {
+    setSecretFieldError(field.key, validateSecretValue(field, input.value));
+    updateSecretsDirtyState();
+  });
+  control.appendChild(input);
+
+  var actions = document.createElement('div');
+  actions.className = 'secret-actions';
+  var revealBtn = makeSecretButton('显示', '显示或隐藏 ' + field.label, function() {
+    secretReveal(input.id, revealBtn);
+  });
+  actions.appendChild(revealBtn);
+  var copyBtn = makeSecretButton('复制', '复制 ' + field.label, function() {
+    secretCopy(input.id, copyBtn);
+  });
+  actions.appendChild(copyBtn);
+  if (field.rotatable && !locked) {
+    var rotateBtn = makeSecretButton('轮换', '生成新的 ' + field.label, function() {
+      rotateSecret(field.key, rotateBtn);
+    });
+    actions.appendChild(rotateBtn);
+  }
+  control.appendChild(actions);
+
+  var err = document.createElement('div');
+  err.className = 'secret-error';
+  err.id = secretErrorId(field.key);
+
+  row.appendChild(head);
+  row.appendChild(control);
+  row.appendChild(err);
+  return row;
+}
 
 function refreshSecrets() {
+  var body = document.getElementById('secretsBody');
+  var saveBtn = document.getElementById('secretsSaveBtn');
+  if (saveBtn) saveBtn.disabled = true;
+  body.textContent = '加载密钥中...';
+  setSecretsStatus('', '');
   api('GET', '/api/secrets').then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
     _secretsEnvLocked = d.env_locked || [];
     var sec = d.secrets || {};
-    var html = '';
+    _secretsOriginal = {};
+    var stack = document.createElement('div');
+    stack.className = 'secret-stack';
     SECRET_FIELDS.forEach(function(f) {
       var locked = _secretsEnvLocked.indexOf(f.key) !== -1;
       var val = sec[f.key] || '';
-      var id = 'secret_' + f.key;
-      html += '<div style="margin-bottom:16px">';
-      html += '<label style="font-size:0.85rem;color:var(--text2);display:block;margin-bottom:5px">' +
-        escapeHtml(f.label) + ' <code style="color:var(--text3)">' + escapeHtml(f.key) + '</code>' +
-        (locked ? ' <span class="pill down" style="margin-left:6px">环境变量锁定</span>' : '') + '</label>';
-      html += '<div style="display:flex;gap:8px;align-items:center">';
-      html += '<input type="password" id="' + id + '" value="' + escapeHtml(val) + '" ' +
-        (locked ? 'disabled ' : '') +
-        'style="flex:1;font-family:monospace' + (locked ? ';opacity:0.6' : '') + '">';
-      html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="secretReveal(\'' + id + '\')">👁</button>';
-      html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="secretCopy(\'' + id + '\')">复制</button>';
-      if (f.rotatable && !locked)
-        html += '<button class="btn btn-ghost" style="padding:6px 10px" onclick="rotateSecret(\'' + f.key + '\')">轮换</button>';
-      html += '</div></div>';
+      _secretsOriginal[f.key] = val;
+      stack.appendChild(renderSecretRow(f, val, locked));
     });
-    document.getElementById('secretsBody').innerHTML = html;
+    body.replaceChildren(stack);
+    updateSecretsDirtyState();
   }).catch(function() { toast('加载密钥失败', 'error'); });
 }
 
-function secretReveal(id) {
+function secretReveal(id, btn) {
   var el = document.getElementById(id);
+  if (!el) return;
   el.type = el.type === 'password' ? 'text' : 'password';
+  if (btn) btn.textContent = el.type === 'password' ? '显示' : '隐藏';
 }
 
-function secretCopy(id) {
+function secretCopy(id, btn) {
   var el = document.getElementById(id);
-  navigator.clipboard.writeText(el.value).then(function() { toast('已复制', 'success'); },
-    function() { toast('复制失败', 'error'); });
+  if (!el) return;
+  if (btn) btn.disabled = true;
+  navigator.clipboard.writeText(el.value).then(function() {
+    toast('已复制', 'success');
+    if (btn) btn.disabled = false;
+  }, function() {
+    toast('复制失败', 'error');
+    if (btn) btn.disabled = false;
+  });
 }
 
-function rotateSecret(key) {
-  if (!confirm('确定轮换 ' + key + '？现有使用旧值的客户端/会话会失效。')) return;
+function rotateSecret(key, btn) {
+  var field = getSecretField(key);
+  var label = field ? field.label : key;
+  if (!confirm('确定轮换 ' + label + '？现有使用旧值的客户端/会话会失效。')) return;
+  if (btn) { btn.disabled = true; btn.textContent = '轮换中'; }
   api('POST', '/api/secrets/rotate', {field: key}).then(function(d) {
-    if (d.error) { toast(d.error, 'error'); return; }
-    var el = document.getElementById('secret_' + key);
+    if (btn) { btn.disabled = false; btn.textContent = '轮换'; }
+    if (d.error) { setSecretsStatus(d.error, 'error'); toast(d.error, 'error'); return; }
+    var el = document.getElementById(secretInputId(key));
     if (el) { el.value = d.value; el.type = 'text'; }
-    toast('已轮换 ' + key, 'success');
-  }).catch(function() { toast('轮换失败', 'error'); });
+    _secretsOriginal[key] = d.value;
+    setSecretFieldError(key, '');
+    updateSecretsDirtyState();
+    setSecretsStatus(label + ' 已轮换并保存', 'success');
+    toast('已轮换 ' + label, 'success');
+  }).catch(function() {
+    if (btn) { btn.disabled = false; btn.textContent = '轮换'; }
+    setSecretsStatus('轮换失败', 'error');
+    toast('轮换失败', 'error');
+  });
+}
+
+function updateSecretsDirtyState() {
+  var changed = 0;
+  var invalid = 0;
+  SECRET_FIELDS.forEach(function(f) {
+    if (_secretsEnvLocked.indexOf(f.key) !== -1) return;
+    var el = document.getElementById(secretInputId(f.key));
+    if (el && el.value !== (_secretsOriginal[f.key] || '')) changed++;
+    var err = document.getElementById(secretErrorId(f.key));
+    if (err && err.textContent) invalid++;
+  });
+  var btn = document.getElementById('secretsSaveBtn');
+  if (btn) btn.disabled = changed === 0 || invalid > 0;
+  if (invalid) setSecretsStatus(invalid + ' 个字段需要处理', 'error');
+  else if (changed) setSecretsStatus(changed + ' 项未保存', 'warning');
+  else setSecretsStatus('已是最新', 'success');
 }
 
 function saveSecrets() {
   var changes = {};
+  var firstError = '';
   SECRET_FIELDS.forEach(function(f) {
     if (_secretsEnvLocked.indexOf(f.key) !== -1) return;
-    var el = document.getElementById('secret_' + f.key);
-    if (el) changes[f.key] = el.value;
+    var el = document.getElementById(secretInputId(f.key));
+    if (!el) return;
+    var err = validateSecretValue(f, el.value);
+    setSecretFieldError(f.key, err);
+    if (err && !firstError) firstError = err;
+    if (!err && el.value !== (_secretsOriginal[f.key] || '')) changes[f.key] = el.value;
   });
+  if (firstError) {
+    setSecretsStatus(firstError, 'error');
+    toast('请先处理字段错误', 'error');
+    return;
+  }
+  if (Object.keys(changes).length === 0) {
+    updateSecretsDirtyState();
+    toast('无修改', 'info');
+    return;
+  }
   var btn = document.getElementById('secretsSaveBtn');
   btn.disabled = true;
+  setSecretsStatus('保存中...', '');
   api('POST', '/api/secrets', {secrets: changes}).then(function(d) {
     btn.disabled = false;
+    if (d.error || d.errors) {
+      var errors = d.errors || {};
+      var msg = d.error || '保存失败';
+      Object.keys(errors).forEach(function(k) {
+        setSecretFieldError(k, errors[k]);
+        if (msg === '保存失败') msg = errors[k];
+      });
+      setSecretsStatus(msg, 'error');
+      toast(msg, 'error');
+      updateSecretsDirtyState();
+      return;
+    }
     var n = (d.changed || []).length;
+    (d.changed || []).forEach(function(k) {
+      var el = document.getElementById(secretInputId(k));
+      if (el) _secretsOriginal[k] = el.value;
+      setSecretFieldError(k, '');
+    });
+    updateSecretsDirtyState();
+    setSecretsStatus(n ? ('已保存 ' + n + ' 项') : '无修改', n ? 'success' : '');
     toast(n ? ('已保存 ' + n + ' 项') : '无修改', n ? 'success' : 'info');
     if ((d.changed || []).indexOf('panel_password') !== -1) toast('面板密码已更新', 'success');
-  }).catch(function() { btn.disabled = false; toast('保存失败', 'error'); });
+  }).catch(function() {
+    btn.disabled = false;
+    setSecretsStatus('保存失败', 'error');
+    toast('保存失败', 'error');
+  });
 }
 
 function cwToggleAdd() {

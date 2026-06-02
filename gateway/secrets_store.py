@@ -104,6 +104,14 @@ _EDITABLE = (
     "panel_password", "public_api_token", "upstream_api_key",
     "panel_session_token", "status_api_token",
 )
+_REQUIRED = {
+    "panel_password", "public_api_token",
+    "panel_session_token", "status_api_token",
+}
+_NO_WHITESPACE = {
+    "public_api_token", "upstream_api_key",
+    "panel_session_token", "status_api_token",
+}
 # Token fields and how to mint a fresh value when rotating.
 _ROTATORS = {
     "public_api_token": lambda: f"sk-mimo-{_secrets_mod.token_urlsafe(32)}",
@@ -131,11 +139,27 @@ def view() -> dict:
     }
 
 
+def _validate_value(field_name: str, value: str) -> str | None:
+    if field_name in _REQUIRED and not value.strip():
+        return "不能为空"
+    if "\n" in value or "\r" in value:
+        return "不能包含换行"
+    if field_name in _NO_WHITESPACE and value and any(ch.isspace() for ch in value):
+        return "不能包含空白字符"
+    return None
+
+
 def update(changes: dict) -> dict:
     """Apply ``{field: value}`` to editable, non-env-locked fields. Mutates the
-    singleton in place + persists. Returns {changed:[...], skipped:[...]}."""
-    changed, skipped = [], []
+    singleton in place + persists. Returns {changed, skipped, errors}.
+
+    Validation is intentionally conservative: upstream_api_key may be empty,
+    but panel/auth tokens must stay non-empty so the operator cannot lock the
+    panel or legacy API into a broken credential state.
+    """
+    changed, skipped, errors = [], [], {}
     with _lock:
+        clean: dict[str, str] = {}
         for field_name, value in (changes or {}).items():
             if field_name not in _EDITABLE:
                 continue
@@ -145,13 +169,21 @@ def update(changes: dict) -> dict:
             if value is None:
                 continue
             value = str(value)
+            error = _validate_value(field_name, value)
+            if error:
+                errors[field_name] = error
+                continue
+            clean[field_name] = value
+        if errors:
+            return {"changed": [], "skipped": skipped, "errors": errors}
+        for field_name, value in clean.items():
             if value == getattr(secrets, field_name):
                 continue
             setattr(secrets, field_name, value)
             changed.append(field_name)
         if changed:
             _persist()
-    return {"changed": changed, "skipped": skipped}
+    return {"changed": changed, "skipped": skipped, "errors": {}}
 
 
 def rotate(field_name: str) -> str | None:
