@@ -15,7 +15,6 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -31,16 +30,23 @@ _MAX_PENDING = int(os.environ.get("MIMO_WS_MAX_PENDING", "2000"))
 _RETRYABLE_STATUSES = {401, 403, 429}
 
 
-@dataclass(slots=True)
 class _Node:
-    ws: WebSocket
-    label: str
-    # The account this Claw bridge serves (from ``?account=`` on connect).
-    # ``None`` means the node joins the shared, account-agnostic pool.
-    account: str | None = None
-    connected_at: float = field(default_factory=time.time)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    cooldown_until: float = 0.0
+    __slots__ = ("ws", "label", "account", "connected_at", "lock", "cooldown_until")
+
+    def __init__(
+        self,
+        ws: WebSocket,
+        label: str,
+        account: str | None = None,
+    ) -> None:
+        self.ws = ws
+        self.label = label
+        # The account this Claw bridge serves (from ``?account=`` on connect).
+        # ``None`` means the node joins the shared, account-agnostic pool.
+        self.account = account
+        self.connected_at = time.time()
+        self.lock = asyncio.Lock()
+        self.cooldown_until = 0.0
 
 
 class WebSocketTunnel:
