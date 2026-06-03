@@ -47,7 +47,6 @@ data/backends.json
 # Gateway runtime state (panel CRUD / discovery)
 data/model_groups.json
 data/probe_nodes.json
-data/claw_workers.json
 
 # Gateway runtime config (often contains secrets)
 gateway.yaml

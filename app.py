@@ -33,6 +33,23 @@ ACCOUNTS_DIR = BASE_DIR / "accounts"
 CURRENT_ACCOUNT_FILE = ACCOUNTS_DIR / "_current.json"
 MIMO_BASE = "https://aistudio.xiaomimimo.com"
 
+# Optional: pin aistudio.xiaomimimo.com to a specific gateway IP (e.g. a mainland
+# edge node) so the panel's own create + chat.send land on that PoP regardless of
+# GeoDNS. SNI/Host stay the domain, so TLS still validates. Find a current
+# mainland edge via a mainland resolver: nslookup aistudio.xiaomimimo.com 223.5.5.5
+_MIMO_PIN_IP = os.environ.get("MIMO_PIN_IP") or None
+if _MIMO_PIN_IP:
+    import socket as _socket
+    _mimo_pin_host = "aistudio.xiaomimimo.com"
+    _orig_getaddrinfo = _socket.getaddrinfo
+
+    def _pinned_getaddrinfo(host, *args, **kwargs):
+        if host == _mimo_pin_host:
+            host = _MIMO_PIN_IP
+        return _orig_getaddrinfo(host, *args, **kwargs)
+
+    _socket.getaddrinfo = _pinned_getaddrinfo
+
 app = FastAPI(title="MiMo Manager")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -111,8 +128,8 @@ async def error_logging_middleware(request: Request, call_next):
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     # IP allowlist gates the PANEL/admin surface only. Public + token-authed
-    # endpoints (API, worker, probe, stats, health) stay reachable from anywhere
-    # so /v1 clients, the claw-worker and probes still work. Empty list = no gate.
+    # endpoints (API, probe, stats, health) stay reachable from anywhere
+    # so /v1 clients and probes still work. Empty list = no gate.
     if not _is_public_path(path):
         from gateway.panel_acl import is_allowed
         if not is_allowed(_client_ip(request)):
@@ -125,9 +142,6 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     # Probe agent uses its own X-Probe-Token header
     if path == "/api/probe/report":
-        return await call_next(request)
-    # Claw-worker (mainland NAS) uses its own X-Worker-Token header
-    if path == "/api/claw-worker/sync":
         return await call_next(request)
     # Probe install assets (agent.py + install.sh) are public — token is in URL
     if path.startswith("/probe/"):
@@ -233,12 +247,12 @@ _ACCOUNTS_DIR_RESOLVED: Path | None = None
 
 def _is_public_path(path: str) -> bool:
     """Paths reachable from ANY ip (not gated by the panel IP allowlist):
-    the public API, token-authed worker/probe/status channels and health."""
+    the public API, token-authed probe/status channels and health."""
     if path.startswith(("/v1/", "/static", "/probe/")):
         return True
     return path in (
         "/health", "/gateway/status", "/api/public/status",
-        "/api/probe/report", "/api/claw-worker/sync", "/ws",
+        "/api/probe/report", "/ws",
     )
 
 
@@ -1895,64 +1909,6 @@ async def probe_report(request: Request):
     return {"ok": True}
 
 
-# ──────────── Claw-worker (mainland NAS distributed deploy) ────────────
-# A worker container on a mainland-IP host does the region-gated MiMo parts
-# (create claw + WS chat to inject the bridge); the panel dispatches, verifies
-# the bridge node, and warms up. See agent/worker/ and
-# gateway/claw_worker_registry.py. Worker management is panel-authed; the
-# /sync data channel uses its own X-Worker-Token (exempted in auth_middleware).
-
-# Long-poll window: how long a worker's poll request is held open waiting for a
-# job, and how often it re-checks. Kept under typical 30s proxy idle timeouts.
-_WORKER_LONGPOLL_HOLD_S = float(os.environ.get("MIMO_WORKER_LONGPOLL_HOLD_S", "25"))
-_WORKER_LONGPOLL_TICK_S = 1.0
-
-
-@app.get("/api/claw-worker/nodes")
-async def claw_worker_list():
-    """Panel-only: list workers (with tokens) + in-flight jobs + recent results."""
-    from gateway.claw_worker_registry import list_workers, list_jobs, list_recent
-    return {"workers": list_workers(include_token=True), "jobs": list_jobs(),
-            "recent": list_recent()}
-
-
-@app.post("/api/claw-worker/nodes/add")
-async def claw_worker_add(request: Request):
-    """Body: {name}. Returns {id, name, token}."""
-    from gateway.claw_worker_registry import add_worker
-    body = await request.json()
-    try:
-        return add_worker(body.get("name", ""))
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/api/claw-worker/nodes/{worker_id}/delete")
-async def claw_worker_delete(worker_id: str):
-    from gateway.claw_worker_registry import delete_worker
-    ok = delete_worker(worker_id)
-    return {"success": ok} if ok else JSONResponse(
-        {"success": False, "error": "worker 不存在"}, status_code=404)
-
-
-@app.post("/api/claw-worker/nodes/{worker_id}/regen-token")
-async def claw_worker_regen(worker_id: str):
-    from gateway.claw_worker_registry import regenerate_token
-    token = regenerate_token(worker_id)
-    return {"token": token} if token else JSONResponse(
-        {"error": "worker 不存在"}, status_code=404)
-
-
-@app.post("/api/claw-worker/trigger/{account_filename}")
-async def claw_worker_trigger(account_filename: str):
-    """Queue an immediate worker deploy for an account (bypasses cron). Picked
-    up on the next worker poll."""
-    from gateway.claw_worker_registry import force_deploy
-    ok = force_deploy(account_filename)
-    return {"success": ok} if ok else JSONResponse(
-        {"success": False, "error": "账号不存在"}, status_code=404)
-
-
 # ──────────── Panel access control (IP allowlist) ────────────
 
 @app.get("/api/panel-acl")
@@ -2029,51 +1985,6 @@ async def secrets_rotate(request: Request):
     if field == "panel_session_token":
         resp.set_cookie(AUTH_COOKIE, value, max_age=86400 * 30, httponly=True)
     return resp
-
-
-@app.post("/api/claw-worker/sync")
-async def claw_worker_sync(request: Request):
-    """Worker data channel. Auth via X-Worker-Token. phase = poll|verify|report
-    (see agent/worker/README.md).
-
-    ``poll`` long-polls: it holds the request up to ~25s, returning as soon as a
-    job becomes claimable. That turns the panel's manual "立即部署" trigger into a
-    near-instant command instead of waiting a whole idle poll interval."""
-    from gateway.claw_worker_registry import touch, claim_job, on_verify, on_report
-    token = request.headers.get("X-Worker-Token", "")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-    worker = touch(token, body.get("worker") or {})
-    if not worker:
-        return JSONResponse({"error": "unknown token"}, status_code=401)
-
-    phase = body.get("phase")
-    if phase == "poll":
-        egress = (body.get("worker") or {}).get("egress") or {}
-        if not egress.get("cn"):
-            # Region guard: never dispatch claw work to a non-mainland egress.
-            return {"action": "idle", "note": "worker egress not mainland"}
-        # Long-poll: return immediately if a job is ready, else wait for one to
-        # appear (manual trigger / cron boundary) up to the hold window.
-        deadline = time.monotonic() + _WORKER_LONGPOLL_HOLD_S
-        while True:
-            job = claim_job(worker["id"])
-            if job:
-                return {"action": "deploy", "job": job}
-            if time.monotonic() >= deadline or await request.is_disconnected():
-                return {"action": "idle"}
-            await asyncio.sleep(_WORKER_LONGPOLL_TICK_S)
-    if phase == "verify":
-        known, connected = on_verify(body.get("job_id"), body.get("log", ""))
-        if not known:
-            return {"ok": False, "error": "unknown job"}
-        return {"ok": True, "connected": connected}
-    if phase == "report":
-        on_report(body.get("job_id"), body.get("status", "error"), body.get("log", ""))
-        return {"ok": True}
-    return JSONResponse({"error": "bad phase"}, status_code=400)
 
 
 # ──────────── Probe public install assets ────────────
