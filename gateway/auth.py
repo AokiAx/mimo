@@ -13,9 +13,8 @@ from fastapi import Request
 
 from gateway.config import APIKeyRecord, APIKeyStore
 from gateway.core import AuthError
+from gateway.db import DB_PATH as API_KEYS_DB
 from gateway.secrets_store import secrets
-
-API_KEYS_DB = Path(__file__).parent.parent / "data" / "api_keys.db"
 
 
 @dataclass(frozen=True)

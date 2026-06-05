@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).parent.parent / "data" / "metrics.db"
+from gateway.db import DB_PATH
 
 
 def _get_conn() -> sqlite3.Connection:

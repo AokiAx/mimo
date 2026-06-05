@@ -38,11 +38,13 @@ from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 
+from gateway.db import DB_PATH as _SHARED_DB_PATH
+
 logger = logging.getLogger(__name__)
 
 # ────────────── tunables ──────────────
 
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "data" / "reasoning_cache.db"
+_DEFAULT_DB_PATH = _SHARED_DB_PATH
 _MAX_ENTRIES = 4096           # memory LRU cap (preserved name for monkeypatch in tests)
 _TTL_S = 7 * 24 * 3600        # 7 days
 _WRITE_QUEUE_MAX = 1024
