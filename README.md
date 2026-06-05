@@ -9,24 +9,48 @@
 
 ---
 
-## 快速开始
+## 安装教程
+
+### 环境要求
+- Python **3.9+**（面板/网关）；Linux / macOS / Windows 均可
+- `git`；如需浏览器登录还要 Chromium（Playwright 自动安装）
+
+### 步骤
 
 ```bash
+# 1. 克隆
+git clone https://github.com/Aoki2008/mimo.git
+cd mimo
+
+# 2. 建虚拟环境（推荐）
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# 3. 装依赖
 pip install -r requirements.txt
 
-# 1. 登录小米账号（可重复加多个账号）
-python claw/mimo_auth.py login
-
-# 2. 启动管理面板（默认 8088）
-python app.py
-# 或
-bash run.sh
+# 4. 首次启动（自动生成 data/secrets.json：随机面板密码 + API token）
+python app.py                    # 或 bash run.sh，默认端口 8088
 ```
 
-打开 `http://localhost:8088`，面板密码见 `data/secrets.json` 的 `panel_password` 字段。
-首次运行会自动生成 `data/secrets.json`，包含随机面板密码和 API token。登录后可在面板「🔑 密钥管理」页查看 / 修改 / 轮换所有密钥（即时生效，无需重启）；被环境变量锁定的字段只读。
+打开 `http://localhost:8088`，用 `data/secrets.json` 里的 `panel_password` 登录。登录后在面板「🔑 密钥管理」页可查看 / 修改 / 轮换所有密钥（即时生效，无需重启）；被环境变量锁定的字段只读。
 
-状态数据接口（需独立 key）：`GET /api/public/status`，鉴权用 `data/secrets.json` 里的 `status_api_token`（独立于 API / 面板 token），供外部独立部署的状态页拉取。本项目不再内置公开状态页。
+### 登录小米账号（任选其一，可加多个账号）
+
+```bash
+# A. 纯 HTTP 交互式登录（无需浏览器，支持邮箱验证码）
+python claw/mimo_auth.py login
+
+# B. 浏览器登录后导出 Cookie（适合验证码/风控复杂时）
+pip install playwright && python -m playwright install chromium
+python claw/mimo_login_get_ck.py --output accounts/myacct.json
+```
+
+### （可选）配置 SSH 自动部署
+要用「定时把 Claw 变成 API 转发节点」，按下文「自动部署流程（SSH 反向隧道 · 方案 B）」配置 `data/ssh_targets.json` + 目标机一次性 `setup-target.sh`。
+
+> 状态数据接口（需独立 key）：`GET /api/public/status`，鉴权用 `data/secrets.json` 里的 `status_api_token`（独立于 API / 面板 token），供外部独立部署的状态页拉取。本项目不再内置公开状态页。
+
 
 <details>
 <summary>环境变量</summary>
@@ -245,6 +269,9 @@ sudo ./claw/target/setup-target.sh "$(cat panel_tunnel_key.pub)"
 
 ## 主要 API 端点
 
+<details>
+<summary>展开端点列表</summary>
+
 ### 兼容端点（gateway 提供，app.py 路由）
 - `POST /v1/chat/completions` — OpenAI Chat
 - `POST /v1/messages` — Anthropic Messages
@@ -275,6 +302,8 @@ sudo ./claw/target/setup-target.sh "$(cat panel_tunnel_key.pub)"
 - `GET /health` — Gateway 进程健康
 - `GET /gateway/status` — 公开 Gateway 状态
 - `GET /probe/agent.py` / `GET /probe/install.sh/{token}` — 探针安装资源
+
+</details>
 
 ---
 
