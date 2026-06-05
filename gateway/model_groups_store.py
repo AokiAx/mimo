@@ -30,14 +30,11 @@ groups); ``resolve()`` returns the first match.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 import threading
-from pathlib import Path
 from typing import Any
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "model_groups.json"
+from gateway import config_store
 
 VALID_PROTOCOLS = ("openai", "anthropic")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,32}$")
@@ -50,26 +47,14 @@ def _empty() -> dict:
 
 
 def _load() -> dict:
-    if not DATA_PATH.exists():
-        return _empty()
-    try:
-        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return _empty()
+    data = config_store.get_section("model_groups", None)
     if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         return _empty()
     return data
 
 
 def _save(data: dict) -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, ensure_ascii=False)
-    tmp_path = DATA_PATH.with_name(f"{DATA_PATH.name}.tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, DATA_PATH)
+    config_store.set_section("model_groups", data)
 
 
 def _normalize_protocols(raw: Any) -> list[str]:
@@ -338,7 +323,7 @@ def import_from_backends(
 def ensure_default_initialized() -> None:
     """First-run helper: if the file is empty/missing, auto-import from
     existing backends so the gateway keeps routing without manual setup."""
-    if DATA_PATH.exists():
+    if config_store.get_section("model_groups", None) is not None:
         return
     try:
         result = import_from_backends()

@@ -1,6 +1,8 @@
 from claw.auto_deploy import (
-    _is_claw_template_reset_reply_success,
     _is_retryable_create_429,
+    _parse_ssh_pubkey,
+    _render_ssh_payload,
+    _REVERSE_TUNNEL_SH,
 )
 
 
@@ -29,20 +31,29 @@ def test_create_malformed_response_is_not_retryable():
     assert not _is_retryable_create_429("HTTP_429")
 
 
-def test_template_reset_reply_success_matches_expected_claw_ack():
-    assert _is_claw_template_reset_reply_success(
-        "好，写入模板并重启。已恢复为模板，重启中。"
-        "搞定。AGENTS.md 和 SOUL.md 已恢复为官方模板，重启信号已发送。"
-    )
+def test_parse_ssh_pubkey_extracts_ed25519_from_reply():
+    reply = "好的，公钥如下：\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxxxYYY claw\n以上。"
+    pk = _parse_ssh_pubkey(reply)
+    assert pk == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxxxYYY claw"
 
 
-def test_template_reset_reply_requires_restart_signal():
-    assert not _is_claw_template_reset_reply_success(
-        "AGENTS.md 和 SOUL.md 已恢复为官方模板。"
-    )
+def test_parse_ssh_pubkey_returns_none_when_absent():
+    assert _parse_ssh_pubkey("没有任何密钥内容") is None
 
 
-def test_template_reset_reply_requires_both_files():
-    assert not _is_claw_template_reset_reply_success(
-        "AGENTS.md 已恢复为官方模板，重启信号已发送。"
-    )
+def test_render_ssh_payload_substitutes_target_placeholders():
+    target = {
+        "host": "203.0.113.9",
+        "tunnel_user": "tunnel",
+        "ssh_port": 2222,
+        "remote_api_port": 19090,
+    }
+    rendered = _render_ssh_payload(_REVERSE_TUNNEL_SH, target)
+    # placeholders are substituted into the shell var assignments (the -R line
+    # itself uses ${VAR} expansion resolved at runtime, not literal values).
+    assert "__TARGET_HOST__" not in rendered and "__REMOTE_API_PORT__" not in rendered
+    assert 'TARGET_HOST="203.0.113.9"' in rendered
+    assert 'TARGET_SSH_PORT="2222"' in rendered
+    assert 'REMOTE_API_PORT="19090"' in rendered
+    assert 'LOCAL_PROXY_PORT="18800"' in rendered
+    assert 'TARGET_USER="tunnel"' in rendered

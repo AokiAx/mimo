@@ -8,16 +8,17 @@ import pytest
 
 from gateway.routing import Backend, BackendRegistry, Router
 from gateway.core import BackendUnavailableError
+import gateway.config_store as config_store
 import gateway.backend_store as backend_store
 import gateway.runtime as runtime
 
 
 @pytest.fixture(autouse=True)
 def reset_runtime(monkeypatch, tmp_path):
-    path = tmp_path / "backends.json"
+    path = tmp_path / "config.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"backends": []}), encoding="utf-8")
-    monkeypatch.setattr(backend_store, "DATA_PATH", path)
+    path.write_text(json.dumps({"backends": {"backends": []}}), encoding="utf-8")
+    monkeypatch.setattr(config_store, "CONFIG_PATH", path)
     for name in (
         "_registry", "_router", "_transport", "_handler",
         "_decision_log", "_probe_task", "_rotation_task",

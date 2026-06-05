@@ -299,17 +299,15 @@ def get_run_history(account_filename: str) -> list:
 
 def load_config() -> dict:
     _ensure_dirs()
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"accounts": {}}
+    from gateway import config_store
+    cfg = config_store.get_section("auto_deploy", None)
+    return cfg if isinstance(cfg, dict) else {"accounts": {}}
 
 
 def save_config(cfg: dict):
     _ensure_dirs()
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    from gateway import config_store
+    config_store.set_section("auto_deploy", cfg)
 
 
 def get_account_config(account_filename: str) -> dict:
@@ -550,19 +548,16 @@ _SSH_PUBKEY_RE = re.compile(r"(ssh-ed25519\s+[A-Za-z0-9+/=]+(?:\s+[\w@.\-]+)?)")
 
 
 def _load_ssh_targets() -> dict:
-    if not SSH_TARGETS_PATH.exists():
-        return {"targets": {}, "assignments": {}, "default_target": None}
-    try:
-        return json.loads(SSH_TARGETS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"targets": {}, "assignments": {}, "default_target": None}
+    from gateway import config_store
+    cfg = config_store.get_section("ssh_targets", None)
+    if isinstance(cfg, dict):
+        return cfg
+    return {"targets": {}, "assignments": {}, "default_target": None}
 
 
 def _save_ssh_targets(cfg: dict) -> None:
-    SSH_TARGETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SSH_TARGETS_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SSH_TARGETS_PATH)
+    from gateway import config_store
+    config_store.set_section("ssh_targets", cfg)
 
 
 def _panel_key_path(cfg: dict) -> Path:

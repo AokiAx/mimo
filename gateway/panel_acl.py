@@ -8,29 +8,24 @@ Only the panel/admin surface is gated by this; the public API (/v1), /health,
 from __future__ import annotations
 
 import ipaddress
-import json
 import threading
-from pathlib import Path
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "panel_acl.json"
+from gateway import config_store
+
 _lock = threading.Lock()
 
 
 def _load() -> dict:
-    if not DATA_PATH.exists():
+    d = config_store.get_section("panel_acl", None)
+    if not isinstance(d, dict):
         return {"allowed_ips": []}
-    try:
-        d = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-        if not isinstance(d.get("allowed_ips"), list):
-            d["allowed_ips"] = []
-        return d
-    except (OSError, json.JSONDecodeError):
-        return {"allowed_ips": []}
+    if not isinstance(d.get("allowed_ips"), list):
+        d["allowed_ips"] = []
+    return d
 
 
 def _save(d: dict) -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DATA_PATH.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    config_store.set_section("panel_acl", d)
 
 
 def validate(ips: list[str]) -> list[str]:

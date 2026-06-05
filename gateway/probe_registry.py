@@ -10,13 +10,12 @@ the node id internally so the URL never leaks the human-readable name.
 """
 from __future__ import annotations
 
-import json
 import secrets
 import threading
 import time
-from pathlib import Path
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "probe_nodes.json"
+from gateway import config_store
+
 OFFLINE_AFTER_S = 30  # 3x the default 10s report interval
 
 _lock = threading.Lock()
@@ -27,18 +26,12 @@ def _empty():
 
 
 def _load() -> dict:
-    if not DATA_PATH.exists():
-        return _empty()
-    try:
-        return json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return _empty()
+    data = config_store.get_section("probe_nodes", None)
+    return data if isinstance(data, dict) else _empty()
 
 
 def _save(data: dict) -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DATA_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                         encoding="utf-8")
+    config_store.set_section("probe_nodes", data)
 
 
 def list_nodes(*, include_token: bool = False) -> list[dict]:
