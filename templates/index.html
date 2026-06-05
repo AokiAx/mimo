@@ -1410,9 +1410,6 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     if (skipReason && skipReason !== 'disabled') html += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
     html += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     html += '</div>';
-    var dt = cfg.deploy_text || '';
-    html += '<div><label style="font-size:0.78rem;color:var(--text3);display:block;margin-bottom:4px">部署文案（发送给 Claw）</label>';
-    html += '<textarea id="deployText_' + fn + '" rows="4" onchange="updateAccountDeploy(\'' + fn + '\',\'deploy_text\',this.value)" style="width:100%;font-size:0.82rem">' + escapeHtml(dt) + '</textarea></div>';
     html += '</div>';
   }
   el.innerHTML = html;

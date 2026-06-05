@@ -30,31 +30,84 @@ groups); ``resolve()`` returns the first match.
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
 import threading
+from pathlib import Path
 from typing import Any
 
 from gateway import config_store
 
+log = logging.getLogger(__name__)
+
 VALID_PROTOCOLS = ("openai", "anthropic")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,32}$")
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def _empty() -> dict:
     return {"groups": []}
 
 
-def _load() -> dict:
-    data = config_store.get_section("model_groups", None)
+def _path() -> Path:
+    override = os.environ.get("MIMO_MODEL_GROUPS")
+    if override:
+        return Path(override)
+    return config_store.CONFIG_PATH.parent / "model_groups.json"
+
+
+def _read_file() -> dict:
+    path = _path()
+    if not path.exists():
+        return _empty()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        log.exception("failed to read %s; treating as empty", path)
+        return _empty()
     if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         return _empty()
     return data
 
 
+def _write_file(data: dict) -> None:
+    path = _path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def migrate_once() -> None:
+    """Move a pre-split ``model_groups`` section out of config.json once.
+
+    The config store no longer imports data/model_groups.json during legacy
+    consolidation. This helper covers installs that already have a
+    ``model_groups`` section inside data/config.json from the previous layout.
+    """
+    with _lock:
+        embedded = config_store.get_section("model_groups", None)
+        if embedded is None:
+            return
+        if (
+            not _path().exists()
+            and isinstance(embedded, dict)
+            and isinstance(embedded.get("groups"), list)
+        ):
+            _write_file(embedded)
+        config_store.delete_section("model_groups")
+
+
+def _load() -> dict:
+    migrate_once()
+    return _read_file()
+
+
 def _save(data: dict) -> None:
-    config_store.set_section("model_groups", data)
+    _write_file(data)
 
 
 def _normalize_protocols(raw: Any) -> list[str]:
@@ -323,7 +376,8 @@ def import_from_backends(
 def ensure_default_initialized() -> None:
     """First-run helper: if the file is empty/missing, auto-import from
     existing backends so the gateway keeps routing without manual setup."""
-    if config_store.get_section("model_groups", None) is not None:
+    migrate_once()
+    if _path().exists():
         return
     try:
         result = import_from_backends()

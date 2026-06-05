@@ -2,9 +2,6 @@
   "backends": {
     "backends": []
   },
-  "model_groups": {
-    "groups": []
-  },
   "auto_deploy": {
     "accounts": {}
   },

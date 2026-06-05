@@ -1,16 +1,18 @@
 """Single consolidated config file for the gateway + deploy stores.
 
-Backends, model groups, panel ACL, probe nodes, auto-deploy schedule, SSH
-targets and the aistudio pin used to live in seven separate data/*.json files.
-They are all small, human-editable config, so we keep them as named sections of
-ONE file (data/config.json) to cut down on the pile of runtime files while
-staying hand-editable.
+Backends, panel ACL, probe nodes, auto-deploy schedule, SSH targets and the
+aistudio pin used to live in separate data/*.json files. They are all small,
+human-editable config, so we keep them as named sections of ONE file
+(data/config.json) to cut down on the pile of runtime files while staying
+hand-editable.
 
 Each owning module keeps its existing ``_load()/_save()`` interface but
 delegates the actual read/write to :func:`get_section` / :func:`set_section`
 here. All writes go through a single lock + atomic temp-rename, so concurrent
 section writes from different modules never clobber the file.
 
+``model_groups.json`` is intentionally NOT folded in — model mapping is edited
+often through the panel and must remain an independent runtime file.
 ``secrets.json`` is intentionally NOT folded in — it has its own env-locking /
 rotation semantics and is more sensitive, so it stays a separate file.
 
@@ -33,7 +35,6 @@ CONFIG_PATH = Path(os.environ.get("MIMO_CONFIG") or _DEFAULT)
 # section name -> legacy standalone filename (relative to CONFIG_PATH's dir)
 _LEGACY = {
     "backends": "backends.json",
-    "model_groups": "model_groups.json",
     "panel_acl": "panel_acl.json",
     "probe_nodes": "probe_nodes.json",
     "auto_deploy": "auto_deploy.json",
@@ -100,6 +101,16 @@ def set_section(name: str, value: Any) -> None:
         data = _read_all()
         data[name] = value
         _write_all(data)
+
+
+def delete_section(name: str) -> bool:
+    with _lock:
+        data = _read_all()
+        if name not in data:
+            return False
+        del data[name]
+        _write_all(data)
+        return True
 
 
 # Fold legacy files in once, before any owning module reads its section.
