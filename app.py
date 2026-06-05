@@ -2188,10 +2188,8 @@ fi
 # ──────────── Gateway Proxy Routes ────────────
 
 from gateway.routes import register_gateway_routes
-from gateway.ws_tunnel import register_ws_routes
 
 register_gateway_routes(app, auth_cookie=AUTH_COOKIE)
-register_ws_routes(app)
 
 
 if __name__ == "__main__":

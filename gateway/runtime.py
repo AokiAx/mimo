@@ -760,8 +760,7 @@ async def _run_readiness_checks(backend: Backend) -> tuple[bool, str, float]:
 
 async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
     assert _transport is not None
-    from gateway.ws_tunnel import compose_upstream_url
-    url = compose_upstream_url(backend.base_url, "/v1/chat/completions")
+    url = backend.base_url.rstrip("/") + "/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
     if backend.api_key:
         headers["Authorization"] = f"Bearer {backend.api_key}"

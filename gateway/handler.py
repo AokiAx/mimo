@@ -33,7 +33,6 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
-from gateway import ws_tunnel
 from gateway.adapters import OpenAIChatAdapter, ProtocolAdapter, UpstreamCodec
 from gateway.anthropic_passthrough import (
     normalize_tool_choice,
@@ -496,9 +495,7 @@ class GatewayHandler:
             request_id=ctx.request_id, model=model, exclude=exclude,
         )
         ctx.target_backend_id = backend.backend_id
-        ctx.upstream_url = ws_tunnel.compose_upstream_url(
-            backend.base_url, upstream_path or self._upstream_path,
-        )
+        ctx.upstream_url = backend.base_url.rstrip("/") + (upstream_path or self._upstream_path)
         ctx.decide(f"route:{backend.backend_id}:{decision.reason}")
         if self._decision_log is not None:
             try:

@@ -23,7 +23,7 @@ from gateway.core import (
     UpstreamError,
     UpstreamTimeoutError,
 )
-from gateway import ws_tunnel
+
 
 logger = logging.getLogger(__name__)
 _MAX_LOG_BODY_CHARS = 4000
@@ -88,10 +88,6 @@ class HttpxTransport:
         headers: dict[str, str] | None = None,
         timeout_s: float = 60.0,
     ) -> tuple[int, bytes]:
-        if ws_tunnel.is_ws_url(url):
-            return await ws_tunnel.request_json(
-                url, body, headers=headers, timeout_s=timeout_s,
-            )
         try:
             resp = await self._client.post(
                 url, json=body, headers=headers or {},
@@ -116,10 +112,6 @@ class HttpxTransport:
         headers: dict[str, str] | None = None,
         timeout_s: float = 600.0,
     ) -> tuple[int, AsyncIterator[bytes]]:
-        if ws_tunnel.is_ws_url(url):
-            return await ws_tunnel.request_stream(
-                url, body, headers=headers, timeout_s=timeout_s,
-            )
         # stream() returns a context manager; we manage it via the iterator
         # so the caller drains the body before we close it.
         ctx_mgr = self._client.stream(
