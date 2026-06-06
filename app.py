@@ -5,6 +5,7 @@ MiMo Claw/API Management Dashboard - FastAPI Backend
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -516,6 +517,144 @@ def _get_sync_http_client() -> httpx.Client:
     return _sync_http_client
 
 
+def _mimo_control_ssh_config() -> dict:
+    """Optional route for MiMo control-plane REST calls via a jump host.
+
+    This is deliberately separate from the SSH reverse-tunnel target user. The
+    target-side ``tunnel`` account is restricted and cannot run arbitrary
+    commands; this route needs a shell-capable SSH login such as root.
+    """
+    target = (os.environ.get("MIMO_CONTROL_SSH_TARGET") or "").strip()
+    cfg: dict = {}
+    try:
+        from gateway import config_store
+        raw = config_store.get_section("mimo_control", {}) or {}
+        if isinstance(raw, dict):
+            ssh_cfg = raw.get("ssh") or {}
+            if isinstance(ssh_cfg, dict):
+                cfg = dict(ssh_cfg)
+    except Exception:
+        cfg = {}
+
+    if target:
+        cfg["target"] = target
+        cfg["enabled"] = True
+    enabled = bool(cfg.get("enabled"))
+    target = str(cfg.get("target") or "").strip()
+    if not enabled or not target:
+        return {"enabled": False}
+
+    port = int(cfg.get("port") or os.environ.get("MIMO_CONTROL_SSH_PORT") or 22)
+    identity_file = str(
+        cfg.get("identity_file")
+        or os.environ.get("MIMO_CONTROL_SSH_IDENTITY")
+        or ""
+    ).strip()
+    timeout = float(cfg.get("timeout") or os.environ.get("MIMO_CONTROL_SSH_TIMEOUT") or 45)
+    return {
+        "enabled": True,
+        "target": target,
+        "port": port,
+        "identity_file": identity_file,
+        "timeout": timeout,
+    }
+
+
+def _ssh_base_args(cfg: dict) -> list[str]:
+    args = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-p", str(cfg["port"]),
+    ]
+    identity_file = cfg.get("identity_file")
+    if identity_file:
+        args += ["-i", str(Path(identity_file).expanduser())]
+    args += [cfg["target"], "python3", "-"]
+    return args
+
+
+def _remote_mimo_script(method: str, url: str, headers: dict, content: bytes | None) -> str:
+    payload = {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "content_b64": base64.b64encode(content or b"").decode("ascii"),
+        "has_content": content is not None,
+    }
+    payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    return f"""
+import base64, json, urllib.error, urllib.request
+
+p = json.loads(base64.b64decode({payload_b64!r}).decode("utf-8"))
+data = base64.b64decode(p["content_b64"]) if p.get("has_content") else None
+req = urllib.request.Request(
+    p["url"],
+    data=data,
+    headers=p["headers"],
+    method=p["method"],
+)
+try:
+    with urllib.request.urlopen(req, timeout=35) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        print(json.dumps({{"status": resp.status, "body": body}}, ensure_ascii=False))
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", "replace")
+    print(json.dumps({{"status": exc.code, "body": body}}, ensure_ascii=False))
+except Exception as exc:
+    print(json.dumps({{"error": type(exc).__name__ + ": " + str(exc)}}, ensure_ascii=False))
+"""
+
+
+def _parse_remote_mimo_output(text: str):
+    remote = json.loads(text)
+    if remote.get("error"):
+        raise RuntimeError(remote["error"])
+    body = remote.get("body") or ""
+    class _Resp:
+        status_code = int(remote["status"])
+        text = body
+    return _parse_mimo_response(_Resp())
+
+
+def _ssh_mimo_request_sync(method: str, url: str, headers: dict, content: bytes | None, cfg: dict):
+    script = _remote_mimo_script(method, url, headers, content)
+    proc = subprocess.run(
+        _ssh_base_args(cfg),
+        input=script,
+        text=True,
+        capture_output=True,
+        timeout=cfg["timeout"],
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError("ssh exit {0}: {1}".format(proc.returncode, detail[:500]))
+    return _parse_remote_mimo_output(proc.stdout.strip())
+
+
+async def _ssh_mimo_request_async(method: str, url: str, headers: dict, content: bytes | None, cfg: dict):
+    script = _remote_mimo_script(method, url, headers, content)
+    proc = await asyncio.create_subprocess_exec(
+        *_ssh_base_args(cfg),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(script.encode("utf-8")),
+            timeout=cfg["timeout"],
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError("ssh MiMo request timed out")
+    if proc.returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", "replace").strip()
+        raise RuntimeError("ssh exit {0}: {1}".format(proc.returncode, detail[:500]))
+    return _parse_remote_mimo_output(stdout.decode("utf-8", "replace").strip())
+
+
 def _build_mimo_request(method, path, body, with_ph, cookies):
     """Shared URL/header/content builder for both sync and async API paths."""
     if cookies is None:
@@ -556,6 +695,9 @@ def curl_api(method, path, body=None, with_ph=True, cookies=None):
     are not running on the FastAPI event loop. Async handlers should use acurl()."""
     method, url, headers, content = _build_mimo_request(method, path, body, with_ph, cookies)
     try:
+        ssh_cfg = _mimo_control_ssh_config()
+        if ssh_cfg.get("enabled"):
+            return _ssh_mimo_request_sync(method, url, headers, content, ssh_cfg)
         resp = _get_sync_http_client().request(method, url, headers=headers, content=content)
         return _parse_mimo_response(resp)
     except httpx.TimeoutException as e:
@@ -570,6 +712,9 @@ async def acurl(method, path, body=None, with_ph=True, cookies=None):
     """Call MiMo API via shared httpx.AsyncClient. Pass cookies=[...] for a specific account."""
     method, url, headers, content = _build_mimo_request(method, path, body, with_ph, cookies)
     try:
+        ssh_cfg = _mimo_control_ssh_config()
+        if ssh_cfg.get("enabled"):
+            return await _ssh_mimo_request_async(method, url, headers, content, ssh_cfg)
         resp = await _get_http_client().request(method, url, headers=headers, content=content)
         return _parse_mimo_response(resp)
     except httpx.TimeoutException as e:
@@ -584,7 +729,13 @@ async def acurl(method, path, body=None, with_ph=True, cookies=None):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_file = BASE_DIR / "templates" / "index.html"
-    return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content=html_file.read_text(encoding="utf-8"),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 def _log_retention_days() -> int:
@@ -2014,6 +2165,140 @@ async def panel_acl_set(request: Request):
     saved = panel_acl.set_allowed(clean)
     _audit("panel_acl_set", request, count=len(saved))
     return {"allowed_ips": saved}
+
+
+# ──────────── SSH target / relay machine config (panel-authed) ────────────
+
+_SSH_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+
+
+def _default_ssh_targets() -> dict:
+    return {
+        "panel_key_path": "data/panel_tunnel_key",
+        "default_target": "",
+        "targets": {},
+        "assignments": {},
+    }
+
+
+def _clean_endpoint_text(value: object, *, field: str, max_len: int = 255) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} 不能为空")
+    if len(text) > max_len or any(ch.isspace() for ch in text):
+        raise ValueError(f"{field} 不能包含空白且长度需 ≤{max_len}")
+    return text
+
+
+def _clean_port(value: object, *, field: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须是数字端口")
+    if port < 1 or port > 65535:
+        raise ValueError(f"{field} 必须在 1-65535 之间")
+    return port
+
+
+def _sanitize_ssh_targets(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    out = _default_ssh_targets()
+    panel_key = str(raw.get("panel_key_path") or out["panel_key_path"]).strip()
+    if not panel_key:
+        panel_key = out["panel_key_path"]
+    if len(panel_key) > 260 or "\n" in panel_key or "\r" in panel_key:
+        raise ValueError("panel_key_path 不合法")
+    out["panel_key_path"] = panel_key
+
+    targets_raw = raw.get("targets") if isinstance(raw.get("targets"), dict) else {}
+    targets: dict[str, dict] = {}
+    for target_id, target in targets_raw.items():
+        tid = str(target_id or "").strip()
+        if not _SSH_ID_RE.match(tid):
+            raise ValueError("目标机 ID 必须由字母/数字/-_/. 组成且 ≤32 字符")
+        if not isinstance(target, dict):
+            raise ValueError(f"目标机 {tid} 配置不合法")
+        port_range = target.get("port_range") or [19080, 19980]
+        if not isinstance(port_range, list) or len(port_range) != 2:
+            raise ValueError(f"目标机 {tid} 的端口池必须是 [起始, 结束]")
+        lo = _clean_port(port_range[0], field=f"{tid}.port_range[0]")
+        hi = _clean_port(port_range[1], field=f"{tid}.port_range[1]")
+        if lo >= hi:
+            raise ValueError(f"目标机 {tid} 的端口池结束端口必须大于起始端口")
+        targets[tid] = {
+            "host": _clean_endpoint_text(target.get("host"), field=f"{tid}.host"),
+            "ssh_port": _clean_port(target.get("ssh_port", 22), field=f"{tid}.ssh_port"),
+            "tunnel_user": _clean_endpoint_text(
+                target.get("tunnel_user", "tunnel"),
+                field=f"{tid}.tunnel_user",
+                max_len=64,
+            ),
+            "upstream_host": _clean_endpoint_text(
+                target.get("upstream_host", "127.0.0.1"),
+                field=f"{tid}.upstream_host",
+            ),
+            "port_range": [lo, hi],
+        }
+    out["targets"] = targets
+
+    default_target = str(raw.get("default_target") or "").strip()
+    if default_target:
+        if default_target not in targets:
+            raise ValueError("默认目标机必须存在于目标机列表")
+        out["default_target"] = default_target
+
+    assignments_raw = raw.get("assignments") if isinstance(raw.get("assignments"), dict) else {}
+    assignments: dict[str, dict] = {}
+    used_ports: set[tuple[str, int]] = set()
+    for account, assignment in assignments_raw.items():
+        name = str(account or "").strip()
+        if not name or len(name) > 200 or "\n" in name or "\r" in name:
+            raise ValueError("账号分配名称不合法")
+        if not isinstance(assignment, dict):
+            continue
+        target_id = str(assignment.get("target") or "").strip()
+        if not target_id:
+            continue
+        if target_id not in targets:
+            raise ValueError(f"账号 {name} 指定的目标机不存在")
+        cleaned = {"target": target_id}
+        port_raw = assignment.get("remote_api_port")
+        if port_raw not in (None, ""):
+            port = _clean_port(port_raw, field=f"{name}.remote_api_port")
+            lo, hi = targets[target_id]["port_range"]
+            if port < lo or port >= hi:
+                raise ValueError(f"账号 {name} 的端口不在目标机 {target_id} 端口池内")
+            key = (target_id, port)
+            if key in used_ports:
+                raise ValueError(f"目标机 {target_id} 的端口 {port} 被重复分配")
+            used_ports.add(key)
+            cleaned["remote_api_port"] = port
+        assignments[name] = cleaned
+    out["assignments"] = assignments
+    return out
+
+
+@app.get("/api/ssh-targets")
+async def ssh_targets_get():
+    from gateway import config_store
+    cfg = config_store.get_section("ssh_targets", None)
+    if not isinstance(cfg, dict):
+        cfg = _default_ssh_targets()
+    return _sanitize_ssh_targets(cfg)
+
+
+@app.post("/api/ssh-targets")
+async def ssh_targets_set(request: Request):
+    from gateway import config_store
+    body = await request.json()
+    try:
+        cfg = _sanitize_ssh_targets(body.get("ssh_targets") if isinstance(body, dict) and "ssh_targets" in body else body)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    config_store.set_section("ssh_targets", cfg)
+    _audit("ssh_targets_set", request, targets=len(cfg["targets"]), assignments=len(cfg["assignments"]))
+    return {"success": True, "ssh_targets": cfg}
 
 
 # ──────────── Secrets management (panel-authed) ────────────

@@ -250,6 +250,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <div class="nav-item" data-page="deploy" onclick="switchPage('deploy')">
       <span class="icon">🚀</span><span>自动部署</span>
     </div>
+    <div class="nav-item" data-page="ssh-targets" onclick="switchPage('ssh-targets')">
+      <span class="icon">🛤️</span><span>中转机配置</span>
+    </div>
     <div class="nav-item" data-page="logs" onclick="switchPage('logs')">
       <span class="icon">🧾</span><span>系统日志</span>
     </div>
@@ -456,6 +459,65 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       </div>
     </div>
 
+    <!-- ════ SSH Target / Relay Machines ════ -->
+    <div class="page" id="page-ssh-targets">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <h2 style="margin:0">目标机 / 中转机配置</h2>
+          <div class="meta">用于 Claw 反向 SSH 隧道：目标机接收 <code>ssh -R</code>，网关访问目标机 loopback 暴露出的 API 端口。</div>
+        </div>
+        <div class="btn-group" style="margin:0">
+          <button class="btn btn-primary" onclick="saveSshTargets()">保存配置</button>
+          <button class="btn btn-ghost" onclick="refreshSshTargets()">重新加载</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>全局设置</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;max-width:980px">
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">面板管理私钥路径</label>
+            <input id="sshPanelKeyPath" placeholder="data/panel_tunnel_key" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          </div>
+          <div>
+            <label style="font-size:.8rem;color:var(--text2)">默认目标机 ID</label>
+            <input id="sshDefaultTarget" list="sshTargetIdList" placeholder="留空则每个账号需单独分配" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+            <datalist id="sshTargetIdList"></datalist>
+          </div>
+        </div>
+        <div id="sshTargetsStatus" class="secret-status" role="status" aria-live="polite"></div>
+      </div>
+
+      <div class="section">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+          <h2 style="margin:0">目标机列表</h2>
+          <button class="btn" onclick="sshAddTargetRow()">新增目标机</button>
+        </div>
+        <table class="data-table">
+          <thead><tr><th>ID</th><th>Host</th><th>SSH</th><th>Tunnel 用户</th><th>网关访问 Host</th><th>端口池</th><th>操作</th></tr></thead>
+          <tbody id="sshTargetsBody">
+            <tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+          <div>
+            <h2 style="margin:0">账号分配</h2>
+            <div class="meta">端口留空时，部署会从目标机端口池自动分配并写回配置。</div>
+          </div>
+          <button class="btn" onclick="sshAddAssignmentRow()">新增分配</button>
+        </div>
+        <table class="data-table">
+          <thead><tr><th>账号文件名</th><th>目标机</th><th>固定远端 API 端口</th><th>操作</th></tr></thead>
+          <tbody id="sshAssignmentsBody">
+            <tr><td colspan="4" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- ════ System Logs ════ -->
     <div class="page" id="page-logs">
       <div class="section">
@@ -577,7 +639,7 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
         </div>
       </div>
       <div id="mgInfo" style="color:var(--text3);font-size:.82rem;padding:6px 0 12px 0">
-        客户端用 <code>exposed_name</code> 调 <code>/v1/chat/completions</code> 或 <code>/v1/messages</code>；网关查到映射后用 <code>native_model</code> 转发上游。无匹配返回 <code>model_not_found</code>。
+        客户端用 <code>exposed_name</code> 调 <code>/v1/chat/completions</code>、<code>/v1/responses</code> 或 <code>/v1/messages</code>；网关查到映射后用 <code>native_model</code> 转发上游。映射持久化在 <code>data/model_groups.json</code>，无匹配返回 <code>model_not_found</code>。
       </div>
       <div id="mgGroupsContainer"></div>
     </div>
@@ -670,9 +732,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <thead><tr><th>端点</th><th>方法</th><th>认证</th><th>描述</th></tr></thead>
           <tbody>
             <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>Bearer</td><td>OpenAI 原生格式</td></tr>
-            <tr><td><code>/v1/messages</code></td><td>POST</td><td>Bearer</td><td>Anthropic 格式 → OpenAI</td></tr>
+            <tr><td><code>/v1/messages</code></td><td>POST</td><td>Bearer</td><td>Anthropic 原生透传</td></tr>
             <tr><td><code>/v1/responses</code></td><td>POST</td><td>Bearer</td><td>Responses 格式 → OpenAI</td></tr>
-            <tr><td><code>/v1/models</code></td><td>GET</td><td>Bearer</td><td>列出可用模型</td></tr>
+            <tr><td><code>/v1/models</code></td><td>GET</td><td>无</td><td>列出映射后的可用模型</td></tr>
             <tr><td><code>/health</code></td><td>GET</td><td>无</td><td>公开健康检查</td></tr>
             <tr><td><code>/api/public/status</code></td><td>GET</td><td>Status Key</td><td>状态页数据（需独立 status_api_token）</td></tr>
           </tbody>
@@ -681,17 +743,16 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <div class="section">
         <h2>认证</h2>
         <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p>所有 API 端点（<code>/health</code> 除外）都需要：</p>
+          <p>数据面写请求（<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/messages</code>）需要：</p>
           <pre style="background:#0d1b2a;padding:12px;border-radius:6px;margin:10px 0;font-size:0.82rem;color:var(--text)">Authorization: Bearer sk-Aoki-MiMo</pre>
-          <p>网关会自动注入后端 API key，客户端只需提供网关 token。</p>
+          <p>网关会自动注入后端 API key，客户端只需提供网关 token。<code>/v1/models</code> 与 <code>/health</code> 公开可读；<code>/api/public/status</code> 使用独立的 <code>status_api_token</code>。</p>
         </div>
       </div>
       <div class="section">
         <h2>格式转换</h2>
         <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p><strong>Anthropic → OpenAI</strong>：转换 <code>/v1/messages</code> 请求（含系统提示、tool_use 块、流式）。</p>
-          <p style="margin-top:8px"><strong>Responses → OpenAI</strong>：转换 <code>/v1/responses</code>（含 input 数组与函数调用）。</p>
-          <p style="margin-top:8px">两种格式都会透明地转换为 <code>/v1/chat/completions</code>，并路由到最佳可用后端。</p>
+          <p><strong>OpenAI Chat / Responses</strong>：走统一适配链路，<code>/v1/responses</code> 会转换到上游 Chat 格式并路由到最佳可用后端。</p>
+          <p style="margin-top:8px"><strong>Anthropic Messages</strong>：<code>/v1/messages</code> 先做模型映射和能力校验，再直连上游 Anthropic 原生接口，保留 <code>thinking</code>、<code>signature</code> 与 beta header。</p>
         </div>
       </div>
     </div>
@@ -796,7 +857,7 @@ function formatUptime(sec) {
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
   dashboard: '概览', accounts: '账号 & Claw',
-  chat: 'Claw 对话', deploy: '自动部署', logs: '系统日志',
+  chat: 'Claw 对话', deploy: '自动部署', 'ssh-targets': '中转机配置', logs: '系统日志',
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
@@ -819,6 +880,7 @@ function switchPage(name) {
   if (name === 'accounts') refreshAccountsFull();
   if (name === 'chat') refreshChatHeader();
   if (name === 'deploy') refreshAccounts();
+  if (name === 'ssh-targets') refreshSshTargets();
   if (name === 'logs') refreshLogs();
   if (name === 'gateway') refreshGateway();
   if (name === 'backends') refreshBackends();
@@ -2204,6 +2266,431 @@ window.vpsAddNode = vpsAddNode;
 window.vpsShowInstall = vpsShowInstall;
 window.vpsRegenToken = vpsRegenToken;
 window.vpsDeleteNode = vpsDeleteNode;
+
+// Panel access control
+var aclCurrentIp = '';
+function refreshPanelAcl() {
+  return api('GET', '/api/panel-acl').then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
+    aclCurrentIp = d.your_ip || '';
+    document.getElementById('aclYourIp').textContent = aclCurrentIp || '--';
+    document.getElementById('aclTextarea').value = (d.allowed_ips || []).join('\n');
+  }).catch(function() {
+    toast('访问控制加载失败', 'error');
+  });
+}
+function aclAddMyIp() {
+  var ip = aclCurrentIp || document.getElementById('aclYourIp').textContent;
+  if (!ip || ip === '--') { toast('当前 IP 未识别', 'error'); return; }
+  var el = document.getElementById('aclTextarea');
+  var lines = el.value.split(/\r?\n/).map(function(x) { return x.trim(); }).filter(Boolean);
+  if (lines.indexOf(ip) === -1) lines.push(ip);
+  el.value = lines.join('\n');
+}
+function savePanelAcl() {
+  var lines = document.getElementById('aclTextarea').value
+    .split(/\r?\n/)
+    .map(function(x) { return x.trim(); })
+    .filter(Boolean);
+  api('POST', '/api/panel-acl', { allowed_ips: lines }).then(function(d) {
+    if (d.error) { toast(d.error, 'error'); return; }
+    document.getElementById('aclTextarea').value = (d.allowed_ips || []).join('\n');
+    toast('访问控制已保存', 'success');
+  }).catch(function() {
+    toast('访问控制保存失败', 'error');
+  });
+}
+window.refreshPanelAcl = refreshPanelAcl;
+window.savePanelAcl = savePanelAcl;
+window.aclAddMyIp = aclAddMyIp;
+
+// SSH target / relay machine config
+var sshTargetsConfig = null;
+var sshTargetAccounts = [];
+
+function sshSetStatus(text, cls) {
+  var el = document.getElementById('sshTargetsStatus');
+  el.textContent = text || '';
+  el.className = 'secret-status' + (cls ? ' ' + cls : '');
+}
+
+function sshTargetOptions(selected) {
+  var ids = Object.keys(sshCollectTargetsFromRows(false));
+  if (ids.length === 0 && sshTargetsConfig && sshTargetsConfig.targets) {
+    ids = Object.keys(sshTargetsConfig.targets);
+  }
+  ids.sort();
+  var html = '<option value="">自动 / 不指定</option>';
+  for (var i = 0; i < ids.length; i++) {
+    html += '<option value="' + escapeHtml(ids[i]) + '"' + (ids[i] === selected ? ' selected' : '') + '>' + escapeHtml(ids[i]) + '</option>';
+  }
+  return html;
+}
+
+function sshTargetRowHtml(id, target) {
+  target = target || {};
+  var range = target.port_range || [19080, 19980];
+  return '<tr data-ssh-target-row>' +
+    '<td><input data-ssh-field="id" value="' + escapeHtml(id || '') + '" placeholder="vps1" oninput="sshRefreshTargetHints()" style="width:100%;min-width:90px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><input data-ssh-field="host" value="' + escapeHtml(target.host || '') + '" placeholder="1.2.3.4" style="width:100%;min-width:130px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><input data-ssh-field="ssh_port" type="number" min="1" max="65535" value="' + escapeHtml(target.ssh_port || 22) + '" style="width:76px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><input data-ssh-field="tunnel_user" value="' + escapeHtml(target.tunnel_user || 'tunnel') + '" style="width:100%;min-width:100px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><input data-ssh-field="upstream_host" value="' + escapeHtml(target.upstream_host || '127.0.0.1') + '" style="width:100%;min-width:130px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><div style="display:flex;gap:6px;align-items:center">' +
+      '<input data-ssh-field="port_lo" type="number" min="1" max="65535" value="' + escapeHtml(range[0] || 19080) + '" style="width:82px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem">' +
+      '<span style="color:var(--text3)">-</span>' +
+      '<input data-ssh-field="port_hi" type="number" min="1" max="65535" value="' + escapeHtml(range[1] || 19980) + '" style="width:82px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem">' +
+    '</div></td>' +
+    '<td><button class="btn btn-ghost" type="button" style="padding:4px 10px;font-size:.75rem" onclick="sshRemoveTargetRow(this)">删除</button></td>' +
+  '</tr>';
+}
+
+function sshAssignmentRowHtml(account, assignment) {
+  assignment = assignment || {};
+  return '<tr data-ssh-assignment-row>' +
+    '<td><input data-ssh-assignment-field="account" value="' + escapeHtml(account || '') + '" placeholder="account@example.com" style="width:100%;min-width:220px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><select data-ssh-assignment-field="target" style="width:100%;min-width:140px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem">' + sshTargetOptions(assignment.target || '') + '</select></td>' +
+    '<td><input data-ssh-assignment-field="remote_api_port" type="number" min="1" max="65535" value="' + escapeHtml(assignment.remote_api_port || '') + '" placeholder="自动分配" style="width:140px;padding:7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem"></td>' +
+    '<td><button class="btn btn-ghost" type="button" style="padding:4px 10px;font-size:.75rem" onclick="sshRemoveAssignmentRow(this)">移除</button></td>' +
+  '</tr>';
+}
+
+function sshCollectTargetsFromRows(includeValues) {
+  var rows = document.querySelectorAll('[data-ssh-target-row]');
+  var targets = {};
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var id = (row.querySelector('[data-ssh-field="id"]').value || '').trim();
+    if (!id) continue;
+    if (!includeValues) {
+      targets[id] = {};
+      continue;
+    }
+    targets[id] = {
+      host: (row.querySelector('[data-ssh-field="host"]').value || '').trim(),
+      ssh_port: Number(row.querySelector('[data-ssh-field="ssh_port"]').value || 22),
+      tunnel_user: (row.querySelector('[data-ssh-field="tunnel_user"]').value || '').trim(),
+      upstream_host: (row.querySelector('[data-ssh-field="upstream_host"]').value || '').trim(),
+      port_range: [
+        Number(row.querySelector('[data-ssh-field="port_lo"]').value || 0),
+        Number(row.querySelector('[data-ssh-field="port_hi"]').value || 0),
+      ],
+    };
+  }
+  return targets;
+}
+
+function sshCollectAssignmentsFromRows() {
+  var rows = document.querySelectorAll('[data-ssh-assignment-row]');
+  var assignments = {};
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var account = (row.querySelector('[data-ssh-assignment-field="account"]').value || '').trim();
+    var target = (row.querySelector('[data-ssh-assignment-field="target"]').value || '').trim();
+    var port = (row.querySelector('[data-ssh-assignment-field="remote_api_port"]').value || '').trim();
+    if (!account || !target) continue;
+    assignments[account] = { target: target };
+    if (port) assignments[account].remote_api_port = Number(port);
+  }
+  return assignments;
+}
+
+function renderSshTargets(cfg) {
+  sshTargetsConfig = cfg || { targets: {}, assignments: {} };
+  document.getElementById('sshPanelKeyPath').value = sshTargetsConfig.panel_key_path || 'data/panel_tunnel_key';
+  document.getElementById('sshDefaultTarget').value = sshTargetsConfig.default_target || '';
+  var ids = Object.keys(sshTargetsConfig.targets || {}).sort();
+  document.getElementById('sshTargetIdList').innerHTML = ids.map(function(id) {
+    return '<option value="' + escapeHtml(id) + '"></option>';
+  }).join('');
+
+  var targetHtml = '';
+  for (var i = 0; i < ids.length; i++) {
+    targetHtml += sshTargetRowHtml(ids[i], sshTargetsConfig.targets[ids[i]]);
+  }
+  document.getElementById('sshTargetsBody').innerHTML = targetHtml ||
+    '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">暂无目标机。点击“新增目标机”开始。</td></tr>';
+
+  var assignmentKeys = [];
+  var seen = {};
+  for (var a = 0; a < sshTargetAccounts.length; a++) {
+    var fn = sshTargetAccounts[a].filename || sshTargetAccounts[a].name || '';
+    if (fn && !seen[fn]) { seen[fn] = true; assignmentKeys.push(fn); }
+  }
+  var assignments = sshTargetsConfig.assignments || {};
+  Object.keys(assignments).forEach(function(k) {
+    if (!seen[k]) { seen[k] = true; assignmentKeys.push(k); }
+  });
+  assignmentKeys.sort();
+  var assignmentHtml = '';
+  for (var j = 0; j < assignmentKeys.length; j++) {
+    assignmentHtml += sshAssignmentRowHtml(assignmentKeys[j], assignments[assignmentKeys[j]]);
+  }
+  document.getElementById('sshAssignmentsBody').innerHTML = assignmentHtml ||
+    '<tr><td colspan="4" style="color:var(--text3);text-align:center;padding:18px">暂无账号。也可以点击“新增分配”手动填写账号文件名。</td></tr>';
+  sshSetStatus('已加载：' + ids.length + ' 台目标机，' + Object.keys(assignments).length + ' 条账号分配。');
+}
+
+function refreshSshTargets() {
+  sshSetStatus('加载中...');
+  return Promise.all([
+    api('GET', '/api/ssh-targets'),
+    api('GET', '/api/accounts'),
+  ]).then(function(results) {
+    var cfg = results[0];
+    if (cfg.error) { sshSetStatus(cfg.error, 'error'); return; }
+    sshTargetAccounts = results[1].accounts || [];
+    renderSshTargets(cfg);
+  }).catch(function() {
+    sshSetStatus('中转机配置加载失败', 'error');
+  });
+}
+
+function sshRefreshTargetHints() {
+  var ids = Object.keys(sshCollectTargetsFromRows(false)).sort();
+  document.getElementById('sshTargetIdList').innerHTML = ids.map(function(id) {
+    return '<option value="' + escapeHtml(id) + '"></option>';
+  }).join('');
+  var selects = document.querySelectorAll('[data-ssh-assignment-field="target"]');
+  for (var i = 0; i < selects.length; i++) {
+    var selected = selects[i].value;
+    selects[i].innerHTML = sshTargetOptions(selected);
+    selects[i].value = selected;
+  }
+}
+
+function sshAddTargetRow() {
+  var body = document.getElementById('sshTargetsBody');
+  if (!document.querySelector('[data-ssh-target-row]')) body.innerHTML = '';
+  var used = Object.keys(sshCollectTargetsFromRows(false));
+  var idx = used.length + 1;
+  var id = 'vps' + idx;
+  while (used.indexOf(id) !== -1) { idx += 1; id = 'vps' + idx; }
+  body.insertAdjacentHTML('beforeend', sshTargetRowHtml(id, {
+    host: '',
+    ssh_port: 22,
+    tunnel_user: 'tunnel',
+    upstream_host: '127.0.0.1',
+    port_range: [19080, 19980],
+  }));
+  sshRefreshTargetHints();
+}
+
+function sshRemoveTargetRow(btn) {
+  var row = btn.closest('[data-ssh-target-row]');
+  if (row) row.remove();
+  if (!document.querySelector('[data-ssh-target-row]')) {
+    document.getElementById('sshTargetsBody').innerHTML =
+      '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">暂无目标机。点击“新增目标机”开始。</td></tr>';
+  }
+  sshRefreshTargetHints();
+}
+
+function sshAddAssignmentRow() {
+  var body = document.getElementById('sshAssignmentsBody');
+  if (!document.querySelector('[data-ssh-assignment-row]')) body.innerHTML = '';
+  body.insertAdjacentHTML('beforeend', sshAssignmentRowHtml('', {}));
+}
+
+function sshRemoveAssignmentRow(btn) {
+  var row = btn.closest('[data-ssh-assignment-row]');
+  if (row) row.remove();
+  if (!document.querySelector('[data-ssh-assignment-row]')) {
+    document.getElementById('sshAssignmentsBody').innerHTML =
+      '<tr><td colspan="4" style="color:var(--text3);text-align:center;padding:18px">暂无账号。也可以点击“新增分配”手动填写账号文件名。</td></tr>';
+  }
+}
+
+function saveSshTargets() {
+  var payload = {
+    panel_key_path: (document.getElementById('sshPanelKeyPath').value || '').trim(),
+    default_target: (document.getElementById('sshDefaultTarget').value || '').trim(),
+    targets: sshCollectTargetsFromRows(true),
+    assignments: sshCollectAssignmentsFromRows(),
+  };
+  sshSetStatus('保存中...');
+  api('POST', '/api/ssh-targets', { ssh_targets: payload }).then(function(d) {
+    if (d.error) { sshSetStatus(d.error, 'error'); toast(d.error, 'error'); return; }
+    renderSshTargets(d.ssh_targets || payload);
+    sshSetStatus('已保存并即时生效。', 'success');
+    toast('中转机配置已保存', 'success');
+  }).catch(function() {
+    sshSetStatus('保存失败', 'error');
+    toast('中转机配置保存失败', 'error');
+  });
+}
+window.refreshSshTargets = refreshSshTargets;
+window.saveSshTargets = saveSshTargets;
+window.sshAddTargetRow = sshAddTargetRow;
+window.sshRemoveTargetRow = sshRemoveTargetRow;
+window.sshAddAssignmentRow = sshAddAssignmentRow;
+window.sshRemoveAssignmentRow = sshRemoveAssignmentRow;
+window.sshRefreshTargetHints = sshRefreshTargetHints;
+
+// Secrets management
+var SECRET_FIELDS = [
+  {
+    key: 'panel_password',
+    label: '面板登录密码',
+    help: '用于登录管理面板；不能为空。'
+  },
+  {
+    key: 'public_api_token',
+    label: '公开 API token',
+    help: '客户端调用 /v1/* 数据面接口时使用；轮换后现有客户端会失效。',
+    rotatable: true
+  },
+  {
+    key: 'upstream_api_key',
+    label: '默认上游 API key',
+    help: '后端未单独填写 api_key 时使用；可以留空。'
+  },
+  {
+    key: 'panel_session_token',
+    label: '面板会话 token',
+    help: '用于面板登录 cookie；轮换后其它已登录会话会掉线。',
+    rotatable: true
+  },
+  {
+    key: 'status_api_token',
+    label: '状态页 API token',
+    help: '仅用于 /api/public/status，独立于面板和 /v1 API token。',
+    rotatable: true
+  }
+];
+var secretErrors = {};
+var secretEnvLocked = [];
+
+function secretSetStatus(text, cls) {
+  var el = document.getElementById('secretsStatus');
+  el.textContent = text || '';
+  el.className = 'secret-status' + (cls ? ' ' + cls : '');
+}
+
+function secretFieldMeta(key) {
+  for (var i = 0; i < SECRET_FIELDS.length; i++) {
+    if (SECRET_FIELDS[i].key === key) return SECRET_FIELDS[i];
+  }
+  return { key: key, label: key, help: '' };
+}
+
+function renderSecrets(data) {
+  var secrets = data.secrets || {};
+  var locked = data.env_locked || [];
+  var html = '<div class="secret-stack">';
+  for (var i = 0; i < SECRET_FIELDS.length; i++) {
+    var f = SECRET_FIELDS[i];
+    var isLocked = locked.indexOf(f.key) !== -1;
+    var err = secretErrors[f.key] || '';
+    html += '<div class="secret-row' + (err ? ' error' : '') + '">' +
+      '<div class="secret-head">' +
+        '<div>' +
+          '<div class="secret-label">' + escapeHtml(f.label) +
+            ' <code>' + escapeHtml(f.key) + '</code>' +
+            (isLocked ? ' <span class="status-text warning">环境变量锁定</span>' : '') +
+          '</div>' +
+          '<div class="secret-help">' + escapeHtml(f.help) + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="secret-control">' +
+        '<input class="secret-input" id="secret-' + escapeHtml(f.key) + '" data-secret-field="' + escapeHtml(f.key) + '" type="password" value="' + escapeHtml(secrets[f.key] || '') + '"' + (isLocked ? ' disabled' : '') + '>' +
+        '<div class="secret-actions">' +
+          "<button class=\"btn btn-ghost\" type=\"button\" onclick=\"secretToggle('" + escapeHtml(f.key) + "')\">显示</button>" +
+          "<button class=\"btn btn-ghost\" type=\"button\" onclick=\"secretCopy('" + escapeHtml(f.key) + "')\">复制</button>" +
+          (f.rotatable ? "<button class=\"btn btn-ghost\" type=\"button\" onclick=\"secretRotate('" + escapeHtml(f.key) + "')\"" + (isLocked ? ' disabled' : '') + '>轮换</button>' : '') +
+        '</div>' +
+      '</div>' +
+      '<div class="secret-error">' + escapeHtml(err) + '</div>' +
+    '</div>';
+  }
+  html += '</div>';
+  document.getElementById('secretsBody').innerHTML = html;
+}
+
+function refreshSecrets() {
+  secretErrors = {};
+  secretSetStatus('加载中...');
+  return api('GET', '/api/secrets').then(function(d) {
+    if (d.error) {
+      secretSetStatus(d.error, 'error');
+      document.getElementById('secretsBody').innerHTML = '';
+      return;
+    }
+    secretEnvLocked = d.env_locked || [];
+    renderSecrets(d);
+    secretSetStatus('已加载。被环境变量锁定的字段不可修改。');
+  }).catch(function() {
+    secretSetStatus('密钥加载失败，请确认已登录面板。', 'error');
+  });
+}
+
+function saveSecrets() {
+  var inputs = document.querySelectorAll('[data-secret-field]');
+  var payload = {};
+  var current = {};
+  for (var i = 0; i < inputs.length; i++) {
+    current[inputs[i].dataset.secretField] = inputs[i].value;
+    if (!inputs[i].disabled) payload[inputs[i].dataset.secretField] = inputs[i].value;
+  }
+  document.getElementById('secretsSaveBtn').disabled = true;
+  secretSetStatus('保存中...');
+  api('POST', '/api/secrets', { secrets: payload }).then(function(d) {
+    document.getElementById('secretsSaveBtn').disabled = false;
+    secretErrors = d.errors || {};
+    if (Object.keys(secretErrors).length) {
+      renderSecrets({ secrets: current, env_locked: secretEnvLocked });
+      secretSetStatus('有字段未通过校验，请按红色提示修改。', 'error');
+      return;
+    }
+    secretSetStatus((d.changed || []).length ? '已保存并即时生效。' : '没有变更。', 'success');
+    refreshSecrets();
+  }).catch(function() {
+    document.getElementById('secretsSaveBtn').disabled = false;
+    secretSetStatus('保存失败', 'error');
+  });
+}
+
+function secretToggle(key) {
+  var el = document.getElementById('secret-' + key);
+  if (!el) return;
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+function secretCopy(key) {
+  var el = document.getElementById('secret-' + key);
+  if (!el) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(el.value).then(function() {
+      toast(secretFieldMeta(key).label + '已复制', 'success');
+    }).catch(function() {
+      el.select();
+      toast('已选中，请手动复制', 'warning');
+    });
+  } else {
+    el.select();
+    toast('已选中，请手动复制', 'warning');
+  }
+}
+
+function secretRotate(key) {
+  var meta = secretFieldMeta(key);
+  if (!confirm('确定轮换 ' + meta.label + '？旧值会立即失效。')) return;
+  secretSetStatus('轮换中...');
+  api('POST', '/api/secrets/rotate', { field: key }).then(function(d) {
+    if (d.error) { secretSetStatus(d.error, 'error'); return; }
+    var el = document.getElementById('secret-' + key);
+    if (el) el.value = d.value || '';
+    secretSetStatus(meta.label + '已轮换并即时生效。', 'success');
+    refreshSecrets();
+  }).catch(function() {
+    secretSetStatus('轮换失败', 'error');
+  });
+}
+window.refreshSecrets = refreshSecrets;
+window.saveSecrets = saveSecrets;
+window.secretToggle = secretToggle;
+window.secretCopy = secretCopy;
+window.secretRotate = secretRotate;
 
 // ══════════════════════════════════════════════════════
 // Clock & Init

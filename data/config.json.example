@@ -27,5 +27,14 @@
   },
   "pin": {
     "aistudio_pin_ip": ""
+  },
+  "mimo_control": {
+    "ssh": {
+      "enabled": false,
+      "target": "root@1.2.3.4",
+      "port": 22,
+      "identity_file": "",
+      "timeout": 45
+    }
   }
 }
