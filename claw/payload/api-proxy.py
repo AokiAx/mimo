@@ -73,6 +73,23 @@ if not API_KEY:
     log("WARNING: no MIMO_API_KEY resolved; upstream calls will 401")
 log(f"upstream: {API_BASE}  pool: {CONN_LIMIT} (per-host {CONN_PER_HOST})  prewarm: {PREWARM}")
 
+# The gateway's MIMO_API_KEY rotates. Reading it once at startup and caching it
+# forever means a rotated key leaves us forwarding a STALE token -> upstream 401
+# (api-proxy 401 while the live key works). Re-resolve at most once per _KEY_TTL
+# so rotations are picked up automatically, no proxy restart needed.
+_KEY_TTL = float(os.environ.get("PROXY_KEY_TTL", "60"))
+_key_cache = {"key": API_KEY, "base": API_BASE, "ts": time.time()}
+
+
+def _current_key_base() -> tuple[str, str]:
+    now = time.time()
+    if now - _key_cache["ts"] > _KEY_TTL:
+        k, b = _resolve_upstream()
+        _key_cache["ts"] = now
+        if k:
+            _key_cache["key"], _key_cache["base"] = k, b
+    return _key_cache["key"], _key_cache["base"]
+
 _verify = os.environ.get("PROXY_VERIFY_SSL", "1") != "0"
 _ssl_ctx: ssl.SSLContext | bool
 if _verify:
@@ -98,13 +115,14 @@ async def handle(req: web.Request) -> web.StreamResponse:
         return web.json_response({"ok": True, "uptime": int(time.time() - _start), "reqs": _reqs})
 
     _reqs += 1
-    target = API_BASE + _upstream_path(req.path)
+    api_key, api_base = _current_key_base()
+    target = api_base + _upstream_path(req.path)
     if req.query_string:
         target += "?" + req.query_string
 
     headers = {"Content-Type": req.headers.get("Content-Type", "application/json"), "Accept": "*/*"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     for h in ("anthropic-version", "anthropic-beta", "x-request-id"):
         if h in req.headers:
             headers[h] = req.headers[h]

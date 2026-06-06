@@ -28,14 +28,17 @@ KEYCOMMENT="$(printf '%s' "$KEYCOMMENT" | tr -cd 'A-Za-z0-9_.@-')"
 
 mkdir -p "$HOME/.ssh"; touch "$AUTHK"; chmod 700 "$HOME/.ssh"; chmod 600 "$AUTHK"
 
-OPTS="restrict,permitlisten=\"127.0.0.1:${PORT}\",command=\"echo tunnel-only; sleep infinity\""
+OPTS="no-pty,no-agent-forwarding,no-x11-forwarding,no-user-rc,permitlisten=\"127.0.0.1:${PORT}\",command=\"echo tunnel-only; sleep infinity\""
 LINE="${OPTS} ${KEYTYPE} ${KEYBLOB} ${KEYCOMMENT}"
 
-# Atomic rewrite: keep every existing line except a prior entry for THIS key
-# blob (idempotent re-auth), then append the fresh one. The panel admin line
-# has a different blob, so it is always preserved.
+# Atomic rewrite enforcing ONE key per forward port. Drop any prior line for
+# THIS port (permitlisten="127.0.0.1:PORT") AND any prior entry for this exact
+# key blob, then append the fresh one. ROOT FIX: without dropping by port, every
+# redeploy stacked another key on the same port, so a dead claw's stale key
+# lingered and a zombie autossh kept re-grabbing the port (401 storms). The
+# panel-admin line has no permitlisten and a different blob, so it survives.
 TMP="$(mktemp "$HOME/.ssh/.authk.XXXXXX")"
-grep -vF "$KEYBLOB" "$AUTHK" > "$TMP" || true
+grep -vF "$KEYBLOB" "$AUTHK" | grep -vF "permitlisten=\"127.0.0.1:${PORT}\"" > "$TMP" || true
 printf '%s\n' "$LINE" >> "$TMP"
 chmod 600 "$TMP"; mv -f "$TMP" "$AUTHK"
 echo "OK authorized ${KEYCOMMENT} -> 127.0.0.1:${PORT}"
