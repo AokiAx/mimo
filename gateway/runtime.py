@@ -67,11 +67,24 @@ _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 _DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
 _DETECTION_PROBE_INTERVAL_S = 10.0      # fast probe interval in detection zone
 _ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
+# How often to re-sync each backend's model list from its /v1/models.
+_MODEL_SYNC_INTERVAL_S = _env_float("GATEWAY_MODEL_SYNC_INTERVAL_S", 300.0)
 
 _READINESS_MAX_STREAM_CHUNKS = 32
 _READINESS_MAX_STREAM_SECONDS = _env_float("GATEWAY_READINESS_STREAM_TIMEOUT_S", _PROBE_TIMEOUT_S)
 _READINESS_PROMPT = "ping"
 _READINESS_MODEL = os.environ.get("GATEWAY_READINESS_MODEL", "mimo-v2-flash")
+
+# Models that cannot answer a text /v1/chat/completions probe (text-to-speech,
+# speech recognition). Probing them would falsely mark a healthy backend dead,
+# so they are excluded from liveness/readiness probing.
+_NON_CHAT_MODEL_RE = re.compile(r"(tts|asr)", re.IGNORECASE)
+
+
+def _probeable_models(backend: Backend) -> list[str]:
+    """The backend's models minus non-chat (tts/asr) ones — we probe every one
+    of these (no single hardcoded probe model)."""
+    return [m for m in backend.models if m and not _NON_CHAT_MODEL_RE.search(m)]
 
 # ────────────── singleton state ──────────────
 
@@ -316,6 +329,9 @@ def get_router_status() -> dict[str, Any]:
         "backends_standby": sum(1 for b in backends if b.lifecycle == "standby"),
         "backends_warming": sum(1 for b in backends if b.lifecycle == "warming"),
         "backends_draining": sum(1 for b in backends if b.lifecycle == "draining"),
+        "backends_failed": sum(1 for b in backends if b.lifecycle == "failed"),
+        "backends_detection": sum(1 for b in backends if b.in_detection),
+        "backends_degraded": sum(1 for b in backends if b.lifecycle == "active" and b.health == "degraded"),
         "rotation_interval_s": int(_ROTATION_INTERVAL_S),
         "pool_idle": 0,
         "pool_active": 0,
@@ -335,6 +351,7 @@ def get_all_backends() -> list[dict[str, Any]]:
             "url": b.base_url,
             "models": list(b.models),
             "healthy": b.is_selectable(now),
+            "status": b.status_label(now),
             "weight": b.weight,
             "avg_latency_ms": round(b.ewma_latency_ms, 1),
             "p95_latency_ms": round(b.ewma_latency_ms, 1),
@@ -551,6 +568,8 @@ async def _probe_loop() -> None:
         async with semaphore:
             if not backend.enabled:
                 return
+            # Probe ONE model chosen from the backend's own (non-tts/asr) model
+            # list — not a hardcoded model, and not every model.
             started = time.monotonic()
             try:
                 body = _readiness_non_stream_body(backend)
@@ -564,18 +583,10 @@ async def _probe_loop() -> None:
                 backend.record_latency(latency)
                 if backend.in_detection:
                     backend.exit_detection()
-                    logger.info(
-                        "Backend %s exited detection zone (healthy)",
-                        backend.backend_id,
-                    )
-                # Recovery: a failed backend that passes the chat probe goes
-                # back to standby so the rotation loop can re-warm it.
+                    logger.info("Backend %s exited detection zone (healthy)", backend.backend_id)
                 if backend.lifecycle == "failed":
                     backend.mark_standby()
-                    logger.info(
-                        "Backend %s recovered from failed → standby",
-                        backend.backend_id,
-                    )
+                    logger.info("Backend %s recovered from failed → standby", backend.backend_id)
                 return
 
             backend.record_probe_failure(
@@ -619,10 +630,66 @@ async def _rotation_loop() -> None:
             _promote_standby_backends_to_warming()
             await _warm_ready_backends()
             _rotate_expired_active_backends()
+            await _sync_backend_models()
             _reap_drained()
         except Exception:  # noqa: BLE001
             logger.exception("Gateway rotation loop failed")
         await asyncio.sleep(_ROTATION_LOOP_INTERVAL_S)
+
+
+def _fetch_models_for(base_url: str, api_key: str = "") -> list[str] | None:
+    """GET <base_url>/v1/models and return a deduped id list, or None if the
+    endpoint is unreachable / 401 / unparseable (caller then leaves models
+    untouched — we never wipe a list just because one fetch failed)."""
+    import httpx
+    url = base_url.rstrip("/") + "/v1/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        r = httpx.get(url, timeout=8, trust_env=False, headers=headers)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    items = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else None)
+    if not isinstance(items, list):
+        return None
+    out: list[str] = []
+    for it in items:
+        mid = it.get("id") if isinstance(it, dict) else (it if isinstance(it, str) else None)
+        if isinstance(mid, str) and mid.strip() and mid not in out:
+            out.append(mid.strip())
+    return out or None
+
+
+async def _sync_backend_models() -> None:
+    """Keep each backend's model list in lockstep with its upstream /v1/models:
+    add models that appear, drop models that no longer do — so a Claw upstream
+    silently adding/renaming/removing a model can't leave us routing to a model
+    it no longer serves. A failed/empty fetch is ignored (list left as-is)."""
+    assert _registry is not None
+    now = time.time()
+    for b in _registry.all():
+        if not b.enabled:
+            continue
+        if now - b.last_model_sync_at < _MODEL_SYNC_INTERVAL_S:
+            continue
+        b.last_model_sync_at = now
+        fetched = await asyncio.to_thread(_fetch_models_for, b.base_url, b.api_key)
+        if not fetched or list(b.models) == fetched:
+            continue
+        added = [m for m in fetched if m not in b.models]
+        removed = [m for m in b.models if m not in fetched]
+        b.models = fetched
+        try:
+            from gateway.backend_store import update_backend
+            update_backend(b.backend_id, models=fetched)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist synced models for %s", b.backend_id)
+        logger.info(
+            "Backend %s models synced from /v1/models (+%s -%s)",
+            b.backend_id, added, removed,
+        )
 
 
 def _promote_standby_backends_to_warming() -> None:
@@ -822,14 +889,17 @@ def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
 def _readiness_model(backend: Backend) -> str:
     if not backend.models:
         raise ValueError("backend has no configured models for readiness checks")
-    if _READINESS_MODEL in backend.models:
-        return _READINESS_MODEL
-    return backend.models[0]
+    probeable = _probeable_models(backend)
+    return probeable[0] if probeable else backend.models[0]
 
 
 def _readiness_non_stream_body(backend: Backend) -> dict[str, Any]:
+    return _readiness_body_for_model(_readiness_model(backend))
+
+
+def _readiness_body_for_model(model: str) -> dict[str, Any]:
     return {
-        "model": _readiness_model(backend),
+        "model": model,
         "messages": [{"role": "user", "content": _READINESS_PROMPT}],
         "max_tokens": 256,
         "stream": False,

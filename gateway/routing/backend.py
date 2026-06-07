@@ -59,6 +59,9 @@ class Backend:
     detection_entered_at: float = 0.0
     probe_consecutive_failures: int = 0
 
+    # Last time models were synced from this backend's /v1/models.
+    last_model_sync_at: float = 0.0
+
     # Breaker
     open_until: float = 0.0                  # epoch sec; 0 = closed
     weight: int = 1                          # static weight for selection
@@ -201,6 +204,33 @@ class Backend:
             cooldown_s=cooldown_s,
             threshold=threshold,
         )
+
+    def status_label(self, now: float | None = None) -> str:
+        """A single human-facing status richer than online/offline. Priority
+        order: user disable > draining > rotation-failed > breaker > detection >
+        warming/standby > active health."""
+        n = now or time.time()
+        if not self.enabled:
+            return "disabled"
+        if self.lifecycle == "draining":
+            return "draining"
+        if self.lifecycle == "failed":
+            return "failed"
+        if self.is_open(n):
+            return "circuit_open"
+        if self.in_detection:
+            return "detection"
+        if self.lifecycle == "warming":
+            return "warming_ready" if self.readiness_successes > 0 else "warming"
+        if self.lifecycle == "standby":
+            return "standby"
+        if self.lifecycle == "active":
+            if self.health == "dead":
+                return "dead"
+            if self.health == "degraded":
+                return "degraded"
+            return "online"
+        return self.health or "unknown"
 
     def is_selectable(self, now: float | None = None) -> bool:
         if not self.enabled:

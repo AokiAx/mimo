@@ -1557,7 +1557,11 @@ function refreshGateway() {
     document.getElementById('gwHealthInfo').innerHTML =
       '<div class="stat-row"><span class="label">状态</span><span class="value">运行中</span></div>' +
       '<div class="stat-row"><span class="label">运行时长</span><span class="value">' + formatUptime(d.uptime || 0) + '</span></div>' +
-      '<div class="stat-row"><span class="label">健康后端</span><span class="value">' + (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0) + '</span></div>';
+      '<div class="stat-row"><span class="label">健康后端</span><span class="value">' + (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0) + '</span></div>' +
+      '<div class="stat-row"><span class="label">活跃 / 预热</span><span class="value">' + (d.backends_active || 0) + ' / ' + (d.backends_warming || 0) + '</span></div>' +
+      '<div class="stat-row"><span class="label">降级 / 检测中</span><span class="value" style="color:var(--yellow)">' + (d.backends_degraded || 0) + ' / ' + (d.backends_detection || 0) + '</span></div>' +
+      '<div class="stat-row"><span class="label">失败 / 排空</span><span class="value">' + (d.backends_failed || 0) + ' / ' + (d.backends_draining || 0) + '</span></div>' +
+      '<div class="stat-row"><span class="label">待命</span><span class="value">' + (d.backends_standby || 0) + '</span></div>';
     document.getElementById('gwPoolInfo').innerHTML =
       '<div class="stat-row"><span class="label">空闲连接</span><span class="value">' + (d.pool_idle || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">活跃连接</span><span class="value">' + (d.pool_active || 0) + '</span></div>' +
@@ -1578,8 +1582,8 @@ function refreshBackends() {
     for (var i = 0; i < d.backends.length; i++) {
       var b = d.backends[i];
       var enabled = b.enabled !== false;
-      var statusStr = !enabled ? '已禁用' : (b.healthy ? '在线' : '离线');
-      var statusColor = !enabled ? 'var(--text3)' : (b.healthy ? 'var(--green)' : 'var(--red)');
+      var st = BK_STATUS[b.status] || [b.status || (b.healthy ? '在线' : '离线'), b.healthy ? 'var(--green)' : 'var(--red)'];
+      var statusStr = st[0], statusColor = st[1];
       var models = b.models || [];
       var modelsHtml = '';
       for (var j = 0; j < models.length; j++) {
@@ -1589,7 +1593,7 @@ function refreshBackends() {
       html += '<td><strong>' + escapeHtml(b.name || b.id) + '</strong></td>';
       html += '<td>' + (modelsHtml || '<span style="color:var(--text3)">--</span>') + '</td>';
       html += '<td style="font-family:monospace;font-size:0.82rem">' + escapeHtml(b.url || '') + '</td>';
-      html += '<td style="color:' + statusColor + '">' + statusStr + '</td>';
+      html += '<td style="color:' + statusColor + ';white-space:nowrap">' + escapeHtml(statusStr) + '</td>';
       html += '<td>' + (b.avg_latency_ms ? b.avg_latency_ms + 'ms' : '--') + '</td>';
       html += '<td>' + (b.total_requests || 0) + '</td>';
       html += '<td style="white-space:nowrap">';
@@ -1604,6 +1608,21 @@ function refreshBackends() {
     document.getElementById('backendsBody').innerHTML = '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:20px">网关无法访问</td></tr>';
   });
 }
+// Rich backend status label + color (matches Backend.status_label()).
+var BK_STATUS = {
+  online: ['在线', 'var(--green)'],
+  degraded: ['部分降级', 'var(--yellow)'],
+  warming: ['预热中', 'var(--accent)'],
+  warming_ready: ['预热(就绪)', 'var(--accent)'],
+  detection: ['检测中', 'var(--yellow)'],
+  circuit_open: ['熔断', 'var(--red)'],
+  failed: ['失败', 'var(--red)'],
+  dead: ['离线', 'var(--red)'],
+  draining: ['排空中', 'var(--text2)'],
+  standby: ['待命', 'var(--text2)'],
+  disabled: ['已禁用', 'var(--text3)'],
+  unknown: ['未知', 'var(--text3)']
+};
 
 // ── Multi-model tag input for backend form ──
 var MIMO_NATIVE_MODELS = [

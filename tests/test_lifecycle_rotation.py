@@ -133,7 +133,7 @@ def test_probe_one_uses_chat_completion_not_models(monkeypatch):
     assert reason == "ok"
     assert len(fake.json_bodies) == 1
     assert fake.json_bodies[0]["messages"][0]["content"] == runtime._READINESS_PROMPT
-    assert fake.json_bodies[0]["model"] == "mimo-v2-flash"
+    assert fake.json_bodies[0]["model"] == "mimo-v2.5-pro"
     assert fake.json_bodies[0]["stream"] is False
     assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S]
 
@@ -151,12 +151,12 @@ def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
     assert len(fake.json_bodies) == 2
     assert len(fake.stream_bodies) == 1
     assert fake.json_bodies[0]["stream"] is False
-    assert fake.json_bodies[0]["model"] == "mimo-v2-flash"
+    assert fake.json_bodies[0]["model"] == "mimo-v2.5-pro"
     assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S, runtime._PROBE_TIMEOUT_S]
     assert fake.stream_bodies[0]["stream"] is True
-    assert fake.stream_bodies[0]["model"] == "mimo-v2-flash"
+    assert fake.stream_bodies[0]["model"] == "mimo-v2.5-pro"
     assert fake.stream_timeouts == [runtime._READINESS_MAX_STREAM_SECONDS]
-    assert fake.json_bodies[1]["model"] == "mimo-v2-flash"
+    assert fake.json_bodies[1]["model"] == "mimo-v2.5-pro"
     assert fake.json_bodies[1]["tools"][0]["function"]["name"] == "gateway_readiness_ping"
     assert fake.json_bodies[1]["tool_choice"]["function"]["name"] == "gateway_readiness_ping"
 
@@ -329,3 +329,52 @@ def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
     assert result["warmed"] == []
     assert result["activated"] == ["only"]
     assert only.lifecycle == "active"
+
+
+def test_probeable_models_excludes_tts_and_asr():
+    b = _backend("x")
+    b.models = [
+        "mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5-tts",
+        "mimo-v2.5-tts-voiceclone", "mimo-v2.5-asr", "mimo-v2-omni",
+    ]
+    assert runtime._probeable_models(b) == [
+        "mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2-omni",
+    ]
+
+
+def test_readiness_model_uses_first_probeable_not_hardcoded_flash():
+    b = _backend("x")
+    b.models = ["mimo-v2.5-pro", "mimo-v2-flash"]
+    assert runtime._readiness_model(b) == "mimo-v2.5-pro"
+    b.models = ["mimo-v2.5-tts", "mimo-v2-omni"]
+    assert runtime._readiness_model(b) == "mimo-v2-omni"
+
+
+def test_health_degrades_then_dies_then_recovers():
+    b = _backend("x")
+    b.record_failure("boom")
+    assert b.health == "degraded"
+    b.record_failure("boom")
+    b.record_failure("boom")
+    assert b.health == "dead"
+    b.record_success()
+    assert b.health == "alive"
+    assert b.consecutive_failures == 0
+
+
+def test_status_label_reflects_states():
+    b = _backend("x", lifecycle="active")  # _backend() records a success → alive
+    assert b.status_label() == "online"
+    b.record_failure("partial")  # 1 failure < threshold → degraded, breaker closed
+    assert b.status_label() == "degraded"
+    b.record_success()
+    b.enabled = False
+    assert b.status_label() == "disabled"
+    b.enabled = True
+    b.lifecycle = "failed"
+    assert b.status_label() == "failed"
+    b.lifecycle = "warming"
+    b.readiness_successes = 0
+    assert b.status_label() == "warming"
+    b.readiness_successes = 1
+    assert b.status_label() == "warming_ready"
