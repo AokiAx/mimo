@@ -144,6 +144,10 @@ _state: dict[str, dict] = {}
 _state_lock = threading.Lock()
 _loop_running = False
 _loop_thread: Optional[threading.Thread] = None
+# Cold-start throttle: last time we fired an initial deploy for an enabled
+# account that had no backend yet (cron used to do this; now the loop does).
+_cold_start_last: dict[str, float] = {}
+_COLD_START_RETRY_S = 180
 
 
 def _session_key(account: str) -> str:
@@ -172,6 +176,32 @@ def _enabled_deployed_accounts() -> list[str]:
     have_backend = {str(b.get("account_id") or "") for b in backends if b.get("base_url")}
     for acc, acc_cfg in accounts_cfg.items():
         if acc_cfg.get("enabled") and acc in have_backend:
+            out.append(acc)
+    return out
+
+
+def _enabled_accounts_without_backend() -> list[str]:
+    """Enabled accounts with NO registered backend yet — they need an initial
+    deploy. Cron used to cold-start these; with cron removed the activity loop
+    does it (the maintenance path only ever talks to already-deployed claws)."""
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+    except Exception:
+        return []
+    accounts_cfg = (cfg.get("accounts") or {})
+    try:
+        from gateway import backend_store
+        backends = backend_store.list_backends()
+    except Exception:
+        return []
+    have = {(str(b.get("account_id") or "")).casefold() for b in backends if b.get("base_url")}
+    out: list[str] = []
+    for acc, c in accounts_cfg.items():
+        if not c.get("enabled"):
+            continue
+        keys = {acc.casefold(), (acc[:-5] if acc.endswith(".json") else acc + ".json").casefold()}
+        if not (keys & have):
             out.append(acc)
     return out
 
@@ -369,6 +399,20 @@ def _loop() -> None:
             with _state_lock:
                 for gone in [a for a in _state if a not in accounts]:
                     _state.pop(gone, None)
+            # Cold-start: enabled accounts without a backend never enter the
+            # maintained set above, so fire their initial deploy here (throttled).
+            for acc in _enabled_accounts_without_backend():
+                if _account_is_deploying(acc):
+                    continue
+                if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
+                    continue
+                _cold_start_last[acc] = now
+                logger.warning("[activity] %s: enabled but no backend → initial deploy (cold start)", acc)
+                try:
+                    from claw.auto_deploy import trigger_deploy
+                    trigger_deploy(acc)
+                except Exception:
+                    logger.exception("[activity] %s: cold-start trigger_deploy failed", acc)
             for acc in accounts:
                 with _state_lock:
                     st = _state.setdefault(acc, {})
