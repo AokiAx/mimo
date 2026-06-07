@@ -150,8 +150,10 @@ def test_user_request_5xx_does_not_mark_backend_failure(monkeypatch):
         metrics=metrics,
     )
 
-    from gateway.core import UpstreamError
-    with pytest.raises(UpstreamError):
+    # After exhausting all (here: one) backends on a retryable 5xx, the gateway
+    # surfaces a friendly high-load 503 rather than the raw per-backend error.
+    from gateway.core import BackendUnavailableError
+    with pytest.raises(BackendUnavailableError):
         asyncio.run(handler.handle(RequestContext(), OpenAIChatAdapter(), _body()))
 
     assert backend.total_failures == 0

@@ -208,29 +208,23 @@ async def startup_event():
             "anyone scanning can log in. Change it on the panel's 密钥管理 page "
             "or in data/secrets.json."
         )
-    # Set DISABLE_SCHEDULER=1 in the systemd unit to keep the scheduler off
-    # (e.g. when first deploying to a new host — operators usually want to
-    # verify accounts / cookies before letting cron fire real Claw deploys).
-    if os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
-        logger.info("[startup] DISABLE_SCHEDULER set — auto-deploy scheduler not started")
-    else:
-        try:
-            from claw.auto_deploy import start_scheduler
-            start_scheduler()
-        except Exception as e:
-            logger.exception("[startup] Failed to start scheduler")
+    # Cron-based scheduled deploys were removed. Claw rotation is now driven by
+    # the activity loop below: a proactive expiry rotation recreates a Claw as it
+    # nears its ~60-min MiMo TTL, plus health-failure redeploys — both drain
+    # in-flight requests before replacing a Claw instead of cutting them on a
+    # fixed clock. DISABLE_SCHEDULER stays the master "no auto-deploy" switch.
     try:
         from gateway.runtime import start_probe as start_router_probe
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
-    # Human-like WS activity loop: keeps each deployed Claw engaged and its
-    # reverse tunnel repaired between hourly redeploys. Gated like the
-    # scheduler so a fresh host can stay quiet until accounts are verified.
+    # Human-like WS activity loop: keeps each deployed Claw engaged, repairs the
+    # reverse tunnel, and drives expiry/health rotation. Gated so a fresh host
+    # stays quiet until accounts are verified.
     if os.environ.get("DISABLE_CLAW_ACTIVITY") in ("1", "true", "yes"):
         logger.info("[startup] DISABLE_CLAW_ACTIVITY set — claw activity loop not started")
     elif os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
-        logger.info("[startup] scheduler disabled — claw activity loop not started")
+        logger.info("[startup] DISABLE_SCHEDULER set — claw activity/rotation loop not started")
     else:
         try:
             from claw.claw_activity import start_activity
@@ -867,7 +861,7 @@ async def claw_destroy():
 async def claw_chat(request: Request):
     body = await request.json()
     message = body.get("message", "")
-    session_key = body.get("session_key", "agent:main:deploy-" + uuid.uuid4().hex[:8])
+    session_key = body.get("session_key", "agent:main:main")
     if not message:
         return JSONResponse({"error": "No message"}, status_code=400)
     text, err = await claw_ws_chat(message, session_key)
@@ -954,7 +948,7 @@ async def claw_ws_chat(
     uploads and should be downloaded via ``curl``.
     """
     if not session_key:
-        session_key = "agent:main:deploy-" + uuid.uuid4().hex[:8]
+        session_key = "agent:main:main"
 
     if attachments:
         envelope = {
@@ -1403,7 +1397,7 @@ async def account_chat(filename: str, request: Request):
     cookies = acc.get("cookies", [])
     body = await request.json()
     message = body.get("message", "")
-    session_key = body.get("session_key", "agent:main:deploy-" + uuid.uuid4().hex[:8])
+    session_key = body.get("session_key", "agent:main:main")
     if not message:
         return JSONResponse({"error": "No message"}, status_code=400)
 

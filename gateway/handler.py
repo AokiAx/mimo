@@ -43,6 +43,7 @@ from gateway.anthropic_passthrough import (
 from gateway.core import (
     AdapterError,
     AuthError,
+    BackendUnavailableError,
     BadRequestError,
     GatewayError,
     InternalEvent,
@@ -67,6 +68,17 @@ _PROTOCOL_TAG = {
     "openai_responses": "openai",
     "anthropic": "anthropic",
 }
+
+# Try up to this many distinct backends before giving up on a request. A 401
+# usually means one backend's injected upstream key is momentarily stale (the
+# claw-side proxy rotates it), and a 429 means that account hit its quota — both
+# are worth retrying on a *different* backend. When every attempt fails we
+# surface a single friendly "high load" 503 instead of a raw per-backend error.
+_MAX_ATTEMPTS = 5
+
+# Upstream HTTP statuses worth retrying on another backend (in addition to any
+# 5xx). 401: stale rotated key on one node. 429: that account is rate-limited.
+_RETRYABLE_UPSTREAM_STATUSES = frozenset({401, 429})
 
 
 class DecisionLogWriter(Protocol):
@@ -289,7 +301,7 @@ class GatewayHandler:
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
-        for _attempt in range(2):
+        for _attempt in range(_MAX_ATTEMPTS):
             try:
                 backend = self._choose_backend(
                     ctx, model, exclude=tried,
@@ -297,7 +309,7 @@ class GatewayHandler:
                 )
             except GatewayError:
                 if last_error is not None:
-                    raise last_error
+                    raise _high_load_error(last_error) from last_error
                 raise
             tried.add(backend.backend_id)
             try:
@@ -312,8 +324,7 @@ class GatewayHandler:
                     raise
                 ctx.decide(f"retry_after:{backend.backend_id}:{e.error_code}")
                 continue
-        assert last_error is not None
-        raise last_error
+        raise _high_load_error(last_error) from last_error
 
     async def _handle_anthropic_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
@@ -373,7 +384,7 @@ class GatewayHandler:
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
-        for _attempt in range(2):
+        for _attempt in range(_MAX_ATTEMPTS):
             try:
                 backend = self._choose_backend(
                     ctx, model, exclude=tried,
@@ -381,7 +392,7 @@ class GatewayHandler:
                 )
             except GatewayError:
                 if last_error is not None:
-                    raise last_error
+                    raise _high_load_error(last_error) from last_error
                 raise
             tried.add(backend.backend_id)
             try:
@@ -396,8 +407,7 @@ class GatewayHandler:
                     raise
                 ctx.decide(f"stream_retry_after:{backend.backend_id}:{e.error_code}")
                 continue
-        assert last_error is not None
-        raise last_error
+        raise _high_load_error(last_error) from last_error
 
     async def _handle_anthropic_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
@@ -517,14 +527,15 @@ class GatewayHandler:
     ) -> tuple[str, AsyncIterator[bytes] | None, bytes]:
         tried: set[str] = set()
         last_error: GatewayError | None = None
-        # Keep retries deliberately small: one retry is enough to mask transient
-        # backend failures without multiplying upstream cost.
-        for _attempt in range(2):
+        # Try up to _MAX_ATTEMPTS distinct backends. Each retryable failure
+        # (401 stale key / 429 quota / 5xx) rotates to a fresh backend; once
+        # we run out of backends or attempts we return a friendly high-load 503.
+        for _attempt in range(_MAX_ATTEMPTS):
             try:
                 backend = self._choose_backend(ctx, model, exclude=tried)
             except GatewayError:
                 if last_error is not None:
-                    raise last_error
+                    raise _high_load_error(last_error) from last_error
                 raise
             tried.add(backend.backend_id)
             try:
@@ -538,15 +549,14 @@ class GatewayHandler:
                     raise
                 ctx.decide(f"retry_after:{backend.backend_id}:{e.error_code}")
                 continue
-        assert last_error is not None
-        raise last_error
+        raise _high_load_error(last_error) from last_error
 
     @staticmethod
     def _is_retryable_non_stream(err: GatewayError) -> bool:
         status = err.details.get("status") if getattr(err, "details", None) else None
         if isinstance(status, int):
-            return status >= 500
-        return getattr(err, "http_status", 500) in (502, 503, 504)
+            return status in _RETRYABLE_UPSTREAM_STATUSES or status >= 500
+        return getattr(err, "http_status", 500) in (401, 429, 502, 503, 504)
 
     async def _handle_non_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
@@ -622,12 +632,12 @@ class GatewayHandler:
         """
         tried: set[str] = set()
         last_error: GatewayError | None = None
-        for _attempt in range(2):
+        for _attempt in range(_MAX_ATTEMPTS):
             try:
                 backend = self._choose_backend(ctx, model, exclude=tried)
             except GatewayError:
                 if last_error is not None:
-                    raise last_error
+                    raise _high_load_error(last_error) from last_error
                 raise
             tried.add(backend.backend_id)
             try:
@@ -641,16 +651,15 @@ class GatewayHandler:
                     raise
                 ctx.decide(f"stream_retry_after:{backend.backend_id}:{e.error_code}")
                 continue
-        assert last_error is not None
-        raise last_error
+        raise _high_load_error(last_error) from last_error
 
     @staticmethod
     def _is_retryable_stream(err: GatewayError) -> bool:
         status = err.details.get("status") if getattr(err, "details", None) else None
         if isinstance(status, int):
-            return status >= 500
+            return status in _RETRYABLE_UPSTREAM_STATUSES or status >= 500
         # Connection errors / timeouts have no status — retry them too.
-        return getattr(err, "http_status", 500) in (502, 503, 504)
+        return getattr(err, "http_status", 500) in (401, 429, 502, 503, 504)
 
     async def _handle_stream(
         self, ctx: RequestContext, adapter: ProtocolAdapter,
@@ -763,6 +772,17 @@ class GatewayHandler:
             )
         except Exception:
             pass
+
+
+def _high_load_error(last_error: GatewayError | None) -> BackendUnavailableError:
+    """Friendly 503 returned after all retry attempts are exhausted."""
+    details: dict[str, Any] = {}
+    if last_error is not None:
+        details["last_error"] = last_error.error_code
+        status = last_error.details.get("status") if last_error.details else None
+        if status is not None:
+            details["last_upstream_status"] = status
+    return BackendUnavailableError("上游高负载，请稍后再试", details=details)
 
 
 def _content_type_for(adapter: ProtocolAdapter, *, stream: bool) -> str:

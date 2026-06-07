@@ -35,13 +35,23 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ─── Cadence ───
-_INTERVAL_MIN_S = 180          # 3 min
-_INTERVAL_MAX_S = 480          # 8 min
+_INTERVAL_MIN_S = 120          # 2 min
+_INTERVAL_MAX_S = 240          # 4 min
 _TICK_S = 20                   # scheduler granularity
 # Consecutive activity cycles with the tunnel still down before we give up on
 # in-place repair and rebuild the Claw (covers the TTL-reclaimed case).
 _ESCALATE_AFTER_UNHEALTHY = 2
 _HISTORY_MAX = 15              # per-account rolling transcript kept for the panel
+
+# Proactive expiry rotation. A MiMo Claw is hard-reclaimed at its ~60-min TTL;
+# rather than wait for the tunnel to die (and cut live requests), we recreate it
+# a few minutes early. Each claw gets a jittered target age in
+# [_ROTATION_MIN_AGE_S, _ROTATION_MAX_AGE_S] so the fleet rotates staggered, not
+# all at once. "age" is the backend's active_for_s (time since it went active ≈
+# time since the claw was deployed). trigger_deploy itself drains the backend
+# and waits for in-flight requests before replacing, so this is graceful.
+_ROTATION_MIN_AGE_S = 40 * 60   # earliest a claw may be electively rotated
+_ROTATION_MAX_AGE_S = 55 * 60   # ~5 min before the 60-min hard TTL
 
 _SCRIPTS_DIR = "/root/.openclaw/workspace/scripts"
 _LOCAL_PROXY_PORT = 18800
@@ -137,8 +147,10 @@ _loop_thread: Optional[threading.Thread] = None
 
 
 def _session_key(account: str) -> str:
-    # Stable per-account session so the transcript reads as one ongoing chat.
-    return f"agent:main:ops-{account}"
+    # Use the platform-default session (what the official web UI uses). Account
+    # scoping comes from the cookies, not the session key, so one canonical
+    # session per claw keeps deploy + maintenance on the same conversation.
+    return "agent:main:main"
 
 
 def _enabled_deployed_accounts() -> list[str]:
@@ -196,6 +208,76 @@ def _verify_health(account: str) -> Optional[bool]:
         return False
 
 
+def _account_age_and_peer(account: str) -> tuple[float, bool]:
+    """Return ``(age_s, has_other_healthy_peer)`` for an account's backend.
+
+    ``age_s`` is the max ``active_for_s`` among this account's selectable
+    backends (≈ time since the claw was deployed). ``has_other_healthy_peer`` is
+    True when at least one *other* account has a healthy active/warming backend —
+    used to avoid electively rotating away the last serving claw.
+    """
+    try:
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+    except Exception:
+        return 0.0, False
+    keys = {account, account[:-5] if account.endswith(".json") else account + ".json"}
+    age = 0.0
+    other_healthy = 0
+    for b in backends:
+        healthy_active = bool(
+            b.get("enabled", True) and b.get("healthy")
+            and b.get("lifecycle") in ("active", "warming")
+        )
+        if str(b.get("account") or "") in keys:
+            if healthy_active:
+                age = max(age, float(b.get("active_for_s") or 0))
+        elif healthy_active:
+            other_healthy += 1
+    return age, other_healthy > 0
+
+
+def _maybe_rotate_for_expiry(account: str) -> bool:
+    """Recreate the claw as it nears its TTL. Returns True if a deploy fired.
+
+    Each claw gets a jittered target age, re-rolled when a fresh deploy resets
+    the backend age. We skip the *elective* rotation when no other healthy claw
+    exists (so we never take the fleet to zero) — the health-failure path and
+    MiMo's own reclaim still cover that case.
+    """
+    age, has_peer = _account_age_and_peer(account)
+    if age <= 0:
+        return False
+    with _state_lock:
+        st = _state.setdefault(account, {})
+        target = st.get("rot_target_s")
+        prev_age = float(st.get("rot_last_age_s") or 0.0)
+        # (Re)roll on first sight or after a redeploy reset the age (age dropped).
+        if target is None or age + 60 < prev_age:
+            target = random.uniform(_ROTATION_MIN_AGE_S, _ROTATION_MAX_AGE_S)
+            st["rot_target_s"] = target
+        st["rot_last_age_s"] = age
+    if age < target:
+        return False
+    if not has_peer:
+        logger.info(
+            "[activity] %s: due for rotation (age=%.0fs) but no healthy peer; deferring",
+            account, age,
+        )
+        return False
+    logger.warning(
+        "[activity] %s: claw near TTL (age=%.0fs ≥ target=%.0fs) → rotate",
+        account, age, target,
+    )
+    try:
+        from claw.auto_deploy import trigger_deploy
+        trigger_deploy(account)
+        return True
+    except Exception:
+        logger.exception("[activity] %s: rotation trigger_deploy failed", account)
+        return False
+
+
 def _run_activity_once(account: str) -> None:
     """One human-like interaction + panel-side health check + escalation."""
     try:
@@ -248,6 +330,7 @@ def _run_activity_once(account: str) -> None:
             st["unhealthy_streak"] = int(st.get("unhealthy_streak", 0)) + 1
         streak = int(st.get("unhealthy_streak", 0))
 
+    escalated = False
     if streak >= _ESCALATE_AFTER_UNHEALTHY and not _account_is_deploying(account):
         logger.warning(
             "[activity] %s: tunnel still down after %d cycles (chat_err=%s) → redeploy",
@@ -255,10 +338,16 @@ def _run_activity_once(account: str) -> None:
         )
         try:
             trigger_deploy(account)
+            escalated = True
         except Exception:
             logger.exception("[activity] %s: trigger_deploy failed", account)
         with _state_lock:
             _state.setdefault(account, {})["unhealthy_streak"] = 0
+
+    # Healthy this cycle (or not yet at the escalation threshold): consider a
+    # proactive expiry rotation. Skip if a health-failure redeploy just fired.
+    if not escalated and not _account_is_deploying(account):
+        _maybe_rotate_for_expiry(account)
 
 
 def _schedule_next(account: str) -> None:

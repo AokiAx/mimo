@@ -17,6 +17,26 @@
 #    ports. See _deploy_ssh_key() on the panel side.
 set -u
 
+# Single-instance guard. The keepalive watchdog may (re)launch this script
+# whenever it thinks the tunnel is down; without a lock those launches pile up
+# into several `while true` supervisors all dialing the same remote port, so all
+# but one lose the bind and churn forever. Hold an exclusive lock so any extra
+# launch is a harmless no-op.
+LOCKFILE="/tmp/reverse-tunnel.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        echo "another reverse-tunnel.sh holds the lock; exiting" >&2
+        exit 0
+    fi
+else
+    if [ -f "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "another reverse-tunnel.sh (pid $(cat "$LOCKFILE")) is running; exiting" >&2
+        exit 0
+    fi
+    echo $$ > "$LOCKFILE"
+fi
+
 TARGET_HOST="__TARGET_HOST__"
 TARGET_USER="__TARGET_USER__"
 TARGET_SSH_PORT="__TARGET_SSH_PORT__"

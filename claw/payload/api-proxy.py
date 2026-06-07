@@ -20,6 +20,7 @@ No proxy-level auth: it binds loopback and is reached only via the reverse
 tunnel landing on the target's loopback, so there is no in-between exposure.
 """
 import asyncio
+import json
 import os
 import ssl
 import time
@@ -33,10 +34,15 @@ HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "18800"))
 REQUEST_TIMEOUT = float(os.environ.get("PROXY_REQUEST_TIMEOUT", "300"))
 STREAM_MAX_SECONDS = float(os.environ.get("PROXY_STREAM_TIMEOUT", "600"))
+# Per-chunk idle ceiling for SSE streams: if the upstream goes quiet this long
+# mid-stream we stop waiting and emit a clean terminal error frame, instead of
+# blocking until the overall deadline / socket read timeout and leaving the
+# client hanging on a half-finished stream.
+STREAM_IDLE_TIMEOUT = float(os.environ.get("PROXY_STREAM_IDLE_TIMEOUT", "120"))
 CONN_LIMIT = int(os.environ.get("PROXY_CONN_LIMIT", "200"))
 CONN_PER_HOST = int(os.environ.get("PROXY_CONN_PER_HOST", str(CONN_LIMIT)))
 PREWARM = int(os.environ.get("PROXY_PREWARM", "10"))
-DEFAULT_ENDPOINT = "https://api-sgp-oc.xiaomimimo.com"
+DEFAULT_ENDPOINT = "https://api-oc.xiaomimimo.com"
 
 _start = time.time()
 _reqs = 0
@@ -77,7 +83,7 @@ log(f"upstream: {API_BASE}  pool: {CONN_LIMIT} (per-host {CONN_PER_HOST})  prewa
 # forever means a rotated key leaves us forwarding a STALE token -> upstream 401
 # (api-proxy 401 while the live key works). Re-resolve at most once per _KEY_TTL
 # so rotations are picked up automatically, no proxy restart needed.
-_KEY_TTL = float(os.environ.get("PROXY_KEY_TTL", "60"))
+_KEY_TTL = float(os.environ.get("PROXY_KEY_TTL", "1"))
 _key_cache = {"key": API_KEY, "base": API_BASE, "ts": time.time()}
 
 
@@ -109,6 +115,30 @@ def _upstream_path(path: str) -> str:
     return path
 
 
+def _is_event_stream(content_type: str | None) -> bool:
+    return bool(content_type and "text/event-stream" in content_type.lower())
+
+
+def _stream_error_frame(path: str, message: str) -> bytes:
+    """Protocol-correct terminal error frame.
+
+    A silently truncated SSE stream (the old ``break``) leaves clients hanging
+    with no ``[DONE]`` / ``message_stop`` — they wait until their own timeout.
+    Emitting a real error frame lets the client fail fast and cleanly.
+    """
+    if path == "/v1/messages":
+        payload = json.dumps(
+            {"type": "error", "error": {"type": "timeout_error", "message": message}},
+            ensure_ascii=False,
+        )
+        return f"event: error\ndata: {payload}\n\n".encode()
+    payload = json.dumps(
+        {"error": {"message": message, "type": "upstream_timeout"}},
+        ensure_ascii=False,
+    )
+    return f"data: {payload}\n\ndata: [DONE]\n\n".encode()
+
+
 async def handle(req: web.Request) -> web.StreamResponse:
     global _reqs
     if req.path == "/health":
@@ -129,6 +159,8 @@ async def handle(req: web.Request) -> web.StreamResponse:
 
     body = await req.read()
     t0 = time.monotonic()
+    resp: web.StreamResponse | None = None
+    is_sse = False
     try:
         assert _session is not None
         async with _session.request(req.method, target, headers=headers, data=body or None) as up:
@@ -136,19 +168,51 @@ async def handle(req: web.Request) -> web.StreamResponse:
             ct = up.headers.get("Content-Type")
             if ct:
                 resp.headers["Content-Type"] = ct
+            is_sse = _is_event_stream(ct)
             await resp.prepare(req)
             deadline = time.monotonic() + STREAM_MAX_SECONDS
-            async for chunk in up.content.iter_any():
+            # Only apply the per-chunk idle ceiling to SSE streams. A non-stream
+            # response holds the socket silent for the whole generation, so an
+            # idle timeout there would falsely abort legitimate slow completions
+            # (the session's sock_read still bounds those).
+            idle = STREAM_IDLE_TIMEOUT if is_sse else None
+            it = up.content.iter_any().__aiter__()
+            while True:
                 if time.monotonic() > deadline:
-                    log(f"{req.path} stream timeout")
+                    raise asyncio.TimeoutError(
+                        f"stream exceeded {STREAM_MAX_SECONDS:.0f}s"
+                    )
+                try:
+                    if idle is not None:
+                        chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+                    else:
+                        chunk = await it.__anext__()
+                except StopAsyncIteration:
                     break
                 await resp.write(chunk)
             await resp.write_eof()
             log(f"{req.method} {req.path} -> {up.status} ({(time.monotonic()-t0)*1000:.0f}ms)")
             return resp
     except Exception as exc:
-        log(f"{req.method} {req.path} ERR {type(exc).__name__}: {exc}")
-        return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=502)
+        if isinstance(exc, asyncio.TimeoutError) and not str(exc):
+            exc = asyncio.TimeoutError(f"upstream idle > {STREAM_IDLE_TIMEOUT:.0f}s")
+        detail = f"{type(exc).__name__}: {exc}"
+        log(f"{req.method} {req.path} ERR {detail} ({(time.monotonic()-t0)*1000:.0f}ms)")
+        # If we've already sent response headers we can't switch to a json error
+        # body — we can only append to the open stream. Emit a terminal error
+        # frame (SSE) and close cleanly; otherwise just end the stream.
+        if resp is not None and resp.prepared:
+            if is_sse:
+                try:
+                    await resp.write(_stream_error_frame(req.path, detail))
+                except Exception:
+                    pass
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+            return resp
+        return web.json_response({"error": detail}, status=502)
 
 
 async def _prewarm() -> None:
