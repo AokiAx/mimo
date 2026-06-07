@@ -20,8 +20,15 @@ TUNNEL_USER="${TUNNEL_USER:-tunnel}"
 AUTHORIZER="/usr/local/bin/authorize-tunnel-key"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Login shell must be a REAL shell (/bin/bash), NOT nologin: sshd executes the
+# forced command via the login shell's -c, and nologin would refuse it
+# ("This account is currently not available"), breaking both the authorizer and
+# the claw reverse tunnel. Security is enforced by the per-key
+# restrict/permitlisten + forced command, not by the login shell.
 if ! id "$TUNNEL_USER" >/dev/null 2>&1; then
-    useradd -r -m -s /usr/sbin/nologin "$TUNNEL_USER"
+    useradd -r -m -s /bin/bash "$TUNNEL_USER"
+else
+    usermod -s /bin/bash "$TUNNEL_USER"
 fi
 HOME_DIR="$(getent passwd "$TUNNEL_USER" | cut -d: -f6)"
 install -d -m 700 -o "$TUNNEL_USER" -g "$TUNNEL_USER" "$HOME_DIR/.ssh"

@@ -676,19 +676,52 @@ def _authorize_key_on_target(target: dict, pubkey: str, log: "DeployLogger") -> 
     return False
 
 
+def _fetch_upstream_models(base_url: str, log: "DeployLogger") -> Optional[list[str]]:
+    """Pull the live model list from the backend's OpenAI-style /v1/models so the
+    registered backend tracks whatever the MiMo upstream actually serves (model
+    names drift; hardcoding one means a rename silently breaks routing). Returns
+    a deduped id list, or None if the endpoint is unreachable / unparseable
+    (caller then keeps the existing/default models)."""
+    import httpx
+    url = base_url.rstrip("/") + "/v1/models"
+    try:
+        r = httpx.get(url, timeout=8, trust_env=False)
+        if r.status_code != 200:
+            log.log(f"⚠️ /v1/models 返回 {r.status_code}，沿用默认模型")
+            return None
+        data = r.json()
+    except Exception as e:  # noqa: BLE001
+        log.log(f"⚠️ 拉取 /v1/models 失败，沿用默认模型: {type(e).__name__}: {e}")
+        return None
+    items = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else None)
+    if not isinstance(items, list):
+        return None
+    models: list[str] = []
+    for it in items:
+        mid = it.get("id") if isinstance(it, dict) else (it if isinstance(it, str) else None)
+        if isinstance(mid, str) and mid.strip() and mid not in models:
+            models.append(mid.strip())
+    return models or None
+
+
 def _register_account_backend(account: str, target: dict, log: "DeployLogger") -> None:
     """Create/update this account's backend to point at the reverse-tunnel
     upstream (http://<upstream_host>:<remote_api_port>). The proxy needs no
     token (loopback + tunnel only), so api_key is left empty. The gateway
     already routes plain http:// backends directly, so no receiver-side change
-    is needed."""
+    is needed. Models are pulled live from /v1/models so the backend tracks the
+    upstream instead of a hardcoded name."""
     base_url = f"http://{target['upstream_host']}:{target['remote_api_port']}"
+    models = _fetch_upstream_models(base_url, log)
     try:
         from gateway import backend_store
         backend_store.upsert_account_backend(
-            account_id=account, base_url=base_url, api_key="",
+            account_id=account, base_url=base_url, api_key="", models=models,
         )
-        log.log(f"✅ 已登记后端 {base_url} (account={account})")
+        if models:
+            log.log(f"✅ 已登记后端 {base_url} (account={account})，模型: {', '.join(models)}")
+        else:
+            log.log(f"✅ 已登记后端 {base_url} (account={account})，模型沿用默认/现有")
     except AttributeError:
         log.log(f"⚠️ backend_store 无 upsert_account_backend，请在面板手动添加后端 base_url={base_url}")
     except Exception as e:  # noqa: BLE001
@@ -705,6 +738,31 @@ def _verify_upstream_ready(target: dict, log: "DeployLogger") -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+def _free_stale_forward_port(target: dict, log: "DeployLogger") -> None:
+    """When co-located with the target (loopback upstream), a previous claw's
+    reverse-tunnel sshd-session can linger and keep holding the forward port
+    (sshd has no ClientAlive set), so the NEW claw's -R hits "port in use" and
+    ExitOnForwardFailure makes it loop forever. Kill any sshd-session still
+    listening on 127.0.0.1:<remote_api_port> so the new tunnel can bind."""
+    host = target.get("upstream_host")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return  # remote target: can't inspect its sockets locally; skip
+    port = int(target["remote_api_port"])
+    try:
+        out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        if f"127.0.0.1:{port} " in line and "sshd" in line:
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                try:
+                    subprocess.run(["kill", m.group(1)], timeout=5)
+                    log.log(f"[cleanup] killed stale sshd-session pid={m.group(1)} holding :{port}")
+                except Exception:
+                    pass
 
 
 # ─── Core deploy flow ───
@@ -796,12 +854,17 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             with_ph=False, cookies=cookies,
         )
         has_claw = False
+        cur_status = ""
         if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-            status = (data.get("data") or {}).get("status", "")
-            if status not in ("", "DESTROYED", "DESTROYING"):
+            cur_status = (data.get("data") or {}).get("status", "")
+            if cur_status not in ("", "DESTROYED", "DESTROYING"):
                 has_claw = True
 
-        if has_claw:
+        # force=False + an already-AVAILABLE claw -> reuse it (skip destroy+create)
+        reuse_existing = (not force) and cur_status == "AVAILABLE"
+        if reuse_existing:
+            log.log("[reuse] existing claw is AVAILABLE and force=False; skip destroy/create")
+        elif has_claw:
             log.log("\u53d1\u73b0\u65e7 Claw\uff0c\u9500\u6bc1\u4e2d...")
             await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
             for _ in range(_DESTROY_POLL_MAX_ITERS):
@@ -824,57 +887,69 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("cancelled", history_status="cancelled")
             return
 
-        # Step 1: Create claw.
+        # Step 1+2: ensure a claw is AVAILABLE. Reuse if force=False and one is
+        # already up; otherwise create (retrying BOTH MiMo capacity 429s AND
+        # CREATE_FAILED infra hiccups, e.g. "subnet mismatch") and poll.
         set_state("step1_create")
-        log.log("Step 1: \u521b\u5efa\u65b0 Claw...")
         retry_deadline = time.monotonic() + _CREATE_429_RETRY_BUDGET_S
-        attempt = 0
-        while True:
-            attempt += 1
-            code, data = await asyncio.to_thread(
-                curl_api_sync,
-                "POST", "/open-apis/user/mimo-claw/create",
-                body={}, cookies=cookies,
-            )
-            if isinstance(data, dict) and data.get("code") == 0:
-                log.log("Claw \u521b\u5efa\u8bf7\u6c42\u5df2\u53d1\u9001" + (f"\uff08\u7b2c {attempt} \u6b21\u5c1d\u8bd5\u6210\u529f\uff09" if attempt > 1 else ""))
-                break
-            if not _is_retryable_create_429(data):
-                log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25: {data}")
-                mark_finished("error", history_status="error")
-                return
-            if cancelled():
-                mark_finished("cancelled", history_status="cancelled")
-                return
-            remaining = retry_deadline - time.monotonic()
-            if remaining <= 0:
-                log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25\uff1aMiMo \u5bb9\u91cf\u9971\u548c\u91cd\u8bd5 {attempt} \u6b21\u540e\u653e\u5f03")
-                mark_finished("error", history_status="error")
-                return
-            sleep_s = random.uniform(0, _CREATE_429_JITTER_MAX_S)
-            log.log(f"\u23f3 MiMo \u521b\u5efa\u9650\u6d41/\u5bb9\u91cf\u9971\u548c\uff08429\uff09\uff0c{sleep_s:.1f}s \u540e\u91cd\u8bd5\uff08\u5df2\u5c1d\u8bd5 {attempt} \u6b21\uff0c\u5269\u4f59\u9884\u7b97 {int(remaining)}s\uff09")
-            await asyncio.sleep(sleep_s)
 
-        # Step 2: Wait until claw is AVAILABLE.
-        set_state("step2_wait")
-        log.log("Step 2: \u7b49\u5f85 Claw \u5c31\u7eea...")
+        async def _trigger_create() -> bool:
+            attempt = 0
+            while True:
+                attempt += 1
+                c2, d2 = await asyncio.to_thread(
+                    curl_api_sync,
+                    "POST", "/open-apis/user/mimo-claw/create",
+                    body={}, cookies=cookies,
+                )
+                if isinstance(d2, dict) and d2.get("code") == 0:
+                    log.log("Claw create sent" + (f" (attempt {attempt})" if attempt > 1 else ""))
+                    return True
+                if not _is_retryable_create_429(d2):
+                    log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25: {d2}")
+                    return False
+                if time.monotonic() >= retry_deadline:
+                    log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25\uff1aMiMo 429 \u91cd\u8bd5 {attempt} \u6b21\u540e\u653e\u5f03")
+                    return False
+                s = random.uniform(0, _CREATE_429_JITTER_MAX_S)
+                log.log(f"\u23f3 MiMo 429\uff0c{s:.1f}s \u540e\u91cd\u8bd5")
+                await asyncio.sleep(s)
+
         claw_ready = False
-        for i in range(_CREATE_POLL_MAX_ITERS):
-            if cancelled():
-                mark_finished("cancelled", history_status="cancelled")
+        if reuse_existing:
+            log.log("[reuse] claw already AVAILABLE; skip Step1 create")
+            claw_ready = True
+        else:
+            log.log("Step 1: \u521b\u5efa\u65b0 Claw...")
+            if not await _trigger_create():
+                mark_finished("error", history_status="error")
                 return
-            await asyncio.sleep(_CREATE_POLL_INTERVAL_S)
-            code, data = await acurl(
-                "GET", "/open-apis/user/mimo-claw/status",
-                with_ph=False, cookies=cookies,
-            )
-            if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-                if (data.get("data") or {}).get("status") == "AVAILABLE":
+            set_state("step2_wait")
+            log.log("Step 2: \u7b49\u5f85 Claw \u5c31\u7eea...")
+            for i in range(_CREATE_POLL_MAX_ITERS):
+                if cancelled():
+                    mark_finished("cancelled", history_status="cancelled")
+                    return
+                await asyncio.sleep(_CREATE_POLL_INTERVAL_S)
+                code, data = await acurl(
+                    "GET", "/open-apis/user/mimo-claw/status",
+                    with_ph=False, cookies=cookies,
+                )
+                sv = ""
+                if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+                    sv = (data.get("data") or {}).get("status", "")
+                if sv == "AVAILABLE":
                     claw_ready = True
                     break
-            log.log(f"  \u7b49\u5f85\u4e2d... ({(i + 1) * _CREATE_POLL_INTERVAL_S}s)")
+                if sv in ("CREATE_FAILED", "FAILED"):
+                    msg = (data.get("data") or {}).get("message", "")
+                    log.log(f"\u26a0\ufe0f Claw {sv} ({msg[:60]}); re-create...")
+                    if time.monotonic() >= retry_deadline or not await _trigger_create():
+                        break
+                    continue
+                log.log(f"  \u7b49\u5f85\u4e2d... ({(i + 1) * _CREATE_POLL_INTERVAL_S}s)")
         if not claw_ready:
-            log.log("\u274c Claw \u542f\u52a8\u8d85\u65f6")
+            log.log("\u274c Claw \u542f\u52a8\u8d85\u65f6/\u5931\u8d25")
             mark_finished("error", history_status="error")
             return
         log.log("\u2705 Claw \u5c31\u7eea")
@@ -887,9 +962,15 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # the neutralized prompt.
         set_state("step2_neutralize")
         log.log("Step 2.5: \u76f4\u5199\u7cbe\u7b80 SOUL.md/AGENTS.md\uff08operator\uff0c\u4e0d\u7ecf agent\uff09...")
-        neutral_ok, neutral_err = await claw_ws_set_agent_files(
-            {"SOUL.md": _MINIMAL_SOUL, "AGENTS.md": _MINIMAL_AGENTS}, cookies=cookies,
-        )
+        neutral_ok, neutral_err = False, None
+        for _na in range(5):
+            neutral_ok, neutral_err = await claw_ws_set_agent_files(
+                {"SOUL.md": _MINIMAL_SOUL, "AGENTS.md": _MINIMAL_AGENTS}, cookies=cookies,
+            )
+            if neutral_ok:
+                break
+            log.log(f"  set-files retry (claw operator WS not warm yet: {neutral_err})")
+            await asyncio.sleep(5)
         if cancelled():
             mark_finished("cancelled", history_status="cancelled")
             return
@@ -954,6 +1035,10 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             log.log("\u274c \u5728\u76ee\u6807\u673a\u6388\u6743\u516c\u94a5\u5931\u8d25\uff0c\u505c\u6b62\u90e8\u7f72")
             mark_finished("error", history_status="error")
             return
+
+        # Free any stale forward port held by a prior claw's lingering tunnel,
+        # so the new claw's autossh -R can bind (else it loops on "port in use").
+        await asyncio.to_thread(_free_stale_forward_port, ssh_target, log)
 
         # Step 4: wait for autossh to bring the reverse tunnel up + proxy ready.
         set_state("step4_verify")

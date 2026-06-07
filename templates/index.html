@@ -250,6 +250,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
     <div class="nav-item" data-page="deploy" onclick="switchPage('deploy')">
       <span class="icon">🚀</span><span>自动部署</span>
     </div>
+    <div class="nav-item" data-page="activity" onclick="switchPage('activity')">
+      <span class="icon">💬</span><span>Claw 维护互动</span>
+    </div>
     <div class="nav-item" data-page="ssh-targets" onclick="switchPage('ssh-targets')">
       <span class="icon">🛤️</span><span>中转机配置</span>
     </div>
@@ -456,6 +459,20 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <button class="btn btn-ghost" onclick="document.getElementById('historyPanel').style.display='none'" style="padding:4px 10px;font-size:0.75rem">关闭</button>
         </div>
         <div id="historyContent" style="max-height:400px;overflow-y:auto"></div>
+      </div>
+    </div>
+
+    <!-- ════ Claw 维护互动 (human-like WS activity) ════ -->
+    <div class="page" id="page-activity">
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <h2 style="margin:0">Claw 维护互动</h2>
+          <div class="meta">面板每 3–8 分钟以拟人方式通过 WS 与每个在线 Claw 对话，顺手维护反向隧道/代理。下面是每个账号本次发了什么、Claw 回了什么。</div>
+        </div>
+        <div id="activityLoopStatus" class="meta" style="margin:0"></div>
+      </div>
+      <div class="section">
+        <div id="activityAccounts"><div style="color:var(--text3);text-align:center;padding:18px">加载中…</div></div>
       </div>
     </div>
 
@@ -862,7 +879,7 @@ function formatUptime(sec) {
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
   dashboard: '概览', accounts: '账号 & Claw',
-  chat: 'Claw 对话', deploy: '自动部署', 'ssh-targets': '中转机配置', logs: '系统日志',
+  chat: 'Claw 对话', deploy: '自动部署', activity: 'Claw 维护互动', 'ssh-targets': '中转机配置', logs: '系统日志',
   gateway: '网关状态', backends: '后端服务器',
   mappings: '模型映射',
   metrics: '指标与日志',
@@ -885,6 +902,7 @@ function switchPage(name) {
   if (name === 'accounts') refreshAccountsFull();
   if (name === 'chat') refreshChatHeader();
   if (name === 'deploy') refreshAccounts();
+  if (name === 'activity') refreshActivity();
   if (name === 'ssh-targets') refreshSshTargets();
   if (name === 'logs') refreshLogs();
   if (name === 'gateway') refreshGateway();
@@ -2785,8 +2803,75 @@ function toggleLogAutoRefresh() {
 
 // Initial load: respect URL hash (so refresh stays on the same page)
 switchPage(pageFromHash());
+
+// ══════════════════════════════════════════════════════
+// Claw 维护互动 (human-like WS activity)
+// ══════════════════════════════════════════════════════
+function activityHealthBadge(h, err) {
+  if (err) return '<span class="badge red">不可达</span>';
+  if (h === true) return '<span class="badge green">在线</span>';
+  if (h === false) return '<span class="badge red">掉线</span>';
+  return '<span class="badge yellow">未知</span>';
+}
+function activityAgo(ts) {
+  if (!ts) return '从未';
+  var s = Math.floor(Date.now()/1000) - ts;
+  if (s < 0) s = 0;
+  return formatUptime(s) + '前';
+}
+function refreshActivity() {
+  api('GET', '/api/claw-activity/status').then(function(d) {
+    d = d || {};
+    var iv = d.interval_s || [];
+    var st = document.getElementById('activityLoopStatus');
+    if (st) {
+      st.innerHTML = (d.running ? '<span class="badge green">运行中</span>' : '<span class="badge red">已停止</span>')
+        + (iv.length === 2 ? ' &nbsp;间隔 ' + iv[0]/60 + '–' + iv[1]/60 + ' 分钟随机' : '')
+        + (d.error ? ' &nbsp;<span style="color:var(--red)">' + escapeHtml(d.error) + '</span>' : '');
+    }
+    var accts = d.accounts || {};
+    var names = Object.keys(accts).sort();
+    var el = document.getElementById('activityAccounts');
+    if (!el) return;
+    if (!names.length) {
+      el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:18px">暂无在线账号的互动记录（仅对“已启用且已部署后端”的账号生效，首轮 3–8 分钟后出现）。</div>';
+      return;
+    }
+    el.innerHTML = names.map(function(name) {
+      var a = accts[name] || {};
+      var hist = (a.history || []).slice().reverse();
+      var histId = 'acthist-' + name.replace(/[^a-zA-Z0-9]/g, '_');
+      var histRows = hist.map(function(h) {
+        return '<div style="border-top:1px solid var(--border);padding:8px 0">'
+          + '<div style="font-size:.72rem;color:var(--text3);margin-bottom:4px">' + activityAgo(h.ts) + ' · ' + activityHealthBadge(h.healthy, h.error) + '</div>'
+          + '<div style="font-size:.78rem;color:var(--accent);white-space:pre-wrap;margin-bottom:4px">📤 ' + escapeHtml(h.message || '') + '</div>'
+          + '<div style="font-size:.78rem;color:var(--text2);white-space:pre-wrap">📥 ' + escapeHtml(h.reply || (h.error ? ('（无回复）' + h.error) : '（无回复）')) + '</div>'
+          + '</div>';
+      }).join('') || '<div style="color:var(--text3);font-size:.78rem;padding:6px 0">暂无历史</div>';
+      return '<div class="section" style="margin-bottom:14px">'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">'
+        +   '<div style="font-weight:600;color:var(--text)">' + escapeHtml(name) + ' ' + activityHealthBadge(a.last_healthy, a.last_chat_err) + '</div>'
+        +   '<div class="meta" style="margin:0">上次 ' + activityAgo(a.last_run) + ' · 下次约 ' + formatUptime(a.next_due_in_s || 0) + ' 后'
+        +     (a.unhealthy_streak ? ' · <span style="color:var(--yellow)">连续异常 ' + a.unhealthy_streak + '</span>' : '')
+        +     (a.running ? ' · <span style="color:var(--accent)">互动中…</span>' : '') + '</div>'
+        + '</div>'
+        + '<div style="font-size:.72rem;color:var(--text3);margin-bottom:3px">本次发送</div>'
+        + '<div style="font-size:.82rem;color:var(--accent);white-space:pre-wrap;background:#0a1520;padding:8px 10px;border-radius:6px;margin-bottom:8px">' + escapeHtml(a.last_message || '（尚未发送）') + '</div>'
+        + '<div style="font-size:.72rem;color:var(--text3);margin-bottom:3px">Claw 回复</div>'
+        + '<div style="font-size:.82rem;color:var(--text2);white-space:pre-wrap;background:#0a1520;padding:8px 10px;border-radius:6px;max-height:240px;overflow-y:auto">' + escapeHtml(a.last_reply || (a.last_chat_err ? ('（无回复）' + a.last_chat_err) : '（尚未回复）')) + '</div>'
+        + '<div style="margin-top:8px"><span style="cursor:pointer;color:var(--text3);font-size:.75rem;user-select:none" onclick="var x=document.getElementById(\'' + histId + '\');x.style.display=x.style.display===\'none\'?\'block\':\'none\'">▾ 历史记录 (' + hist.length + ')</span>'
+        +   '<div id="' + histId + '" style="display:none;margin-top:6px">' + histRows + '</div></div>'
+        + '</div>';
+    }).join('');
+  }).catch(function() {});
+}
 // Refresh dashboard summary every 30s (claw status changes are slow)
 setInterval(refreshDashboard, 30000);
+// Refresh the activity page while it is open
+setInterval(function() {
+  var p = document.getElementById('page-activity');
+  if (p && p.classList.contains('active')) refreshActivity();
+}, 10000);
 // Refresh top bar gateway light every 10s
 setInterval(function() {
   api('GET', '/api/gateway/status').then(function(d) {

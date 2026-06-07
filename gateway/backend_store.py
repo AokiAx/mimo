@@ -147,7 +147,7 @@ def upsert_account_backend(
     with _lock:
         data = _load()
         for b in data["backends"]:
-            if b.get("account_id") == account_id:
+            if (b.get("account_id") or "").casefold() == (account_id or "").casefold():
                 existing_id = b["id"]
                 break
         else:

@@ -224,6 +224,19 @@ async def startup_event():
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
+    # Human-like WS activity loop: keeps each deployed Claw engaged and its
+    # reverse tunnel repaired between hourly redeploys. Gated like the
+    # scheduler so a fresh host can stay quiet until accounts are verified.
+    if os.environ.get("DISABLE_CLAW_ACTIVITY") in ("1", "true", "yes"):
+        logger.info("[startup] DISABLE_CLAW_ACTIVITY set — claw activity loop not started")
+    elif os.environ.get("DISABLE_SCHEDULER") in ("1", "true", "yes"):
+        logger.info("[startup] scheduler disabled — claw activity loop not started")
+    else:
+        try:
+            from claw.claw_activity import start_activity
+            start_activity()
+        except Exception:
+            logger.exception("[startup] Failed to start claw activity loop")
 
 
 @app.on_event("shutdown")
@@ -488,15 +501,28 @@ def _invalidate_summary(filename: str | None = None) -> None:
         _summary_cache.pop(filename, None)
 
 
+_http_client_loop = None  # event loop the async client is bound to
+
+
 def _get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None:
+    global _http_client, _http_client_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    # A global AsyncClient is bound to the loop it was created on. The auto-deploy
+    # scheduler runs each deploy in a fresh thread + asyncio.run (a NEW loop), so
+    # reusing a client created on another loop raises "Future attached to a
+    # different loop" (this was silently breaking every scheduled deploy at the
+    # FDS-upload step). Rebuild whenever the running loop changes.
+    if _http_client is None or _http_client_loop is not loop:
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, connect=10.0),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             trust_env=False,
             follow_redirects=False,
         )
+        _http_client_loop = loop
     return _http_client
 
 
@@ -1771,6 +1797,17 @@ async def auto_deploy_history(account_filename: str):
     """Get run history for a specific account."""
     from claw.auto_deploy import get_run_history
     return {"history": get_run_history(account_filename)}
+
+
+@app.get("/api/claw-activity/status")
+async def claw_activity_status():
+    """Per-account human-like WS maintenance state: what we last sent each
+    Claw, what it replied, health, and next-due countdown."""
+    try:
+        from claw.claw_activity import get_activity_status
+        return get_activity_status()
+    except Exception as e:  # noqa: BLE001
+        return {"running": False, "accounts": {}, "error": f"{type(e).__name__}: {e}"}
 
 
 # ──────────── Gateway API endpoints ────────────
