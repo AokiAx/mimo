@@ -41,6 +41,7 @@ import uuid
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 # 路径配置
 ACCOUNTS_DIR = Path(__file__).resolve().parent.parent / "accounts"
@@ -48,7 +49,12 @@ AUTH_CONFIG = Path(__file__).resolve().parent.parent / "tmp" / "mimo_auth_config
 MIMO_BASE = "https://aistudio.xiaomimimo.com"
 XIAOMI_LOGIN = "https://account.xiaomi.com/pass/serviceLogin"
 XIAOMI_AUTH = "https://account.xiaomi.com/pass/serviceLoginAuth2"
+# The browser posts password auth to the global passport host, while the
+# post-2FA /end callback still lives on account.xiaomi.com.
+XIAOMI_AUTH_POST = "https://global.account.xiaomi.com/pass/serviceLoginAuth2"
 SID = "xiaomichatbot"
+LOGIN_GROUP = "DEFAULT"
+DEFAULT_SERVICE_PARAM = {"checkSafePhone": False, "checkSafeAddress": False, "lsrp_score": 0.0}
 # The real callback URL is NOT /open-apis/user/mi/get — it is /sts?sign=...&followup=...
 # obtained from GET /open-apis/v1/genLoginUrl (302 redirect carries the callback).
 # We fetch it dynamically so the sign token stays valid.
@@ -229,9 +235,63 @@ def _device_fingerprint(email):
     return hashlib.md5(f"mimo-claw:{email}".encode()).hexdigest()
 
 
+def _service_param_json():
+    return json.dumps(DEFAULT_SERVICE_PARAM, separators=(",", ":"))
+
+
+def _build_login_qs(callback_url):
+    return quote(f"?callback={quote(callback_url, safe='')}&sid={SID}", safe="")
+
+
+def _extract_login_params(location, callback_url):
+    """Pull browser login params from the serviceLogin 302 Location."""
+    if not location:
+        return {}
+    params = parse_qs(urlparse(location).query, keep_blank_values=True)
+    values = {key: vals[0] for key, vals in params.items() if vals}
+    values.setdefault("callback", callback_url)
+    values.setdefault("qs", _build_login_qs(callback_url))
+    values.setdefault("serviceParam", _service_param_json())
+    values.setdefault("showActiveX", "false")
+    values.setdefault("theme", "")
+    values.setdefault("needTheme", "false")
+    values.setdefault("bizDeviceType", "")
+    return values
+
+
+def _build_login_referer(callback_url, sign, login_params):
+    params = {
+        "_group": LOGIN_GROUP,
+        "_sign": sign,
+        "serviceParam": login_params.get("serviceParam") or _service_param_json(),
+        "showActiveX": login_params.get("showActiveX", "false"),
+        "theme": login_params.get("theme", ""),
+        "needTheme": login_params.get("needTheme", "false"),
+        "bizDeviceType": login_params.get("bizDeviceType", ""),
+        "_locale": "zh_CN",
+        "source": "",
+        "region": "CN",
+        "sid": SID,
+        "qs": _build_login_qs(callback_url),
+        "callback": callback_url,
+    }
+    return f"https://global.account.xiaomi.com/fe/service/login/password?{urlencode(params)}"
+
+
 def _xiaomi_get_sign(session, callback_url):
     """Step 1: 获取 _sign 和初始 cookies"""
     session.cookies.set("userId", "", domain="account.xiaomi.com")
+    resp = session.get(
+        XIAOMI_LOGIN,
+        params={"callback": callback_url, "sid": SID, "_group": LOGIN_GROUP},
+        allow_redirects=False,
+        timeout=15,
+    )
+
+    login_params = _extract_login_params(resp.headers.get("Location", ""), callback_url)
+    if login_params.get("_sign"):
+        return login_params["_sign"], resp, login_params
+
     resp = session.get(
         XIAOMI_LOGIN,
         params={"sid": SID, "callback": callback_url, "_json": "true"},
@@ -242,8 +302,18 @@ def _xiaomi_get_sign(session, callback_url):
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return None, resp
-    return data.get("_sign", ""), resp
+        return None, resp, {}
+    login_params = {
+        "_sign": data.get("_sign", ""),
+        "callback": callback_url,
+        "qs": _build_login_qs(callback_url),
+        "serviceParam": _service_param_json(),
+        "showActiveX": "false",
+        "theme": "",
+        "needTheme": "false",
+        "bizDeviceType": "",
+    }
+    return data.get("_sign", ""), resp, login_params
 
 
 def _send_email_code(session, flag=8):
@@ -490,16 +560,33 @@ def _handle_verification(session, notification_url="", original_callback="", use
     raise Exception("验证码错误次数过多")
 
 
-def _xiaomi_authenticate(session, email, password, sign, callback, device_fingerprint=""):
-    """Step 2: 提交登录表单"""
+def _xiaomi_authenticate(session, email, password, sign, callback, device_fingerprint="", login_params=None):
+    """Step 2: 提交登录表单 (global passport flow)
+
+    Matches the params the global FE (global.account.xiaomi.com) posts:
+    region/policyName/serviceParam plus a properly-built ``qs``. The ``user``
+    field is sent in PLAINTEXT — the browser encrypts it via the ``eui`` header,
+    but the backend historically accepts plaintext too. If the response says the
+    username is invalid/needs encryption, that's the signal we need the eui path.
+    """
+    login_params = login_params or {}
     pw_hash = hashlib.md5(password.encode()).hexdigest().upper()
     post_data = {
-        "sid": SID,
-        "hash": pw_hash,
         "callback": callback,
-        "qs": f"%3Fsid%3D{SID}%26_json%3Dtrue",
+        "qs": _build_login_qs(callback),
+        "sid": SID,
+        "region": "CN",
+        "source": "",
+        "bizDeviceType": login_params.get("bizDeviceType", ""),
+        "needTheme": login_params.get("needTheme", "false"),
+        "theme": login_params.get("theme", ""),
+        "showActiveX": login_params.get("showActiveX", "false"),
+        "serviceParam": login_params.get("serviceParam") or _service_param_json(),
         "user": email,
+        "hash": pw_hash,
         "_json": "true",
+        "policyName": "globalmiaccount",
+        "captCode": "",
     }
     if sign:
         post_data["_sign"] = sign
@@ -507,10 +594,12 @@ def _xiaomi_authenticate(session, email, password, sign, callback, device_finger
         post_data["deviceFingerprint"] = device_fingerprint
 
     resp = session.post(
-        XIAOMI_AUTH,
+        XIAOMI_AUTH_POST,
         data=post_data,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://global.account.xiaomi.com",
+            "Referer": _build_login_referer(callback, sign, login_params),
             "x-requested-with": "XMLHttpRequest",
         },
         allow_redirects=False,
@@ -522,6 +611,27 @@ def _xiaomi_authenticate(session, email, password, sign, callback, device_finger
     except json.JSONDecodeError:
         raise Exception(f"登录响应解析失败: {text[:200]}")
     return data
+
+
+def _looks_like_visual_captcha(auth_data):
+    desc = str(auth_data.get("desc") or "")
+    code = str(auth_data.get("code") or "")
+    if auth_data.get("notificationUrl"):
+        return False
+    if any(key in auth_data for key in ("captchaUrl", "captcha", "captCode", "ick")):
+        return True
+    return "验证码" in desc or code in {"70016", "70022", "87001"}
+
+
+def _format_auth_error(auth_data):
+    desc = auth_data.get("desc", auth_data.get("code", "unknown"))
+    if _looks_like_visual_captcha(auth_data):
+        return (
+            "登录失败: 小米要求图形/滑块验证码（不是邮箱/短信验证码）。"
+            f"服务端返回: {desc}。请先在同一网络用浏览器完成一次小米账号登录，"
+            "或换已登录过的网络/IP 后再运行。"
+        )
+    return f"登录失败: {desc}"
 
 
 def _xiaomi_exchange_token(session, location):
@@ -568,14 +678,14 @@ def do_login(email, password):
 
     # Step 1: 获取 _sign
     print("[login] 获取登录签名...")
-    sign, init_resp = _xiaomi_get_sign(session, callback)
+    sign, init_resp, login_params = _xiaomi_get_sign(session, callback)
     if not sign:
         raise Exception(f"获取 _sign 失败，响应: {init_resp.text[:200]}")
 
     # Step 2: 认证
     device_fp = _device_fingerprint(email)
     print("[login] 提交登录信息...")
-    auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp)
+    auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp, login_params)
 
     code = auth_data.get("code", 0)
     result = auth_data.get("result", "")
@@ -596,8 +706,8 @@ def do_login(email, password):
             print(f"[login] debug auth_data: {json.dumps(auth_data, ensure_ascii=False)[:500]}")
             raise Exception("登录成功但没有返回 location URL")
     else:
-        desc = auth_data.get("desc", auth_data.get("code", "unknown"))
-        raise Exception(f"登录失败: {desc}")
+        print(f"[login] debug auth_data: {json.dumps(auth_data, ensure_ascii=False)[:600]}")
+        raise Exception(_format_auth_error(auth_data))
 
     print("[login] 获取 serviceToken...")
     # Step 3: 用 location 换 serviceToken
@@ -757,12 +867,12 @@ def web_start_login(email, password):
         if not callback:
             return {"status": "error", "error": "获取 callback URL 失败"}
 
-        sign, init_resp = _xiaomi_get_sign(session, callback)
+        sign, init_resp, login_params = _xiaomi_get_sign(session, callback)
         if not sign:
             return {"status": "error", "error": "获取 _sign 失败"}
 
         device_fp = _device_fingerprint(email)
-        auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp)
+        auth_data = _xiaomi_authenticate(session, email, password, sign, callback, device_fp, login_params)
 
         # Branch A — needs 2FA
         if auth_data.get("notificationUrl") and not auth_data.get("location"):
@@ -810,8 +920,7 @@ def web_start_login(email, password):
             cookies = _finish_login(session, location, auth_data)
             return {"status": "ok", "cookies": cookies}
 
-        desc = auth_data.get("desc", auth_data.get("code", "unknown"))
-        return {"status": "error", "error": f"登录失败: {desc}"}
+        return {"status": "error", "error": _format_auth_error(auth_data)}
 
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
