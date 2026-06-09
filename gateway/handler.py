@@ -74,7 +74,7 @@ _PROTOCOL_TAG = {
 # claw-side proxy rotates it), and a 429 means that account hit its quota — both
 # are worth retrying on a *different* backend. When every attempt fails we
 # surface a single friendly "high load" 503 instead of a raw per-backend error.
-_MAX_ATTEMPTS = 5
+_MAX_ATTEMPTS = 2
 
 # Upstream HTTP statuses worth retrying on another backend (in addition to any
 # 5xx). 401: stale rotated key on one node. 429: that account is rate-limited.
