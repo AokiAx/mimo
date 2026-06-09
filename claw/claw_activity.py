@@ -178,9 +178,12 @@ def _enabled_deployed_accounts() -> list[str]:
         backends = backend_store.list_backends()
     except Exception:
         backends = []
-    have_backend = {str(b.get("account_id") or "") for b in backends if b.get("base_url")}
+    have_backend = {str(b.get("account_id") or "").casefold() for b in backends if b.get("base_url")}
     for acc, acc_cfg in accounts_cfg.items():
-        if acc_cfg.get("enabled") and acc in have_backend:
+        if not acc_cfg.get("enabled"):
+            continue
+        keys = {acc.casefold(), (acc[:-5] if acc.endswith(".json") else acc + ".json").casefold()}
+        if keys & have_backend:
             out.append(acc)
     return out
 
@@ -318,7 +321,7 @@ def _try_reupload_scripts(account: str, cookies: list) -> bool:
     """
     try:
         from claw.auto_deploy import (
-            _load_ssh_targets,
+            _resolve_account_target,
             _render_ssh_payload,
             _API_PROXY_PY,
             _REVERSE_TUNNEL_SH,
@@ -331,22 +334,9 @@ def _try_reupload_scripts(account: str, cookies: list) -> bool:
 
     # Resolve the SSH target for this account.
     try:
-        cfg = _load_ssh_targets()
-        targets = cfg.get("targets") or {}
-        assignments = cfg.get("assignments") or {}
-        asn = assignments.get(account) or {}
-        tname = asn.get("target") or cfg.get("default_target")
-        if not tname or tname not in targets:
-            return False
-        t = targets[tname]
-        ssh_target = {
-            "host": t["host"],
-            "ssh_port": int(t.get("ssh_port", 22)),
-            "tunnel_user": t.get("tunnel_user", "tunnel"),
-            "upstream_host": t.get("upstream_host", "127.0.0.1"),
-            "remote_api_port": int(asn.get("remote_api_port", 0)),
-        }
-        if not ssh_target["remote_api_port"]:
+        ssh_target, target_err = _resolve_account_target(account)
+        if ssh_target is None:
+            logger.warning("[activity] %s: cannot reupload scripts: %s", account, target_err)
             return False
     except Exception:
         logger.exception("[activity] %s: failed to resolve SSH target", account)
@@ -364,10 +354,10 @@ def _try_reupload_scripts(account: str, cookies: list) -> bool:
         f"pip install --break-system-packages -q aiohttp`\n"
         f"3. 生成隧道密钥（若无）：`test -f {sshdir}/id_tunnel || "
         f"ssh-keygen -t ed25519 -N '' -f {sshdir}/id_tunnel -C claw`\n"
-        f"4. 起代理：`pkill -f api-proxy.py 2>/dev/null||true; "
-        f"nohup python3 {scripts_dir}/api-proxy.py >/tmp/api-proxy.log 2>&1 &`\n"
+        f"4. 起代理：`pkill -f 'python {scripts_dir}/api-proxy.py' 2>/dev/null||true; "
+        f"nohup python {scripts_dir}/api-proxy.py >/tmp/api-proxy.log 2>&1 &`\n"
         f"5. 起反向隧道："
-        f"`pkill -f reverse-tunnel.sh 2>/dev/null||true; nohup bash {scripts_dir}/reverse-tunnel.sh >/tmp/reverse-tunnel.log 2>&1 &`\n"
+        f"`pkill -f 'bash {scripts_dir}/reverse-tunnel.sh' 2>/dev/null||true; nohup bash {scripts_dir}/reverse-tunnel.sh >/tmp/reverse-tunnel.log 2>&1 &`\n"
         f"6. 最后把公钥发我：`cat {sshdir}/id_tunnel.pub`"
     )
 

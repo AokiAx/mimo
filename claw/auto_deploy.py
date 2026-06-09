@@ -46,7 +46,6 @@ from typing import Optional
 
 from croniter import croniter  # noqa: F401  (dep retained; cron exprs still in config)
 
-CONFIG_PATH = Path(__file__).parent.parent / "data" / "auto_deploy.json"
 LOG_DIR = Path(__file__).parent.parent / "data" / "deploy_logs"
 HISTORY_DIR = Path(__file__).parent.parent / "data" / "deploy_history"
 INCIDENT_DIR = LOG_DIR / "incidents"
@@ -161,7 +160,6 @@ _BRIDGE_CONNECT_MAX_ITERS = 48   # → up to 240s
 # Targets + per-account assignments live in data/ssh_targets.json; the panel's
 # admin private key (whose pubkey was installed on each target via
 # claw/target/setup-target.sh) lives at data/panel_tunnel_key by default.
-SSH_TARGETS_PATH = Path(__file__).parent.parent / "data" / "ssh_targets.json"
 _PANEL_KEY_DEFAULT = Path(__file__).parent.parent / "data" / "panel_tunnel_key"
 _API_PROXY_PY = PAYLOAD_DIR / "api-proxy.py"
 _REVERSE_TUNNEL_SH = PAYLOAD_DIR / "reverse-tunnel.sh"
@@ -235,7 +233,6 @@ logger_module = logging.getLogger(__name__)
 
 
 def _ensure_dirs():
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
@@ -646,10 +643,10 @@ def _ssh_bootstrap_instructions() -> str:
         f"pip install --break-system-packages -q aiohttp`（autossh 装不上没关系，脚本会自动退回纯 ssh 重连）\n"
         f"3. 生成隧道密钥（若无）：`test -f {sshdir}/id_tunnel || "
         f"ssh-keygen -t ed25519 -N '' -f {sshdir}/id_tunnel -C claw`\n"
-        f"4. 起代理：`pkill -f api-proxy.py 2>/dev/null||true; "
-        f"nohup python3 {scripts}/api-proxy.py >/tmp/api-proxy.log 2>&1 &`\n"
+        f"4. 起代理：`pkill -f 'python {scripts}/api-proxy.py' 2>/dev/null||true; "
+        f"nohup python {scripts}/api-proxy.py >/tmp/api-proxy.log 2>&1 &`\n"
         f"5. 起反向隧道（公钥被授权前一直重试是正常的）："
-        f"`pkill -f reverse-tunnel.sh 2>/dev/null||true; nohup bash {scripts}/reverse-tunnel.sh >/tmp/reverse-tunnel.log 2>&1 &`\n"
+        f"`pkill -f 'bash {scripts}/reverse-tunnel.sh' 2>/dev/null||true; nohup bash {scripts}/reverse-tunnel.sh >/tmp/reverse-tunnel.log 2>&1 &`\n"
         f"6. 最后把公钥发我：`cat {sshdir}/id_tunnel.pub`"
     )
 
@@ -767,7 +764,8 @@ def _free_stale_forward_port(target: dict, log: "DeployLogger") -> None:
     port = int(target["remote_api_port"])
     try:
         out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
+    except Exception as e:
+        logger_module.debug("ss -ltnp unavailable, skipping stale port cleanup: %s", e)
         return
     for line in out.splitlines():
         if f"127.0.0.1:{port} " in line and "sshd" in line:

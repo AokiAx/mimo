@@ -31,7 +31,7 @@ kill_pids() { for p in "$@"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; do
 if ! ss -tln 2>/dev/null | grep -q ":${LOCAL_PROXY_PORT} "; then
     log "api-proxy down on :${LOCAL_PROXY_PORT}, restarting"
     kill_pids $(pgrep -f "$SCRIPTS/api-proxy.py" 2>/dev/null)
-    nohup python3 "$SCRIPTS/api-proxy.py" > /tmp/api-proxy.log 2>&1 &
+    nohup python "$SCRIPTS/api-proxy.py" > /tmp/api-proxy.log 2>&1 &
     sleep 2
 fi
 

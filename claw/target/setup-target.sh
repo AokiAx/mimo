@@ -46,7 +46,7 @@ install -m 600 -o "$TUNNEL_USER" -g "$TUNNEL_USER" "$TMP" "$AUTHK"
 rm -f "$TMP"
 
 echo "[setup] done."
-echo "  tunnel user : $TUNNEL_USER (nologin; panel-admin + per-claw locked forwards)"
+echo "  tunnel user : $TUNNEL_USER (login shell /bin/bash for forced-command; no interactive access via restrict+permitlisten)"
 echo "  authorizer  : $AUTHORIZER"
 echo "  hand panel  : host, ssh_port, tunnel user='$TUNNEL_USER'"
 echo "  ensure sshd : AllowTcpForwarding remote (or yes); GatewayPorts no (loopback-only forwards)"
