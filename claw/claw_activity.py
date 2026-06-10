@@ -323,6 +323,8 @@ def _try_reupload_scripts(account: str, cookies: list) -> bool:
         from claw.auto_deploy import (
             _resolve_account_target,
             _render_ssh_payload,
+            _parse_ssh_pubkey,
+            _authorize_key_on_target,
             _API_PROXY_PY,
             _REVERSE_TUNNEL_SH,
             _KEEPALIVE_SH,
@@ -388,6 +390,30 @@ def _try_reupload_scripts(account: str, cookies: list) -> bool:
             logger.warning("[activity] %s: script reupload WS failed: %s", account, err)
             return False
         logger.info("[activity] %s: scripts re-uploaded, reply: %s", account, (reply or "")[:200])
+
+        # Extract pubkey from Claw's reply and authorize it on the target.
+        # Without this, the reverse tunnel can never establish — the Claw
+        # generates a keypair but the pubkey is never added to the target's
+        # tunnel user authorized_keys.
+        pubkey = _parse_ssh_pubkey(reply or "")
+        if pubkey:
+            class _LogAdapter:
+                """Wrap stdlib logger to satisfy DeployLogger interface."""
+                def log(self, msg: str) -> None:
+                    logger.info("[activity] %s: %s", account, msg)
+            try:
+                authorized = await asyncio.to_thread(
+                    _authorize_key_on_target, ssh_target, pubkey, _LogAdapter(),
+                )
+                if authorized:
+                    logger.info("[activity] %s: tunnel pubkey authorized on target", account)
+                else:
+                    logger.warning("[activity] %s: tunnel pubkey authorization failed", account)
+            except Exception:
+                logger.exception("[activity] %s: tunnel pubkey authorization exception", account)
+        else:
+            logger.info("[activity] %s: no pubkey found in Claw reply", account)
+
         return True
 
     try:
