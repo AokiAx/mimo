@@ -511,7 +511,11 @@ class GatewayHandler:
             request_id=ctx.request_id, model=model, exclude=exclude,
         )
         ctx.target_backend_id = backend.backend_id
-        ctx.upstream_url = backend.base_url.rstrip("/") + (upstream_path or self._upstream_path)
+        # Free API backends use the full URL as-is (upstream_path="")
+        if backend.metadata and backend.metadata.get("type") == "free_api":
+            ctx.upstream_url = backend.base_url.rstrip("/")
+        else:
+            ctx.upstream_url = backend.base_url.rstrip("/") + (upstream_path or self._upstream_path)
         ctx.decide(f"route:{backend.backend_id}:{decision.reason}")
         if self._decision_log is not None:
             try:
@@ -523,6 +527,8 @@ class GatewayHandler:
     @staticmethod
     def _headers_for(backend) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
+        if backend.metadata and backend.metadata.get("type") == "free_api":
+            headers["X-Mimo-Source"] = "mimocode-cli-free"
         if backend.api_key:
             headers["Authorization"] = f"Bearer {backend.api_key}"
         return headers

@@ -218,6 +218,14 @@ async def startup_event():
         start_router_probe()
     except Exception as e:
         logger.exception("[startup] Failed to start gateway probe")
+    try:
+        from gateway.free_api import get_pool
+        pool = get_pool()
+        pool.start()
+        loop = asyncio.get_running_loop()
+        loop.create_task(pool.start_async())
+    except Exception:
+        logger.exception("[startup] Failed to start free API pool")
     # Human-like WS activity loop: keeps each deployed Claw engaged, repairs the
     # reverse tunnel, and drives expiry/health rotation. Gated so a fresh host
     # stays quiet until accounts are verified.
@@ -248,6 +256,12 @@ async def shutdown_event():
         await shutdown_gateway_runtime()
     except Exception as e:
         logger.exception("[shutdown] Failed to close gateway runtime")
+    try:
+        from gateway.free_api import get_pool
+        pool = get_pool()
+        await pool.shutdown()
+    except Exception:
+        logger.exception("[shutdown] Failed to stop free API pool")
     try:
         from gateway.auth import close_key_store
         close_key_store()
@@ -1802,6 +1816,52 @@ async def claw_activity_status():
         return get_activity_status()
     except Exception as e:  # noqa: BLE001
         return {"running": False, "accounts": {}, "error": f"{type(e).__name__}: {e}"}
+
+
+# ──────────── Free API / Proxy config endpoints ────────────
+
+
+@app.get("/api/free-api/config")
+async def free_api_config():
+    """Get free API pool config + channel status."""
+    try:
+        from gateway.free_api import get_pool
+        pool = get_pool()
+        return pool.get_config()
+    except ImportError:
+        return {"enabled": False, "channels": []}
+
+
+@app.post("/api/free-api/config")
+async def free_api_update_config(request: Request):
+    """Update free API pool configuration."""
+    try:
+        from gateway.free_api import FreeApiConfig, get_pool
+        body = await request.json()
+        FreeApiConfig.save(body)
+        pool = get_pool()
+        pool.reload()
+        return {"success": True}
+    except ImportError:
+        return {"success": False, "error": "Free API module not installed"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/free-api/test/{channel_id}")
+async def free_api_test_channel(channel_id: str):
+    """Test a specific free API channel."""
+    try:
+        from gateway.free_api import get_pool
+        pool = get_pool()
+        import asyncio
+        result = await pool.test_channel(channel_id)
+        return result
+    except ImportError:
+        return {"success": False, "error": "Free API module not installed"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 
 # ──────────── Gateway API endpoints ────────────

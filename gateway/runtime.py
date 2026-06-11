@@ -33,6 +33,7 @@ from gateway.core import BadRequestError, GatewayError, RequestContext
 from gateway.handler import GatewayHandler
 from gateway.routing import Backend, BackendRegistry, InMemoryDecisionLog, Router
 from gateway.secrets_store import secrets
+from gateway.free_api import get_pool, make_free_api_backends
 from gateway.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,14 @@ def reload_backends() -> int:
     _ensure_initialized()
     assert _registry is not None
     new_entries = _build_backends_from_store()
+    # Inject free API channels as backends
+    try:
+        new_entries.extend(
+            _build_backend_from_entry(e)
+            for e in make_free_api_backends()
+        )
+    except Exception:
+        logger.exception("[reload] Failed to inject free API backends")
     now = time.time()
     seen: set[str] = set()
 
@@ -958,6 +967,14 @@ def start_probe() -> None:
     """Idempotent. Spawns background liveness and rotation tasks."""
     global _probe_task, _rotation_task
     _ensure_initialized()
+    # Start the free API pool (channel management + JWT refresh)
+    try:
+        pool = get_pool()
+        pool.start()
+        loop = asyncio.get_running_loop()
+        loop.create_task(pool.start_async())
+    except Exception:
+        logger.exception("[startup] Failed to start free API pool")
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -971,6 +988,12 @@ def start_probe() -> None:
 async def shutdown() -> None:
     """Close runtime-owned background resources."""
     global _probe_task, _rotation_task
+    # Shut down the free API pool
+    try:
+        pool = get_pool()
+        await pool.shutdown()
+    except Exception:
+        logger.exception("[shutdown] Failed to stop free API pool")
     tasks = (_probe_task, _rotation_task)
     _probe_task = None
     _rotation_task = None
