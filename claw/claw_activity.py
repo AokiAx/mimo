@@ -464,6 +464,23 @@ def _maybe_rotate_for_expiry(account: str) -> bool:
         return False
 
 
+def _check_claw_alive(cookies: list) -> Optional[str]:
+    """Check Claw status via MiMo API. Returns the status string
+    ('AVAILABLE', 'DESTROYED', etc.) or None on error."""
+    try:
+        import importlib
+        app_mod = importlib.import_module("app")
+        code, data = asyncio.run(app_mod.acurl(
+            "GET", "/open-apis/user/mimo-claw/status",
+            with_ph=False, cookies=cookies,
+        ))
+        if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+            return (data.get("data") or {}).get("status", "")
+    except Exception:
+        pass
+    return None
+
+
 def _run_activity_once(account: str) -> None:
     """One human-like interaction + panel-side health check + escalation."""
     try:
@@ -476,6 +493,23 @@ def _run_activity_once(account: str) -> None:
 
     cookies = _load_account_cookies(account)
     if cookies is None:
+        return
+
+    # Pre-flight: check if Claw is still alive. If DESTROYED, skip the
+    # WS chat + fix-in-place dance and go straight to redeploy.
+    claw_status = _check_claw_alive(cookies)
+    if claw_status in ("DESTROYED", "DESTROYING", ""):
+        logger.warning(
+            "[activity] %s: Claw status=%s — triggering redeploy",
+            account, claw_status or "empty",
+        )
+        if not _account_is_deploying(account):
+            try:
+                trigger_deploy(account)
+            except Exception:
+                logger.exception("[activity] %s: trigger_deploy failed", account)
+            with _state_lock:
+                _state.setdefault(account, {})["unhealthy_streak"] = 0
         return
 
     message = _compose_message()
