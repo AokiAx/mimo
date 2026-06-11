@@ -189,11 +189,15 @@ class FreeApiPool:
         if self._httpx_client is None:
             return None
         fp = self._make_fingerprint(channel)
-        kwargs = {}
+        client = self._httpx_client
         if channel.proxy_url:
-            kwargs["proxies"] = {"all://": channel.proxy_url}
+            if not hasattr(self, "_proxy_clients"):
+                self._proxy_clients = {}
+            if channel.proxy_url not in self._proxy_clients:
+                self._proxy_clients[channel.proxy_url] = httpx.AsyncClient(timeout=httpx.Timeout(15), proxy=channel.proxy_url)
+            client = self._proxy_clients[channel.proxy_url]
         try:
-            resp = await self._httpx_client.post(BOOTSTRAP_URL, json={"client": fp}, **kwargs)
+            resp = await client.post(BOOTSTRAP_URL, json={"client": fp})
             if resp.status_code != 200:
                 channel.healthy = False
                 channel.last_error = f"bootstrap HTTP {resp.status_code}"
@@ -284,14 +288,19 @@ class FreeApiPool:
             return {"success": False, "error": ch.last_error}
         if self._httpx_client is None:
             return {"success": False, "error": "no client"}
-        kwargs = {}
         if ch.proxy_url:
-            kwargs["proxies"] = {"all://": ch.proxy_url}
+            if not hasattr(self, "_proxy_clients"):
+                self._proxy_clients = {}
+            if ch.proxy_url not in self._proxy_clients:
+                self._proxy_clients[ch.proxy_url] = httpx.AsyncClient(timeout=httpx.Timeout(15), proxy=ch.proxy_url)
+            test_client = self._proxy_clients[ch.proxy_url]
+        else:
+            test_client = self._httpx_client
         headers = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json", "X-Mimo-Source": "mimocode-cli-free"}
         payload = {"model": "mimo-auto", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5, "stream": False}
         start = time.time()
         try:
-            resp = await self._httpx_client.post(CHAT_URL, json=payload, headers=headers, timeout=httpx.Timeout(timeout_s), **kwargs)
+            resp = await test_client.post(CHAT_URL, json=payload, headers=headers, timeout=httpx.Timeout(timeout_s))
             lat = time.time() - start
             if resp.status_code == 200:
                 return {"success": True, "latency_ms": round(lat * 1000, 1)}
