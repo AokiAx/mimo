@@ -336,7 +336,7 @@ def make_free_api_backends() -> list[dict[str, Any]]:
         entries.append({
             "id": f"freeapi-{channel.channel_id}",
             "name": f"免费API:{channel.label}",
-            "base_url": "https://api.xiaomimimo.com/api/free-ai",
+            "base_url": "https://api.xiaomimimo.com/api/free-ai/openai/chat",
             "models": models,
             "api_key": channel.jwt or "",
             "weight": weight,
@@ -345,7 +345,7 @@ def make_free_api_backends() -> list[dict[str, Any]]:
             "metadata": {
                 "type": "free_api",
                 "channel_id": channel.channel_id,
-                "is_proxy": channel.is_proxy,
+                "is_proxy": channel.is_proxy, "proxy_url": channel.proxy_url,
             },
         })
     return entries

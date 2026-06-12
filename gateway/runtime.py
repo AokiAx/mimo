@@ -105,9 +105,9 @@ _total_requests: int = 0
 
 
 def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
-    meta: dict[str, str] = {}
+    meta: dict[str, Any] = dict(entry.get("metadata") or {})
     name = entry.get("name") or ""
-    if name:
+    if name and "name" not in meta:
         meta["name"] = name
     api_key = entry.get("api_key") or secrets.upstream_api_key
     models = entry.get("models") or []
@@ -116,7 +116,7 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
     lifecycle = entry.get("lifecycle") or "active"
     if lifecycle not in {"standby", "warming", "active", "draining", "failed", "disabled"}:
         lifecycle = "active"
-    return Backend(
+    backend = Backend(
         backend_id=entry["id"],
         base_url=entry["base_url"],
         models=[m for m in models if isinstance(m, str) and m],
@@ -132,6 +132,15 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         in_detection=bool(entry.get("in_detection", False)),
         detection_entered_at=float(entry.get("detection_entered_at") or 0.0),
     )
+    if backend.metadata.get("type") == "free_api":
+        # Prefer direct egress first; spill into proxies only when direct has in-flight load.
+        if backend.metadata.get("is_proxy"):
+            backend.weight = 1
+            backend.max_in_flight = 1
+        else:
+            backend.weight = 50
+            backend.max_in_flight = 2
+    return backend
 
 
 def _build_backends_from_store() -> list[Backend]:
@@ -836,14 +845,37 @@ async def _run_readiness_checks(backend: Backend) -> tuple[bool, str, float]:
 
 async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
     assert _transport is not None
-    url = backend.base_url.rstrip("/") + "/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
-    if backend.api_key:
-        headers["Authorization"] = f"Bearer {backend.api_key}"
+    proxy_url = None
+    if backend.metadata and backend.metadata.get("type") == "free_api":
+        url = backend.base_url.rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        # Fetch fresh JWT from pool
+        try:
+            from gateway.free_api import get_pool
+            pool = get_pool()
+            ch_id = backend.metadata.get("channel_id", "")
+            for ch in pool.get_channels():
+                if ch.channel_id == ch_id and ch.jwt:
+                    headers["Authorization"] = f"Bearer {ch.jwt}"
+                    break
+            else:
+                if backend.api_key:
+                    headers["Authorization"] = f"Bearer {backend.api_key}"
+        except Exception:
+            if backend.api_key:
+                headers["Authorization"] = f"Bearer {backend.api_key}"
+        headers["X-Mimo-Source"] = "mimocode-cli-free"
+        proxy_url = backend.metadata.get("proxy_url")
+    else:
+        url = backend.base_url.rstrip("/") + "/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if backend.api_key:
+            headers["Authorization"] = f"Bearer {backend.api_key}"
     try:
         if body.get("stream"):
             status, raw_iter = await _transport.post_stream(
                 url, body, headers=headers, timeout_s=_READINESS_MAX_STREAM_SECONDS,
+                proxy=proxy_url,
             )
             if status >= 400:
                 return False, f"http {status}"
@@ -857,6 +889,7 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
 
         status, raw = await _transport.post_json(
             url, body, headers=headers, timeout_s=_PROBE_TIMEOUT_S,
+            proxy=proxy_url,
         )
         if status >= 400:
             return False, f"http {status}: {raw[:200]!r}"

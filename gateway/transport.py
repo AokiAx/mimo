@@ -64,7 +64,8 @@ class HttpxTransport:
         max_connections: int = 100,
         trust_env: bool = False,
     ):
-        limits = httpx.Limits(
+        self._connect_timeout = connect_timeout_s
+        self._limits = httpx.Limits(
             max_connections=max_connections,
             max_keepalive_connections=keepalive,
         )
@@ -72,7 +73,7 @@ class HttpxTransport:
         # upstream URL, so any system-level HTTP proxy (e.g. WinINET WPAD)
         # interfering with that traffic is a misconfiguration, not a feature.
         self._client = httpx.AsyncClient(
-            limits=limits,
+            limits=self._limits,
             timeout=httpx.Timeout(connect_timeout_s),
             trust_env=trust_env,
         )
@@ -87,9 +88,19 @@ class HttpxTransport:
         *,
         headers: dict[str, str] | None = None,
         timeout_s: float = 60.0,
+        proxy: str | None = None,
     ) -> tuple[int, bytes]:
         try:
-            resp = await self._client.post(
+            client = self._client
+            if proxy:
+                ckey = f"_pxy_{hash(proxy)}"
+                if not hasattr(self, ckey):
+                    setattr(self, ckey, httpx.AsyncClient(
+                        limits=self._limits, timeout=httpx.Timeout(self._connect_timeout),
+                        proxy=proxy, trust_env=False,
+                    ))
+                client = getattr(self, ckey)
+            resp = await client.post(
                 url, json=body, headers=headers or {},
                 timeout=httpx.Timeout(timeout_s),
             )
@@ -111,10 +122,22 @@ class HttpxTransport:
         *,
         headers: dict[str, str] | None = None,
         timeout_s: float = 600.0,
+        proxy: str | None = None,
     ) -> tuple[int, AsyncIterator[bytes]]:
+        client = self._client
+        if proxy:
+            ckey = f"_pxy_{hash(proxy)}"
+            if not hasattr(self, ckey):
+                setattr(self, ckey, httpx.AsyncClient(
+                    limits=self._limits,
+                    timeout=httpx.Timeout(self._connect_timeout),
+                    proxy=proxy,
+                    trust_env=False,
+                ))
+            client = getattr(self, ckey)
         # stream() returns a context manager; we manage it via the iterator
         # so the caller drains the body before we close it.
-        ctx_mgr = self._client.stream(
+        ctx_mgr = client.stream(
             "POST", url, json=body, headers=headers or {},
             timeout=httpx.Timeout(timeout_s),
         )
