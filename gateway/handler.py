@@ -74,7 +74,7 @@ _PROTOCOL_TAG = {
 # claw-side proxy rotates it), and a 429 means that account hit its quota — both
 # are worth retrying on a *different* backend. When every attempt fails we
 # surface a single friendly "high load" 503 instead of a raw per-backend error.
-_MAX_ATTEMPTS = 2
+_MAX_ATTEMPTS = 8
 
 # Upstream HTTP statuses worth retrying on another backend (in addition to any
 # 5xx). 401: stale rotated key on one node. 429: that account is rate-limited.
@@ -336,9 +336,22 @@ class GatewayHandler:
         started = time.monotonic()
         try:
             try:
+                pxy = backend.metadata.get("proxy_url") if backend.metadata else None
+                send_body = upstream_body
+                if backend.metadata and backend.metadata.get("type") == "free_api":
+                    send_body = dict(upstream_body)
+                    send_body["model"] = "mimo-auto"
+                    # free api reasoning often consumes all tokens; raise tiny requests to a safer floor
+                    try:
+                        mt = int(send_body.get("max_tokens") or 0)
+                    except Exception:
+                        mt = 0
+                    if mt and mt < 200:
+                        send_body["max_tokens"] = 200
                 status, raw = await self._transport.post_json(
-                    ctx.upstream_url, upstream_body,
+                    ctx.upstream_url, send_body,
                     headers=headers, timeout_s=self._upstream_timeout_s,
+                    proxy=pxy,
                 )
             except GatewayError as e:
                 self._record_metric(ctx, backend.backend_id, 0,
@@ -419,9 +432,21 @@ class GatewayHandler:
         backend.inc_in_flight()
         started = time.monotonic()
         try:
+            pxy = backend.metadata.get("proxy_url") if backend.metadata else None
+            send_body = upstream_body
+            if backend.metadata and backend.metadata.get("type") == "free_api":
+                send_body = dict(upstream_body)
+                send_body["model"] = "mimo-auto"
+                try:
+                    mt = int(send_body.get("max_tokens") or 0)
+                except Exception:
+                    mt = 0
+                if mt and mt < 200:
+                    send_body["max_tokens"] = 200
             status, raw_iter = await self._transport.post_stream(
-                ctx.upstream_url, upstream_body,
+                ctx.upstream_url, send_body,
                 headers=headers, timeout_s=self._upstream_timeout_s,
+                proxy=pxy,
             )
         except GatewayError as e:
             backend.dec_in_flight()
@@ -511,7 +536,11 @@ class GatewayHandler:
             request_id=ctx.request_id, model=model, exclude=exclude,
         )
         ctx.target_backend_id = backend.backend_id
-        ctx.upstream_url = backend.base_url.rstrip("/") + (upstream_path or self._upstream_path)
+        # Free API backends use the full URL as-is (upstream_path="")
+        if backend.metadata and backend.metadata.get("type") == "free_api":
+            ctx.upstream_url = backend.base_url.rstrip("/")
+        else:
+            ctx.upstream_url = backend.base_url.rstrip("/") + (upstream_path or self._upstream_path)
         ctx.decide(f"route:{backend.backend_id}:{decision.reason}")
         if self._decision_log is not None:
             try:
@@ -523,6 +552,22 @@ class GatewayHandler:
     @staticmethod
     def _headers_for(backend) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
+        if backend.metadata and backend.metadata.get("type") == "free_api":
+            headers["X-Mimo-Source"] = "mimocode-cli-free"
+            try:
+                from gateway.free_api import get_pool
+                ch_id = backend.metadata.get("channel_id", "")
+                for ch in get_pool().get_channels():
+                    if ch.channel_id == ch_id and ch.jwt:
+                        headers["Authorization"] = f"Bearer {ch.jwt}"
+                        break
+                else:
+                    if backend.api_key:
+                        headers["Authorization"] = f"Bearer {backend.api_key}"
+            except Exception:
+                if backend.api_key:
+                    headers["Authorization"] = f"Bearer {backend.api_key}"
+            return headers
         if backend.api_key:
             headers["Authorization"] = f"Bearer {backend.api_key}"
         return headers

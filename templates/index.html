@@ -275,6 +275,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <span class="icon">⚡</span><span>网关状态</span>
       <span class="badge green" id="gwBadge">正常</span>
     </div>
+    <div class="nav-item" data-page="freeapi" onclick="switchPage('freeapi')">
+      <span class="icon">🌐</span><span>代理配置</span>
+    </div>
     <div class="nav-item" data-page="backends" onclick="switchPage('backends')">
       <span class="icon">🖥️</span><span>后端</span>
     </div>
@@ -818,7 +821,61 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
           <button class="btn btn-ghost" onclick="refreshSecrets()">重新加载</button>
         </div>
       </div>
+    
+</div>
+
+<div class="page" id="page-freeapi">
+  <div class="topbar">
+    <div class="topbar-title">🌐 代理配置</div>
+    <div class="topbar-right">MiMo Free API 多通道管理</div>
+  </div>
+  <div class="content">
+    <div class="section">
+      <h2>⚙️ 基本设置</h2>
+      <div style="display:grid;gap:12px;grid-template-columns:1fr 1fr;max-width:700px">
+        <div>
+          <label style="display:block;font-size:0.82rem;color:var(--text2);margin-bottom:4px">启用免费API</label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="fa-enabled" onchange="saveFreeApiConfig()">
+            <span>启用</span>
+          </label>
+        </div>
+        <div>
+          <label style="display:block;font-size:0.82rem;color:var(--text2);margin-bottom:4px">模型列表</label>
+          <input type="text" id="fa-models" placeholder="mimo-auto,mimo-v2.5-pro,..." onchange="saveFreeApiConfig()">
+        </div>
+      </div>
     </div>
+
+    <div class="section">
+      <h2>📡 本机直连IP</h2>
+      <div style="margin-bottom:10px;font-size:0.82rem;color:var(--text2)">
+        直接使用本机IP请求MiMo免费API，不经过代理。填"auto"用默认IP，也可指定具体本地IP。
+      </div>
+      <div id="fa-direct-ips"></div>
+      <button class="btn btn-ghost" onclick="addDirectIpField()" style="margin-top:8px">+ 添加本机IP</button>
+    </div>
+
+    <div class="section">
+      <h2>🔌 VLESS代理节点</h2>
+      <div style="margin-bottom:10px;font-size:0.82rem;color:var(--text2)">
+        通过本地sing-box代理端口转发请求。每个端口对应一个VLESS节点。
+      </div>
+      <div id="fa-proxy-ports"></div>
+      <button class="btn btn-ghost" onclick="addProxyPortField()" style="margin-top:8px">+ 添加代理端口</button>
+    </div>
+
+    <div class="section">
+      <h2>📊 通道状态</h2>
+      <div id="fa-loading">加载中...</div>
+      <div id="fa-channels" style="display:none">
+        <div id="fa-channels-table" style="overflow-x:auto"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
 
   </div><!-- /content -->
 </div><!-- /main -->
@@ -2905,6 +2962,196 @@ document.getElementById('ssoCode').addEventListener('keydown', function(e) {
 document.getElementById('ssoPassword').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') { e.preventDefault(); ssoLogin(); }
 });
+</script>
+
+<script>
+// ── Free API / Proxy Config ──
+
+function addDirectIpField() {
+  const container = document.getElementById('fa-direct-ips');
+  const div = document.createElement('div');
+  div.style.marginBottom = '6px';
+  div.style.display = 'flex';
+  div.style.gap = '6px';
+  div.innerHTML = '<input type="text" placeholder="auto 或 154.219.100.236" style="flex:1;font-family:monospace" onchange="saveFreeApiConfig()">'
+    + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
+  container.appendChild(div);
+}
+
+function addProxyPortField() {
+  const container = document.getElementById('fa-proxy-ports');
+  const div = document.createElement('div');
+  div.style.marginBottom = '6px';
+  div.style.display = 'flex';
+  div.style.gap = '6px';
+  div.innerHTML = '<input type="number" placeholder="11000" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
+    + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
+  container.appendChild(div);
+}
+
+async function loadFreeApiConfig() {
+  const loadEl = document.getElementById('fa-loading');
+  const channelsEl = document.getElementById('fa-channels');
+  loadEl.style.display = 'block';
+  loadEl.textContent = '加载中...';
+  channelsEl.style.display = 'none';
+
+  try {
+    const resp = await fetch('/api/free-api/config');
+    const data = await resp.json();
+
+    document.getElementById('fa-enabled').checked = data.enabled || false;
+    document.getElementById('fa-models').value = (data.models || []).join(',');
+
+    // Direct IPs
+    const dc = document.getElementById('fa-direct-ips');
+    dc.innerHTML = '';
+    const ips = (data.direct_ips && data.direct_ips.length) ? data.direct_ips : ['auto'];
+    ips.forEach(ip => {
+      const div = document.createElement('div');
+      div.style.marginBottom = '6px';
+      div.style.display = 'flex';
+      div.style.gap = '6px';
+      div.innerHTML = '<input type="text" value="' + ip.replace(/"/g,'&quot;') + '" style="flex:1;font-family:monospace" onchange="saveFreeApiConfig()">'
+        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
+      dc.appendChild(div);
+    });
+
+    // Proxy ports
+    const pc = document.getElementById('fa-proxy-ports');
+    pc.innerHTML = '';
+    (data.proxy_ports || []).forEach(port => {
+      const div = document.createElement('div');
+      div.style.marginBottom = '6px';
+      div.style.display = 'flex';
+      div.style.gap = '6px';
+      div.innerHTML = '<input type="number" value="' + port + '" style="flex:1;font-family:monospace" min="1024" max="65535" onchange="saveFreeApiConfig()">'
+        + '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();saveFreeApiConfig()" style="flex-shrink:0">删除</button>';
+      pc.appendChild(div);
+    });
+
+    // Channels table
+    loadEl.style.display = 'none';
+    channelsEl.style.display = 'block';
+    const tableEl = document.getElementById('fa-channels-table');
+
+    if (data.channels && data.channels.length > 0) {
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:0.82rem">';
+      html += '<thead><tr style="border-bottom:1px solid var(--border);color:var(--text3)">';
+      html += '<th style="padding:8px 6px;text-align:left">通道ID</th>';
+      html += '<th style="padding:8px 6px;text-align:left">类型</th>';
+      html += '<th style="padding:8px 6px;text-align:left">目标</th>';
+      html += '<th style="padding:8px 6px;text-align:center">健康</th>';
+      html += '<th style="padding:8px 6px;text-align:center">JWT</th>';
+      html += '<th style="padding:8px 6px;text-align:right">过期时间</th>';
+      html += '<th style="padding:8px 6px;text-align:center">操作</th>';
+      html += '</tr></thead><tbody>';
+
+      data.channels.forEach(ch => {
+        const expiresMin = ch.jwt_expires_in ? Math.floor(ch.jwt_expires_in / 60) + 'm' : '-';
+        const healthIcon = ch.healthy ? '<span class="indicator green"></span>' : '<span class="indicator red"></span>';
+        const jwtIcon = ch.has_jwt ? '<span class="indicator green"></span>' : '<span class="indicator gray"></span>';
+        const typeText = ch.type === 'direct' ? '直连' : '代理';
+
+        html += '<tr style="border-bottom:1px solid var(--border)">';
+        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.id + '</td>';
+        html += '<td style="padding:8px 6px">' + typeText + '</td>';
+        html += '<td style="padding:8px 6px;font-family:monospace;font-size:0.75rem">' + ch.target + '</td>';
+        html += '<td style="padding:8px 6px;text-align:center">' + healthIcon + '</td>';
+        html += '<td style="padding:8px 6px;text-align:center">' + jwtIcon + '</td>';
+        html += '<td style="padding:8px 6px;text-align:right;font-size:0.75rem">' + expiresMin + '</td>';
+        html += '<td style="padding:8px 6px;text-align:center">';
+        html += '<button class="btn btn-ghost" onclick="testChannel(\'' + ch.id + '\')" style="font-size:0.75rem;padding:2px 8px">测试</button>';
+        html += '</td></tr>';
+
+        if (ch.last_error) {
+          html += '<tr style="border-bottom:1px solid var(--border)">';
+          html += '<td colspan="7" style="padding:2px 6px 8px;font-size:0.75rem;color:var(--red)">\u26a0 ' + ch.escaped_error + '</td>';
+          html += '</tr>';
+        }
+      });
+
+      html += '</tbody></table>';
+      tableEl.innerHTML = html;
+    } else {
+      tableEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)">暂无通道，请先启用并配置</div>';
+    }
+  } catch(e) {
+    loadEl.textContent = '\u274c 加载失败: ' + e.message;
+  }
+}
+
+async function saveFreeApiConfig() {
+  const enabled = document.getElementById('fa-enabled').checked;
+  const modelsRaw = document.getElementById('fa-models').value;
+  const models = modelsRaw.split(',').map(s => s.trim()).filter(Boolean);
+
+  const directIps = [];
+  document.querySelectorAll('#fa-direct-ips input').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) directIps.push(v);
+  });
+
+  const proxyPorts = [];
+  document.querySelectorAll('#fa-proxy-ports input').forEach(inp => {
+    const v = parseInt(inp.value);
+    if (!isNaN(v) && v > 0) proxyPorts.push(v);
+  });
+
+  try {
+    const resp = await fetch('/api/free-api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: enabled, models: models, direct_ips: directIps, proxy_ports: proxyPorts}),
+    });
+    const result = await resp.json();
+    if (result.success) {
+      showToast('\u2714 配置已保存', 'success');
+      loadFreeApiConfig();
+    } else {
+      showToast('\u274c ' + (result.error || '保存失败'), 'error');
+    }
+  } catch(e) {
+    showToast('\u274c ' + e.message, 'error');
+  }
+}
+
+async function testChannel(channelId) {
+  showToast('\ud83d\udd0d 测试中...', '');
+  try {
+    const resp = await fetch('/api/free-api/test/' + encodeURIComponent(channelId), {method: 'POST'});
+    const result = await resp.json();
+    if (result.success) {
+      showToast(channelId + ' \u2714\ufe0f ' + result.latency_ms + 'ms', 'success');
+    } else {
+      showToast(channelId + ' \u274c ' + result.error, 'error');
+    }
+  } catch(e) {
+    showToast('\u274c ' + e.message, 'error');
+  }
+}
+
+// Hook page switch
+(function() {
+  const orig = window.switchPage;
+  if (orig) {
+    window.switchPage = function(page) {
+      orig(page);
+      if (page === 'freeapi') loadFreeApiConfig();
+    };
+  }
+})();
+
+// Hook page switch
+(function() {
+  const orig = window.switchPage;
+  if (orig) {
+    window.switchPage = function(page) {
+      orig(page);
+      if (page === 'freeapi') loadFreeApiConfig();
+    };
+  }
+})();
 </script>
 </body>
 </html>
