@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -98,14 +99,14 @@ class FakeTransport:
         self.json_timeouts = []
         self.stream_timeouts = []
 
-    async def post_json(self, url, body, *, headers=None, timeout_s=60.0):
+    async def post_json(self, url, body, *, headers=None, timeout_s=60.0, proxy=None):
         self.json_bodies.append(body)
         self.json_timeouts.append(timeout_s)
         if body.get("tools"):
             return 200, b'{"choices":[{"message":{"tool_calls":[{"id":"call_1"}]}}]}'
         return 200, b'{"choices":[{"message":{"content":"ok"}}]}'
 
-    async def post_stream(self, url, body, *, headers=None, timeout_s=600.0):
+    async def post_stream(self, url, body, *, headers=None, timeout_s=600.0, proxy=None):
         self.stream_bodies.append(body)
         self.stream_timeouts.append(timeout_s)
 
@@ -194,6 +195,45 @@ def test_readiness_without_models_fails_explicitly(monkeypatch):
     assert "backend has no configured models" in reason
     assert fake.json_bodies == []
     assert fake.stream_bodies == []
+
+
+def test_start_probe_does_not_attempt_removed_free_api_pool(monkeypatch, caplog):
+    async def idle_loop():
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(runtime, "_probe_loop", idle_loop)
+    monkeypatch.setattr(runtime, "_rotation_loop", idle_loop)
+
+    async def scenario():
+        with caplog.at_level(logging.ERROR):
+            runtime.start_probe()
+            await asyncio.sleep(0)
+
+        tasks = [runtime._probe_task, runtime._rotation_task]
+        monkeypatch.setattr(runtime, "_probe_task", None)
+        monkeypatch.setattr(runtime, "_rotation_task", None)
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert "free API pool" not in caplog.text
+
+
+def test_shutdown_does_not_attempt_removed_free_api_pool(caplog):
+    async def scenario():
+        with caplog.at_level(logging.ERROR):
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+    assert "free API pool" not in caplog.text
 
 
 def test_persist_backend_runtime_state_logs_failures(monkeypatch, caplog):

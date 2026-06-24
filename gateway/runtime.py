@@ -1,6 +1,7 @@
 """Gateway runtime — wires the handler pipeline into app.py.
 
-Backends live in ``data/backends.json`` (managed by ``backend_store``).
+Backends live in the ``backends`` section of ``data/config.json`` (managed by
+``backend_store``).
 Credentials come from ``data/secrets.json`` (managed by ``secrets_store``).
 
 The runtime owns backend lifecycle for account rotation:
@@ -57,8 +58,9 @@ _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
-# Account-rotation defaults. Cloud deployments are expected to live for about
-# one hour; rotate at 50 minutes to leave room for deploy + readiness checks.
+# Gateway-side standby warm-up cadence. Claw free-tier TTL/account relay is
+# driven by ``claw.claw_activity``; this loop only nudges already-configured
+# peer backends toward readiness when they exist.
 _ROTATION_INTERVAL_S = 50 * 60.0
 _READINESS_INTERVAL_S = 10.0
 _READINESS_REQUIRED_SUCCESSES = 1
@@ -135,7 +137,7 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
 
 
 def _build_backends_from_store() -> list[Backend]:
-    """Read ``data/backends.json`` and produce Backend objects."""
+    """Read the persisted backends config and produce Backend objects."""
     return [_build_backend_from_entry(entry) for entry in _list_persisted()]
 
 
@@ -181,7 +183,7 @@ def _make_metrics_recorder():
 
 
 def reload_backends() -> int:
-    """Re-read ``backends.json`` and reconcile the in-memory registry.
+    """Re-read persisted backend config and reconcile the in-memory registry.
 
     Existing Backend objects keep EWMA, breaker, and in-flight state. Removed
     backends are marked draining instead of being dropped while requests are in
@@ -962,14 +964,6 @@ def start_probe() -> None:
     """Idempotent. Spawns background liveness and rotation tasks."""
     global _probe_task, _rotation_task
     _ensure_initialized()
-    # Start the free API pool (channel management + JWT refresh)
-    try:
-        pool = get_pool()
-        pool.start()
-        loop = asyncio.get_running_loop()
-        loop.create_task(pool.start_async())
-    except Exception:
-        logger.exception("[startup] Failed to start free API pool")
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -983,12 +977,6 @@ def start_probe() -> None:
 async def shutdown() -> None:
     """Close runtime-owned background resources."""
     global _probe_task, _rotation_task
-    # Shut down the free API pool
-    try:
-        pool = get_pool()
-        await pool.shutdown()
-    except Exception:
-        logger.exception("[shutdown] Failed to stop free API pool")
     tasks = (_probe_task, _rotation_task)
     _probe_task = None
     _rotation_task = None

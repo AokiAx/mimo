@@ -1186,12 +1186,13 @@ def cancel_deploy(account_filename: str) -> dict:
 def start_scheduler():
     """No-op: cron-based scheduled deploys were removed.
 
-    Claw rotation is now driven entirely by the activity loop
-    (:mod:`claw.claw_activity`): a proactive *expiry rotation* recreates a Claw
-    as it nears its ~60-min MiMo TTL, and a *health-failure* redeploy fires when
-    the tunnel stays down. Both go through :func:`trigger_deploy`, which drains
-    the backend and waits for in-flight requests to finish before replacing the
-    Claw — so we never cut live traffic on a fixed clock the way cron did.
+    Claw lifecycle is now driven entirely by the activity loop
+    (:mod:`claw.claw_activity`): a proactive relay cold-starts another account
+    before the current ~4h Claw expires, and a health-failure redeploy fires
+    when the tunnel stays down. Both go through :func:`trigger_deploy`, which
+    drains the backend and waits for in-flight requests to finish before
+    replacing the Claw — so we never cut live traffic on a fixed clock the way
+    cron did.
     Kept as a no-op so existing callers/tests that import it don't break.
     """
     logger_module.info(

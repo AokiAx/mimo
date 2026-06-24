@@ -18,11 +18,11 @@ class FakeTransport:
         self.responses = responses
         self.calls: list[str] = []
 
-    async def post_json(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=60.0):
+    async def post_json(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=60.0, proxy=None):
         self.calls.append(url)
         return self.responses[url]
 
-    async def post_stream(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=600.0):
+    async def post_stream(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=600.0, proxy=None):
         raise AssertionError("stream not used")
 
     async def close(self):
@@ -34,10 +34,10 @@ class FakeStreamTransport:
         self.chunks = chunks
         self.calls: list[str] = []
 
-    async def post_json(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=60.0):
+    async def post_json(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=60.0, proxy=None):
         raise AssertionError("json not used")
 
-    async def post_stream(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=600.0):
+    async def post_stream(self, url: str, body: dict[str, Any], *, headers=None, timeout_s=600.0, proxy=None):
         self.calls.append(url)
 
         async def gen():

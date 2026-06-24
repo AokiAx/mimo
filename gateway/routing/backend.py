@@ -39,7 +39,7 @@ class Backend:
     consecutive_failures: int = 0
     last_error: str = ""
 
-    # Enable/disable (user-controlled, persisted in backends.json)
+    # Enable/disable (user-controlled, persisted in data/config.json)
     enabled: bool = True
 
     # Lifecycle / rotation

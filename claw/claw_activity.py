@@ -2,7 +2,7 @@
 reverse tunnel healthy by talking to it like a real operator would.
 
 Why this exists (vs a dumb claw-side cron):
-  * A Claw stays AVAILABLE on the MiMo side for its ~60-min TTL, but its
+  * A Claw stays AVAILABLE on the MiMo side for its ~4h TTL, but its
     nohup'd reverse-tunnel / api-proxy processes can die with nothing to
     revive them — so the backend silently goes offline minutes after a
     successful deploy. (See deploy_logs: tunnel up at Step 4, gone soon after.)
@@ -44,19 +44,13 @@ _TICK_S = 20                   # scheduler granularity
 _ESCALATE_AFTER_UNHEALTHY = 2
 _HISTORY_MAX = 15              # per-account rolling transcript kept for the panel
 
-# Proactive expiry rotation. A MiMo Claw is hard-reclaimed at its ~60-min TTL;
-# rather than wait for the tunnel to die (and cut live requests), we recreate it
-# a few minutes early. Each claw gets a jittered target age in
-# [_ROTATION_MIN_AGE_S, _ROTATION_MAX_AGE_S] so the fleet rotates staggered, not
-# all at once. "age" is the backend's active_for_s (time since it went active ≈
-# time since the claw was deployed). trigger_deploy itself drains the backend
-# and waits for in-flight requests before replacing, so this is graceful.
-# NOTE (2026-06): MiMo changed the free-tier Claw lifecycle — TTL is now ~4h
-# (was ~60min) and an account may create only ONE Claw per calendar day (Beijing). So we no longer
-# electively rotate a single account to stay up 24/7; instead the fleet rotates
-# ACROSS accounts (a used account cools down for 24h; a fresh available account
-# is cold-started next). Elective same-account rotation is therefore disabled.
-_ROTATION_MIN_AGE_S = 3 * 60 * 60      # (legacy) earliest a claw may be electively rotated
+# Proactive expiry relay. MiMo free-tier Claws are now hard-reclaimed at ~4h,
+# and an account may create only ONE Claw per Beijing calendar day. We no
+# longer electively rotate a single account to stay up 24/7; instead the fleet
+# relays ACROSS accounts (a used account cools down for the day; a fresh
+# available account is cold-started before the current one expires). The legacy
+# age window is retained only as a same-account safety guard.
+_ROTATION_MIN_AGE_S = 3 * 60 * 60      # earliest same-account rebuild guard
 _ROTATION_MAX_AGE_S = 3 * 60 * 60 + 45 * 60  # ~15 min before the 4h hard TTL
 
 _SCRIPTS_DIR = "/root/.openclaw/workspace/scripts"
@@ -305,7 +299,7 @@ def _account_age_and_peer(account: str) -> tuple[float, bool]:
 
 
 def _remaining_ttl_s(account: str) -> float:
-    """Estimated seconds until MiMo reclaims this Claw (~60 min hard TTL)."""
+    """Estimated seconds until MiMo reclaims this Claw (~4h hard TTL)."""
     age, _ = _account_age_and_peer(account)
     if age <= 0:
         return float(_MIMO_HARD_TTL_S)

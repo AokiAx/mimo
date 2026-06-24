@@ -8,9 +8,6 @@
   "panel_acl": {
     "allowed_ips": []
   },
-  "probe_nodes": {
-    "nodes": {}
-  },
   "ssh_targets": {
     "panel_key_path": "data/panel_tunnel_key",
     "default_target": "vps1",

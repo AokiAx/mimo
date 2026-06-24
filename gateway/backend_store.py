@@ -1,4 +1,4 @@
-"""Persistent backend store — CRUD for data/backends.json.
+"""Persistent backend store — CRUD for the backends section of data/config.json.
 
 Each entry is a dict with:
   id, name, base_url, models (list[str]), api_key, weight, enabled, account_id

@@ -1,7 +1,7 @@
 """Single consolidated config file for the gateway + deploy stores.
 
-Backends, panel ACL, probe nodes, auto-deploy schedule, SSH targets and the
-aistudio pin used to live in separate data/*.json files. They are all small,
+Backends, panel ACL, auto-deploy schedule, SSH targets and the aistudio pin
+used to live in separate data/*.json files. They are all small,
 human-editable config, so we keep them as named sections of ONE file
 (data/config.json) to cut down on the pile of runtime files while staying
 hand-editable.

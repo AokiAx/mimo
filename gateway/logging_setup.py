@@ -47,6 +47,16 @@ def _build_handler(path: Path, *, level: int, retention_days: int) -> TimedRotat
     return handler
 
 
+def _same_log_file(handler: logging.Handler, path: Path) -> bool:
+    raw = getattr(handler, "baseFilename", None)
+    if not raw:
+        return False
+    try:
+        return Path(raw).resolve() == path.resolve()
+    except OSError:
+        return False
+
+
 def setup_logging(base_dir: str | Path) -> Path:
     """Configure root logging with daily rotation and retention.
 
@@ -66,11 +76,25 @@ def setup_logging(base_dir: str | Path) -> Path:
     root = logging.getLogger()
     root.setLevel(root_level)
 
-    existing = {getattr(h, "name", "") for h in root.handlers}
     for name, level in (("app.log", logging.INFO), ("error.log", logging.ERROR)):
         handler_name = f"mimo-file-{name}"
-        if handler_name not in existing:
-            root.addHandler(_build_handler(log_dir / name, level=level, retention_days=retention_days))
+        target = log_dir / name
+        existing = [
+            h for h in root.handlers
+            if getattr(h, "name", "") == handler_name
+        ]
+        reusable = False
+        for handler in existing:
+            if _same_log_file(handler, target):
+                handler.setLevel(level)
+                if isinstance(handler, TimedRotatingFileHandler):
+                    handler.backupCount = retention_days
+                reusable = True
+                continue
+            root.removeHandler(handler)
+            handler.close()
+        if not reusable:
+            root.addHandler(_build_handler(target, level=level, retention_days=retention_days))
 
     # Ensure uvicorn loggers propagate into the file handlers while preserving
     # their console output handlers.

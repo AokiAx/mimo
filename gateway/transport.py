@@ -39,6 +39,7 @@ class UpstreamTransport(Protocol):
         *,
         headers: dict[str, str] | None = None,
         timeout_s: float = 60.0,
+        proxy: str | None = None,
     ) -> tuple[int, bytes]: ...
 
     async def post_stream(
@@ -48,6 +49,7 @@ class UpstreamTransport(Protocol):
         *,
         headers: dict[str, str] | None = None,
         timeout_s: float = 600.0,
+        proxy: str | None = None,
     ) -> tuple[int, AsyncIterator[bytes]]: ...
 
     async def close(self) -> None: ...

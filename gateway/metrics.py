@@ -3,10 +3,9 @@ SQLite-backed metrics for gateway requests.
 
 Two consumers write here:
 
-* The legacy ``gateway.proxy.proxy_request`` calls ``record_request``.
-* The new pipeline (``gateway.handler.GatewayHandler``) accepts a
-  ``MetricsRecorder`` protocol; ``SQLiteMetricsRecorder`` below is the
-  implementation we plug in.
+* ``gateway.handler.GatewayHandler`` accepts a ``MetricsRecorder`` protocol;
+  ``SQLiteMetricsRecorder`` below is the synchronous implementation, while
+  ``QueuedSQLiteMetricsRecorder`` is used on the request hot path.
 
 The schema is one row per finished request. It carries enough columns to
 build the panel's 24h dashboard, per-backend stats, and the public

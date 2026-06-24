@@ -200,12 +200,15 @@ def reset_for_tests() -> None:
 def _writer_loop() -> None:
     """Background worker: pull entries off the queue and batch-write."""
     path = _db_path()
+    work_queue = _write_queue
+    if work_queue is None:
+        return
     conn = sqlite3.connect(str(path), check_same_thread=False)
     last_purge = time.time()
     try:
         while True:
             try:
-                first = _write_queue.get(timeout=_WORKER_DRAIN_TIMEOUT_S)  # type: ignore[union-attr]
+                first = work_queue.get(timeout=_WORKER_DRAIN_TIMEOUT_S)
             except queue.Empty:
                 if _writer_stop.is_set():
                     return
@@ -215,30 +218,21 @@ def _writer_loop() -> None:
                     last_purge = time.time()
                 continue
             if first is None:
+                work_queue.task_done()
                 return
 
             batch = [first]
             # Drain any other pending items so we commit them in one
             # transaction — turns N requests into 1 fsync.
+            saw_shutdown = False
             while True:
                 try:
-                    nxt = _write_queue.get_nowait()  # type: ignore[union-attr]
+                    nxt = work_queue.get_nowait()
                 except queue.Empty:
                     break
                 if nxt is None:
-                    # Shutdown signal received mid-drain. Flush what we have
-                    # before returning.
-                    try:
-                        conn.executemany(
-                            "INSERT OR REPLACE INTO reasoning_cache "
-                            "(tool_ids, reasoning, expires_at) "
-                            "VALUES (?, ?, ?)",
-                            batch,
-                        )
-                        conn.commit()
-                    except sqlite3.DatabaseError as e:
-                        logger.warning("reasoning_cache flush on shutdown failed: %s", e)
-                    return
+                    saw_shutdown = True
+                    break
                 batch.append(nxt)
 
             try:
@@ -254,6 +248,13 @@ def _writer_loop() -> None:
                 # disk issues.
                 logger.warning("reasoning_cache write failed (%d items): %s",
                                len(batch), e)
+            finally:
+                for _ in batch:
+                    work_queue.task_done()
+                if saw_shutdown:
+                    work_queue.task_done()
+            if saw_shutdown:
+                return
     finally:
         conn.close()
 
@@ -536,5 +537,8 @@ def flush(timeout_s: float = 2.0) -> None:
     if _write_queue is None:
         return
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline and not _write_queue.empty():
+    while (
+        time.monotonic() < deadline
+        and getattr(_write_queue, "unfinished_tasks", 0)
+    ):
         time.sleep(0.01)

@@ -202,11 +202,9 @@ async def startup_event():
             "anyone scanning can log in. Change it on the panel's 密钥管理 page "
             "or in data/secrets.json."
         )
-    # Cron-based scheduled deploys were removed. Claw rotation is now driven by
-    # the activity loop below: a proactive expiry rotation recreates a Claw as it
-    # nears its ~60-min MiMo TTL, plus health-failure redeploys — both drain
-    # in-flight requests before replacing a Claw instead of cutting them on a
-    # fixed clock. DISABLE_SCHEDULER stays the master "no auto-deploy" switch.
+    # Cron-based scheduled deploys were removed. Gateway probing/readiness starts
+    # here; Claw lifecycle relay is driven by the activity loop below.
+    # DISABLE_SCHEDULER stays the master "no auto-deploy" switch.
     try:
         from gateway.runtime import start_probe as start_router_probe
         start_router_probe()
@@ -1953,7 +1951,7 @@ async def gateway_backend_activate(backend_id: str):
 
 @app.post("/api/gateway/backends/reload")
 async def gateway_backends_reload():
-    """Re-read backends.json and rebuild the backend registry."""
+    """Re-read persisted backend config and rebuild the backend registry."""
     try:
         from gateway.runtime import reload_backends
         count = reload_backends()
