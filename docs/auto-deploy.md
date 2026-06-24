@@ -66,7 +66,7 @@ def trigger_deploy(account_filename: str) -> dict:
 |---|---|---|
 | Activity Loop 冷启动 | `enabled=true` + 无后端 | 首次部署，限频 3min |
 | Activity Loop 健康失败 | 连续 2 次健康检查失败 + TTL<20min | 全量重建 |
-| Activity Loop TTL 轮换 | 后端 age ≥ 40-55min（随机）+ 有 peer | 优雅替换 |
+| Activity Loop TTL 接力 | 当前 active 后端剩余 TTL < relay lead | 冷启动下一个可用账号，完成后单 active 切换 |
 | 面板 API | `POST /api/auto-deploy/{account}/deploy` | 手动触发 |
 
 ---
@@ -89,8 +89,8 @@ def trigger_deploy(account_filename: str) -> dict:
 ```
 ① _notify_gateway_deploy_start(account)
    → runtime.prepare_account_deploy()
-   → 有 active peer: mark_draining → 等 in-flight 完成
-   → 无 active peer: 跳过（不中断服务）
+   → 匹配到该账号 active 后端: mark_draining → 等 in-flight 完成
+   → 无匹配后端: 跳过
 
 ② GET /open-apis/user/mimo-claw/status
    ├─ force=False + AVAILABLE → reuse（跳过销毁+创建，直接 Step 2.5）
@@ -200,8 +200,8 @@ ssh -i panel_key tunnel@target "<port> ssh-ed25519 <blob> claw"
 ② _notify_gateway_deploy_done(account)
    → runtime.complete_account_deploy()
    → reload_backends()（从 config.json 重读）
-   → 有 peer → warming（后台 readiness 检查通过后激活）
-   → 无 peer → 直接 activate（部署已验证 /health）
+   → 目标后端直接 active（部署已验证 /health）
+   → 其它 active 后端进入 draining，停止接新流量
 ```
 
 ### 3.9 失败处理
@@ -209,7 +209,7 @@ ssh -i panel_key tunnel@target "<port> ssh-ed25519 <blob> claw"
 ```
 任何步骤失败:
   mark_finished("error")
-    → _notify_gateway_deploy_failed()（有 peer 时标记 failed，移出路由）
+    → _notify_gateway_deploy_failed()（标记 failed，移出路由）
     → _save_run_history()     → data/deploy_history/<account>.json
     → _save_incident_log()    → data/deploy_logs/incidents/<account>__<ts>_<uuid>.log
 ```
@@ -275,8 +275,8 @@ _notify_gateway_deploy_start(account)
   → runtime.prepare_account_deploy(account)
 
   匹配该账号的后端 →
-    有 active peer: mark_draining（停接新请求）→ 等 in-flight 完成
-    无 active peer: 跳过（不中断服务）
+    active 后端 mark_draining（停接新请求）→ 等 in-flight 完成
+    无匹配 active 后端: 跳过
 ```
 
 ### 5.2 部署后: complete_account_deploy
@@ -286,9 +286,9 @@ _notify_gateway_deploy_start(account)
 _notify_gateway_deploy_done(account)
   → runtime.complete_account_deploy(account)
 
-  reload_backends() →
-    有 peer: warming（后台 readiness 通过后激活）
-    无 peer: 直接 activate（已验证 /health）
+  reload_backends()
+  匹配该账号的后端 → 直接 activate（已验证 /health）
+  其它 active 后端 → draining
 ```
 
 ### 5.3 部署失败: fail_account_deploy
@@ -298,23 +298,20 @@ _notify_gateway_deploy_done(account)
 _notify_gateway_deploy_failed(account, error)
   → runtime.fail_account_deploy(account, error)
 
-  有 peer: mark_failed_rotation（移出路由）
-  无 peer: 保留（让 router 尝试恢复）
+  匹配后端 → mark_failed_rotation（移出路由）
 ```
 
 ### 5.4 后端生命周期状态机
 
 ```
-standby ──▶ warming ──▶ active ──▶ draining ──▶ (移除/重新 warming)
-              │                      ▲
-              │   prepare_deploy     │
-              └──────────────────────┘
+active ── prepare_deploy ──▶ draining ──▶ standby
+  ▲                              │
+  └──── complete_deploy ─────────┘
 ```
 
-- **standby**: 初始注册
-- **warming**: readiness 检查中（非流式 + 流式 + tool-call）
-- **active**: 可路由
+- **active**: 唯一可路由后端
 - **draining**: 等 in-flight 完成后移除
+- **standby**: 保留配置但不接新流量
 
 ---
 

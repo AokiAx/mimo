@@ -15,7 +15,7 @@ Flow per account (scheme B — hardened, locked-down reverse tunnel):
      forward — no shell, no other ports, even if the claw is compromised.
   4. Wait for autossh to bring the reverse tunnel up + the proxy /health to be
      reachable, then register the account's backend at http://<upstream>:<port>
-     and hand off to the gateway warmup.
+     and hand off to the gateway's single-active backend switch.
   5. Done — record run history.
 
 Targets + per-account port assignments live in data/ssh_targets.json (freely
@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -87,7 +86,7 @@ def _notify_gateway_deploy_start(account_filename: str, log: "DeployLogger") -> 
         except Exception as e:  # noqa: BLE001
             log.log(f"⚠️ Gateway drain 等待失败，将继续部署: {type(e).__name__}: {e}")
     elif matched and blocked:
-        log.log(f"⚠️ Gateway 未找到可接管的 active peer，无法预切换: {', '.join(blocked)}")
+        log.log(f"⚠️ Gateway 预切换被阻止: {', '.join(blocked)}")
     elif matched:
         log.log(f"Gateway 后端已处于非 active 状态，跳过预切换: {', '.join(matched)}")
     else:
@@ -95,19 +94,19 @@ def _notify_gateway_deploy_start(account_filename: str, log: "DeployLogger") -> 
 
 
 def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> None:
-    """Reload backend state and put the freshly verified Claw into warmup."""
+    """Reload backend state and make the freshly verified Claw the active target."""
     try:
         from gateway.runtime import complete_account_deploy
         result = complete_account_deploy(account_filename)
     except Exception as e:  # noqa: BLE001
-        log.log(f"⚠️ Gateway 自动重载/热身失败，请手动重载: {type(e).__name__}: {e}")
+        log.log(f"⚠️ Gateway 自动重载/激活失败，请手动重载: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-done hook failed for %s", account_filename)
         return
     matched = result.get("matched") or []
     warmed = result.get("warmed") or []
     activated = result.get("activated") or []
     if warmed:
-        log.log(f"Gateway 已重载并开始热身新 Claw 后端: {', '.join(warmed)}")
+        log.log(f"Gateway 已重载并保留新 Claw 后端为待激活状态: {', '.join(warmed)}")
     if activated:
         log.log(f"Gateway 已重载并激活新 Claw 后端: {', '.join(activated)}")
     if not matched:
@@ -115,7 +114,7 @@ def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> N
 
 
 def _notify_gateway_deploy_failed(account_filename: str, error: str, log: "DeployLogger") -> None:
-    """Keep a failed replacement target out of routing when a peer exists."""
+    """Keep a failed replacement target out of routing."""
     try:
         from gateway.runtime import fail_account_deploy
         result = fail_account_deploy(account_filename, error=error)
@@ -132,10 +131,12 @@ def _notify_gateway_deploy_failed(account_filename: str, error: str, log: "Deplo
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
 
-# 上游 Claw 连接约 1 小时会被硬断，提前轮换给 5-10 分钟冷启动留余量。
-_ROTATION_TARGET_AGE_S = 40 * 60
-_ROTATION_CRITICAL_AGE_S = 50 * 60
-_ROTATION_HARD_EXPIRY_AGE_S = 55 * 60
+# MiMo free-tier Claws are reclaimed at roughly 4h. Status reporting mirrors
+# the activity loop relay window: start preparing around 30 minutes before TTL,
+# treat the last 10 minutes as critical, and hard-expire at 4h.
+_ROTATION_TARGET_AGE_S = 3 * 60 * 60 + 30 * 60
+_ROTATION_CRITICAL_AGE_S = 3 * 60 * 60 + 50 * 60
+_ROTATION_HARD_EXPIRY_AGE_S = 4 * 60 * 60
 
 # Per-step timing knobs.
 _DESTROY_POLL_INTERVAL_S = 5
@@ -447,12 +448,10 @@ def _rotation_policy(enabled_count: int) -> dict:
     enabled = max(0, int(enabled_count or 0))
     if enabled <= 0:
         return {"desired_active": 0, "normal_min_active": 0, "emergency_min_active": 0}
-    normal_min = min(enabled, max(3, int(math.ceil(enabled * 0.80))))
-    emergency_min = min(enabled, max(3, int(math.floor(enabled * 0.67))))
     return {
-        "desired_active": enabled,
-        "normal_min_active": normal_min,
-        "emergency_min_active": emergency_min,
+        "desired_active": 1,
+        "normal_min_active": 1,
+        "emergency_min_active": 1,
     }
 
 
@@ -505,7 +504,7 @@ def _load_rotation_status(cfg: dict) -> dict:
         ]
         selectable = [
             b for b in matches
-            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
         ]
         age_s = max((float(b.get("active_for_s") or 0) for b in selectable), default=0.0)
         reason = _rotation_reason(age_s)
@@ -1132,7 +1131,7 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         # Register/refresh the account's backend to the reverse-tunnel upstream.
         _register_account_backend(account_filename, ssh_target, log)
 
-        # Hand off to the gateway: reload + warmup validates the model link.
+        # Hand off to the gateway: reload and switch to the verified backend.
         _notify_gateway_deploy_done(account_filename, log)
         log.log("=== \u2705 \u90e8\u7f72\u5b8c\u6210\uff08\u53cd\u5411\u96a7\u9053\u5df2\u901a\uff0c\u540e\u7aef\u5df2\u767b\u8bb0\uff09===")
         mark_finished("done", history_status="done")

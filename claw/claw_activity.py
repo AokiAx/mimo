@@ -269,12 +269,12 @@ def _verify_health(account: str) -> Optional[bool]:
         return False
 
 
-def _account_age_and_peer(account: str) -> tuple[float, bool]:
-    """Return ``(age_s, has_other_healthy_peer)`` for an account's backend.
+def _account_age_and_other_active(account: str) -> tuple[float, bool]:
+    """Return ``(age_s, has_other_healthy_active)`` for an account's backend.
 
     ``age_s`` is the max ``active_for_s`` among this account's selectable
-    backends (≈ time since the claw was deployed). ``has_other_healthy_peer`` is
-    True when at least one *other* account has a healthy active/warming backend —
+    backends (≈ time since the claw was deployed). ``has_other_healthy_active`` is
+    True when at least one *other* account has a healthy active backend —
     used to avoid electively rotating away the last serving claw.
     """
     try:
@@ -288,7 +288,7 @@ def _account_age_and_peer(account: str) -> tuple[float, bool]:
     for b in backends:
         healthy_active = bool(
             b.get("enabled", True) and b.get("healthy")
-            and b.get("lifecycle") in ("active", "warming")
+            and b.get("lifecycle") == "active"
         )
         if str(b.get("account") or "") in keys:
             if healthy_active:
@@ -300,7 +300,7 @@ def _account_age_and_peer(account: str) -> tuple[float, bool]:
 
 def _remaining_ttl_s(account: str) -> float:
     """Estimated seconds until MiMo reclaims this Claw (~4h hard TTL)."""
-    age, _ = _account_age_and_peer(account)
+    age, _ = _account_age_and_other_active(account)
     if age <= 0:
         return float(_MIMO_HARD_TTL_S)
     return max(0.0, float(_MIMO_HARD_TTL_S) - age)
@@ -454,7 +454,7 @@ def _maybe_rotate_for_expiry(account: str) -> bool:
     exists (so we never take the fleet to zero) — the health-failure path and
     MiMo's own reclaim still cover that case.
     """
-    age, has_peer = _account_age_and_peer(account)
+    age, has_other_active = _account_age_and_other_active(account)
     if age <= 0:
         return False
     with _state_lock:
@@ -468,9 +468,9 @@ def _maybe_rotate_for_expiry(account: str) -> bool:
         st["rot_last_age_s"] = age
     if age < target:
         return False
-    if not has_peer:
+    if not has_other_active:
         logger.info(
-            "[activity] %s: due for rotation (age=%.0fs) but no healthy peer; deferring",
+            "[activity] %s: due for rotation (age=%.0fs) but no other healthy active backend; deferring",
             account, age,
         )
         return False
@@ -581,7 +581,7 @@ def _count_active_with_headroom(lead_s: float) -> int:
     n = 0
     for b in backends:
         if not (b.get("enabled", True) and b.get("healthy")
-                and b.get("lifecycle") in ("active", "warming")):
+                and b.get("lifecycle") == "active"):
             continue
         remaining = float(_MIMO_HARD_TTL_S) - float(b.get("active_for_s") or 0)
         if remaining > lead_s:
@@ -607,7 +607,7 @@ def _available_for_create() -> list[str]:
     have_backend = {
         str(b.get("account") or "")
         for b in backends
-        if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+        if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
     }
     out: list[tuple[float, str]] = []
     for acc, c in (cfg.get("accounts") or {}).items():

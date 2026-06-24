@@ -50,7 +50,7 @@ def test_router_excludes_warming_and_draining_backends():
     chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
 
     assert chosen.backend_id == "active"
-    assert decision.excluded["warming"] == "warming, no readiness success yet"
+    assert decision.excluded["warming"] == "lifecycle=warming"
     assert decision.excluded["draining"] == "lifecycle=draining"
 
 
@@ -61,19 +61,32 @@ def test_router_raises_when_only_warming_backend_exists():
         router.choose(request_id="r1", model="mimo-v2.5-pro")
 
 
-def test_activate_backend_joins_load_balancing_pool_without_draining_peer(monkeypatch):
+def test_router_excludes_warming_even_after_readiness_success():
+    active = _backend("active")
+    warming = _backend("warming", lifecycle="warming")
+    warming.readiness_successes = 1
+    router = Router(BackendRegistry([warming, active]))
+
+    chosen, decision = router.choose(request_id="r1", model="mimo-v2.5-pro")
+
+    assert chosen.backend_id == "active"
+    assert decision.excluded["warming"] == "lifecycle=warming"
+
+
+def test_activate_backend_drains_existing_active_peers(monkeypatch):
     old = _backend("old")
     old.active_since = 100.0
     new = _backend("new", lifecycle="warming")
     reg = BackendRegistry([old, new])
     monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
 
     result = runtime.activate_backend("new")
 
     assert result["success"] is True
     assert new.lifecycle == "active"
-    assert old.lifecycle == "active"
-    assert old.drain_deadline == 0.0
+    assert old.lifecycle == "draining"
+    assert old.drain_deadline > 0.0
 
 
 def test_reap_drained_keeps_in_flight_until_deadline(monkeypatch, caplog):
@@ -139,29 +152,6 @@ def test_probe_one_uses_chat_completion_not_models(monkeypatch):
     assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S]
 
 
-def test_readiness_checks_cover_non_stream_stream_and_tool(monkeypatch):
-    fake = FakeTransport()
-    monkeypatch.setattr(runtime, "_transport", fake)
-    backend = _backend("candidate", lifecycle="warming")
-
-    ok, reason, latency_ms = asyncio.run(runtime._run_readiness_checks(backend))
-
-    assert ok is True
-    assert reason == "ready"
-    assert latency_ms >= 0
-    assert len(fake.json_bodies) == 2
-    assert len(fake.stream_bodies) == 1
-    assert fake.json_bodies[0]["stream"] is False
-    assert fake.json_bodies[0]["model"] == "mimo-v2.5-pro"
-    assert fake.json_timeouts == [runtime._PROBE_TIMEOUT_S, runtime._PROBE_TIMEOUT_S]
-    assert fake.stream_bodies[0]["stream"] is True
-    assert fake.stream_bodies[0]["model"] == "mimo-v2.5-pro"
-    assert fake.stream_timeouts == [runtime._READINESS_MAX_STREAM_SECONDS]
-    assert fake.json_bodies[1]["model"] == "mimo-v2.5-pro"
-    assert fake.json_bodies[1]["tools"][0]["function"]["name"] == "gateway_readiness_ping"
-    assert fake.json_bodies[1]["tool_choice"]["function"]["name"] == "gateway_readiness_ping"
-
-
 def test_readiness_model_falls_back_when_flash_unavailable():
     backend = _backend("candidate")
     backend.models = ["mimo-v2.5-pro"]
@@ -169,30 +159,14 @@ def test_readiness_model_falls_back_when_flash_unavailable():
     assert runtime._readiness_model(backend) == "mimo-v2.5-pro"
 
 
-def test_tool_readiness_accepts_structural_json_response():
-    ok, reason = runtime._raw_response_is_valid(
-        b'{"choices":[{"message":{"tool_calls":[{"id":"call_1"}]}}]}'
-    )
-    assert ok is True
-    assert reason == "ok"
-
-    ok, reason = runtime._raw_response_is_valid(
-        b'{"choices":[{"message":{"content":"no tool"}}]}'
-    )
-    assert ok is False
-    assert "no tool call" in reason
-
-
-def test_readiness_without_models_fails_explicitly(monkeypatch):
+def test_probe_without_models_fails_explicitly(monkeypatch):
     fake = FakeTransport()
     monkeypatch.setattr(runtime, "_transport", fake)
-    backend = _backend("candidate", lifecycle="warming")
+    backend = _backend("candidate", lifecycle="active")
     backend.models = []
 
-    ok, reason, _latency_ms = asyncio.run(runtime._run_readiness_checks(backend))
-
-    assert ok is False
-    assert "backend has no configured models" in reason
+    with pytest.raises(ValueError, match="backend has no configured models"):
+        runtime._readiness_non_stream_body(backend)
     assert fake.json_bodies == []
     assert fake.stream_bodies == []
 
@@ -249,39 +223,24 @@ def test_persist_backend_runtime_state_logs_failures(monkeypatch, caplog):
     assert "Failed to persist backend state for candidate" in caplog.text
 
 
-def test_concurrent_warm_and_manual_activate_keeps_all_ready_backends_active(monkeypatch):
-    old = _backend("old")
-    warm_a = _backend("warm-a", lifecycle="warming")
-    warm_b = _backend("warm-b", lifecycle="warming")
-    warm_a.last_probe_at = 0.0
-    warm_b.last_probe_at = 0.0
-    reg = BackendRegistry([old, warm_a, warm_b])
+def test_single_active_enforcement_drains_extra_active_backends(monkeypatch):
+    chosen = _backend("chosen")
+    extra_a = _backend("extra-a")
+    extra_b = _backend("extra-b")
+    reg = BackendRegistry([chosen, extra_a, extra_b])
     monkeypatch.setattr(runtime, "_registry", reg)
     monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fake_readiness(_backend):
-        entered.set()
-        await release.wait()
-        return True, "ready", 1.0
-
-    async def scenario():
-        monkeypatch.setattr(runtime, "_run_readiness_checks", fake_readiness)
-        task = asyncio.create_task(runtime._warm_ready_backends())
-        await entered.wait()
-        runtime.activate_backend("warm-b")
-        release.set()
-        await task
-
-    asyncio.run(scenario())
+    retired = runtime._retire_other_backends(chosen)
 
     active = {b.backend_id for b in reg.all() if b.lifecycle == "active"}
-    assert active == {"old", "warm-a", "warm-b"}
+    draining = {b.backend_id for b in reg.all() if b.lifecycle == "draining"}
+    assert active == {"chosen"}
+    assert draining == {"extra-a", "extra-b"}
+    assert retired == ["extra-a", "extra-b"]
 
 
-def test_prepare_account_deploy_drains_active_backend_when_peer_can_serve(monkeypatch):
+def test_prepare_account_deploy_drains_matching_active_backend(monkeypatch):
     old = _backend("old")
     old.account_id = "alice"
     old.in_flight = 0
@@ -299,7 +258,7 @@ def test_prepare_account_deploy_drains_active_backend_when_peer_can_serve(monkey
     assert peer.lifecycle == "active"
 
 
-def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
+def test_prepare_account_deploy_drains_even_when_no_peer_exists(monkeypatch):
     only = _backend("only")
     only.account_id = "alice"
     reg = BackendRegistry([only])
@@ -308,36 +267,12 @@ def test_prepare_account_deploy_blocks_when_no_peer_exists(monkeypatch):
 
     result = runtime.prepare_account_deploy("alice")
 
-    assert result["drained"] == []
-    assert result["blocked"] == ["only"]
-    assert only.lifecycle == "active"
+    assert result["drained"] == ["only"]
+    assert result["blocked"] == []
+    assert only.lifecycle == "draining"
 
 
-def test_promote_standby_backends_to_warming_fills_load_balancing_pool(monkeypatch):
-    active = _backend("active")
-    standby = _backend("standby", lifecycle="standby")
-    reg = BackendRegistry([active, standby])
-    monkeypatch.setattr(runtime, "_registry", reg)
-    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
-
-    runtime._promote_standby_backends_to_warming()
-
-    assert active.lifecycle == "active"
-    assert standby.lifecycle == "warming"
-
-
-def test_promote_standby_backend_activates_when_no_capacity_exists(monkeypatch):
-    standby = _backend("standby", lifecycle="standby")
-    reg = BackendRegistry([standby])
-    monkeypatch.setattr(runtime, "_registry", reg)
-    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
-
-    runtime._promote_standby_backends_to_warming()
-
-    assert standby.lifecycle == "active"
-
-
-def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch):
+def test_complete_account_deploy_activates_target_and_drains_other_active(monkeypatch):
     old = _backend("old", lifecycle="draining")
     old.account_id = "alice"
     peer = _backend("peer")
@@ -349,11 +284,11 @@ def test_complete_account_deploy_reloads_and_warms_with_active_peer(monkeypatch)
 
     result = runtime.complete_account_deploy("alice")
 
-    assert result["warmed"] == ["old"]
-    assert result["activated"] == []
-    assert old.lifecycle == "warming"
-    assert old.last_probe_at == 0.0
-    assert peer.lifecycle == "active"
+    assert result["warmed"] == []
+    assert result["activated"] == ["old"]
+    assert result["retired"] == ["peer"]
+    assert old.lifecycle == "active"
+    assert peer.lifecycle == "draining"
 
 
 def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):

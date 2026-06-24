@@ -1,15 +1,11 @@
 """
 Backend selection + decision logging.
 
-The Router's only job is: given a RequestContext, pick the best backend
-that can serve the requested model. There is no notion of fallback or
-retry here — that lives in the handler, which can call ``choose`` again
-after marking a backend as failed.
-
-Selection uses ``Backend.routing_score()`` (lower is better), which
-combines EWMA latency, in-flight count, and weight. Ties (e.g. before
-any request has landed) are broken by weighted request count, then oldest
-last-failure, so otherwise-equal active backends share traffic fairly.
+The Router's only job is: given a RequestContext, pick the active backend
+that can serve the requested model. Retry still lives in the handler, which can
+call ``choose`` again after excluding a backend. The gateway now enforces one
+active backend at lifecycle boundaries; scoring remains only as a compatibility
+fallback for legacy multi-active configs.
 """
 from __future__ import annotations
 
@@ -79,9 +75,7 @@ class Router:
             if not b.is_selectable(now):
                 if not b.enabled:
                     excluded[b.backend_id] = "disabled"
-                elif getattr(b, "lifecycle", "active") == "warming" and b.readiness_successes <= 0:
-                    excluded[b.backend_id] = "warming, no readiness success yet"
-                elif getattr(b, "lifecycle", "active") not in ("active", "warming"):
+                elif getattr(b, "lifecycle", "active") != "active":
                     excluded[b.backend_id] = f"lifecycle={b.lifecycle}"
                 elif b.is_temporarily_disabled(now):
                     excluded[b.backend_id] = (
@@ -114,11 +108,9 @@ class Router:
                 details={"decision": decision.to_dict()},
             )
 
-        # Score = ewma_latency * (1 + in_flight) / weight, lower is better.
-        # Ties are spread by weighted request count before falling back to
-        # oldest last-failure and stable id ordering. That keeps equal active
-        # backends from pinning sequential traffic to a single backend while
-        # still avoiding a just-recovered backend stealing the whole pool.
+        # Compatibility fallback for legacy multi-active configs: lower score
+        # wins, then older/less-used backends. Normal operation has one active
+        # backend, so this path is effectively deterministic.
         chosen = min(
             candidates,
             key=lambda b: (

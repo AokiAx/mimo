@@ -1490,7 +1490,7 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     html += '<div style="margin-bottom:10px">';
     html += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
     html += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
-    html += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动轮换：临近 TTL（约 40–55 分钟）优雅重部署，无需 Cron</span>';
+    html += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4h TTL，剩余约 30 分钟冷启动下一个可用账号，无需 Cron</span>';
     html += '</div>';
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
@@ -1499,7 +1499,7 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     var skipReason = schedInfo.skip_reason || '';
     html += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     html += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
-    if (ageMin > 0) html += '<span>年龄：<b style="color:' + (ageMin >= 50 ? 'var(--red)' : ageMin >= 40 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
+    if (ageMin > 0) html += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
     if (rotReason && rotReason !== 'fresh' && rotReason !== 'disabled') html += '<span>轮换原因：<b>' + escapeHtml(rotReason) + '</b></span>';
     if (skipReason && skipReason !== 'disabled') html += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
     html += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';

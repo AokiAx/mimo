@@ -202,7 +202,7 @@ async def startup_event():
             "anyone scanning can log in. Change it on the panel's 密钥管理 page "
             "or in data/secrets.json."
         )
-    # Cron-based scheduled deploys were removed. Gateway probing/readiness starts
+    # Cron-based scheduled deploys were removed. Gateway health probing starts
     # here; Claw lifecycle relay is driven by the activity loop below.
     # DISABLE_SCHEDULER stays the master "no auto-deploy" switch.
     try:
@@ -1941,7 +1941,7 @@ async def gateway_backend_toggle(backend_id: str):
 
 @app.post("/api/gateway/backends/{backend_id}/activate")
 async def gateway_backend_activate(backend_id: str):
-    """Hard-switch traffic to a backend and drain peers serving the same models."""
+    """Hard-switch traffic to a backend and retire other active backends."""
     try:
         from gateway.runtime import activate_backend
         return activate_backend(backend_id)
@@ -2097,7 +2097,7 @@ async def public_status(request: Request, key: str = ""):
         backends = get_all_backends()
         online = sum(
             1 for b in backends
-            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
         )
         operational = online > 0
     except Exception:

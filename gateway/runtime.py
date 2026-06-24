@@ -4,10 +4,9 @@ Backends live in the ``backends`` section of ``data/config.json`` (managed by
 ``backend_store``).
 Credentials come from ``data/secrets.json`` (managed by ``secrets_store``).
 
-The runtime owns backend lifecycle for account rotation:
-new/reloaded backends are warmed with non-stream, stream, and tool-call probes;
-when ready, each healthy backend joins the active load-balancing pool. Backends
-only enter draining when they are removed, disabled, or being redeployed.
+The runtime owns a single active backend for gateway routing. Claw account
+relay is driven outside the gateway; when a freshly deployed backend is marked
+active, every other active backend is drained out of new traffic.
 """
 from __future__ import annotations
 
@@ -58,12 +57,10 @@ _PROBE_CONCURRENCY = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
-# Gateway-side standby warm-up cadence. Claw free-tier TTL/account relay is
-# driven by ``claw.claw_activity``; this loop only nudges already-configured
-# peer backends toward readiness when they exist.
-_ROTATION_INTERVAL_S = 50 * 60.0
-_READINESS_INTERVAL_S = 10.0
-_READINESS_REQUIRED_SUCCESSES = 1
+# Gateway no longer owns account/backend pool rotation. Claw free-tier TTL and
+# account relay are driven by ``claw.claw_activity``; the gateway keeps one
+# active backend and only performs health/model maintenance.
+_ROTATION_INTERVAL_S = 0.0
 _DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 _DETECTION_ZONE_FAILURES = 2           # consecutive failures to enter detection
@@ -72,10 +69,7 @@ _ROTATION_LOOP_INTERVAL_S = _env_float("GATEWAY_ROTATION_LOOP_INTERVAL_S", 60.0)
 # How often to re-sync each backend's model list from its /v1/models.
 _MODEL_SYNC_INTERVAL_S = _env_float("GATEWAY_MODEL_SYNC_INTERVAL_S", 300.0)
 
-_READINESS_MAX_STREAM_CHUNKS = 32
-_READINESS_MAX_STREAM_SECONDS = _env_float("GATEWAY_READINESS_STREAM_TIMEOUT_S", _PROBE_TIMEOUT_S)
 _READINESS_PROMPT = "ping"
-_READINESS_MODEL = os.environ.get("GATEWAY_READINESS_MODEL", "mimo-v2-flash")
 
 # Models that cannot answer a text /v1/chat/completions probe (text-to-speech,
 # speech recognition). Probing them would falsely mark a healthy backend dead,
@@ -165,7 +159,7 @@ def _ensure_initialized() -> None:
 
 
 def _bootstrap_active_lifecycles() -> None:
-    """Seed active timers while preserving all active backends for load balancing."""
+    """Seed active timers and collapse legacy multi-active configs to one."""
     assert _registry is not None
     now = time.time()
     for b in _registry.all():
@@ -173,6 +167,8 @@ def _bootstrap_active_lifecycles() -> None:
             b.mark_active(now=now)
         elif b.lifecycle == "draining" and not b.drain_deadline:
             b.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
+    _enforce_single_active_backend()
+
 
 def _make_metrics_recorder():
     try:
@@ -187,8 +183,8 @@ def reload_backends() -> int:
 
     Existing Backend objects keep EWMA, breaker, and in-flight state. Removed
     backends are marked draining instead of being dropped while requests are in
-    flight. New backends start warming when an active peer for the same model
-    exists; otherwise they are activated to avoid bootstrapping into outage.
+    flight. Legacy configs with several active backends are collapsed to one
+    active backend; extra active entries are drained/standby instead of routed.
     """
     _ensure_initialized()
     assert _registry is not None
@@ -200,9 +196,9 @@ def reload_backends() -> int:
         seen.add(fresh.backend_id)
         existing = _registry.get(fresh.backend_id)
         if existing is None:
-            if fresh.lifecycle == "warming" and not _has_active_peer(fresh):
-                fresh.mark_active(now=now)
-            elif fresh.lifecycle == "active":
+            if fresh.lifecycle == "active" or (
+                fresh.lifecycle == "warming" and not _has_active_backend()
+            ):
                 fresh.mark_active(now=now)
             _registry.add(fresh)
             continue
@@ -237,20 +233,58 @@ def reload_backends() -> int:
                 old.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
         else:
             _registry.remove(old.backend_id)
+    _enforce_single_active_backend()
     _reap_drained(now=now)
     return len(_registry.all())
 
 
-def _has_active_peer(candidate: Backend) -> bool:
+def _has_active_backend() -> bool:
     assert _registry is not None
-    c_models = set(candidate.models)
     return any(
-        b.backend_id != candidate.backend_id
-        and b.enabled
+        b.enabled
         and b.lifecycle == "active"
-        and bool(c_models.intersection(b.models))
         for b in _registry.all()
     )
+
+
+def _enforce_single_active_backend(*, preferred: Backend | None = None) -> list[str]:
+    """Keep only one active backend in the gateway data plane.
+
+    Older configs may still contain several active entries from the previous
+    pool model. Preserve the preferred/current active backend and retire the
+    rest so the router sees a single account at a time.
+    """
+    assert _registry is not None
+    active = [
+        b for b in _registry.all()
+        if b.enabled and b.lifecycle == "active"
+    ]
+    if not active:
+        return []
+    keep = preferred if any(b is preferred for b in active) else max(
+        active,
+        key=lambda b: (b.active_since or 0.0, b.backend_id),
+    )
+    return _retire_other_backends(keep)
+
+
+def _retire_other_backends(active_backend: Backend) -> list[str]:
+    """Move every other routable backend out of new traffic."""
+    assert _registry is not None
+    retired: list[str] = []
+    now = time.time()
+    for backend in _registry.all():
+        if backend.backend_id == active_backend.backend_id:
+            continue
+        if backend.lifecycle == "active" or backend.in_flight > 0:
+            backend.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
+        elif backend.lifecycle == "warming":
+            backend.mark_standby()
+        else:
+            continue
+        _persist_backend_runtime_state(backend)
+        retired.append(backend.backend_id)
+    return retired
 
 
 # ────────────── dispatch (used by /v1/* routes) ──────────────
@@ -406,14 +440,14 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
 
 
 def activate_backend(backend_id: str) -> dict[str, Any]:
-    """Hard-switch traffic to one ready backend and drain peers for shared models."""
+    """Hard-switch traffic to one backend and retire every other active backend."""
     _ensure_initialized()
     assert _registry is not None
     b = _registry.get(backend_id)
     if b is None:
         return {"success": False, "error": f"Backend {backend_id!r} not found"}
-    _activate_backend(b, reason="manual")
-    return {"success": True, "backend": backend_id}
+    retired = _activate_backend(b, reason="manual")
+    return {"success": True, "backend": backend_id, "retired": retired}
 
 
 def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
@@ -424,7 +458,7 @@ def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> d
     destroys the old Claw/tunnel, clients see avoidable 5xxs until the next
     manual reload or health-probe cycle. This helper is intentionally sync so
     the deploy thread can call it before touching the old Claw: active matching
-    backends are drained only when another active peer can serve their models.
+    backends are drained even if this temporarily leaves no route.
     """
     _ensure_initialized()
     assert _registry is not None
@@ -433,9 +467,6 @@ def prepare_account_deploy(account_id: str, *, api_port: int | None = None) -> d
     blocked: list[str] = []
     for backend in targets:
         if backend.lifecycle != "active":
-            continue
-        if not _has_active_peer(backend):
-            blocked.append(backend.backend_id)
             continue
         backend.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S)
         _persist_backend_runtime_state(backend)
@@ -478,6 +509,7 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
     targets = _matching_account_backends(account_id, api_port=api_port)
     warmed: list[str] = []
     activated: list[str] = []
+    retired: list[str] = []
     for backend in targets:
         backend.enabled = True
         backend.disabled_until = 0.0
@@ -485,16 +517,9 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         backend.health = "alive"
         backend.consecutive_failures = 0
         backend.last_error = ""
-        if _has_active_peer(backend):
-            backend.mark_warming(now=now)
-            backend.last_probe_at = 0.0
-            warmed.append(backend.backend_id)
-        else:
-            # The deploy flow has already verified the endpoint. If no peer is
-            # carrying traffic, restore service immediately instead of waiting
-            # for the background rotation loop.
-            backend.mark_active(now=now)
-            activated.append(backend.backend_id)
+        backend.mark_active(now=now)
+        retired.extend(_retire_other_backends(backend))
+        activated.append(backend.backend_id)
         _persist_backend_runtime_state(backend)
     return {
         "success": True,
@@ -502,6 +527,7 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         "matched": [b.backend_id for b in targets],
         "warmed": warmed,
         "activated": activated,
+        "retired": retired,
     }
 
 
@@ -512,10 +538,6 @@ def fail_account_deploy(account_id: str, *, api_port: int | None = None, error: 
     targets = _matching_account_backends(account_id, api_port=api_port)
     failed: list[str] = []
     for backend in targets:
-        if backend.lifecycle == "active" and not _has_active_peer(backend):
-            # Single-backend installs have no failover target; leave the backend
-            # visible so the router can recover if the old tunnel is still alive.
-            continue
         backend.mark_failed_rotation(error)
         _persist_backend_runtime_state(backend)
         failed.append(backend.backend_id)
@@ -552,7 +574,7 @@ def _base_url_port(base_url: str) -> int | None:
         return None
 
 
-# ────────────── probe / readiness / rotation loops ──────────────
+# ────────────── probe / maintenance loops ──────────────
 
 
 async def _probe_loop() -> None:
@@ -625,15 +647,13 @@ async def _probe_loop() -> None:
 
 
 async def _rotation_loop() -> None:
-    """Warm standby backends periodically so they can join the active pool."""
+    """Run lightweight backend maintenance for single-active mode."""
     _ensure_initialized()
     assert _registry is not None
     while True:
         try:
-            _promote_standby_backends_to_warming()
-            await _warm_ready_backends()
-            _rotate_expired_active_backends()
             await _sync_backend_models()
+            _enforce_single_active_backend()
             _reap_drained()
         except Exception:  # noqa: BLE001
             logger.exception("Gateway rotation loop failed")
@@ -695,88 +715,21 @@ async def _sync_backend_models() -> None:
         )
 
 
-def _promote_standby_backends_to_warming() -> None:
-    """Continuously fill the load-balancing pool from enabled standby backends."""
-    assert _registry is not None
-    now = time.time()
-    for b in _registry.all():
-        if not b.enabled or b.lifecycle != "standby" or b.is_temporarily_disabled(now):
-            continue
-        if _has_active_peer(b):
-            b.mark_warming(now=now)
-        else:
-            # If this model currently has no active capacity, avoid leaving the
-            # gateway unavailable while waiting for the next readiness cycle.
-            b.mark_active(now=now)
-        _persist_backend_runtime_state(b)
-
-
-async def _warm_ready_backends() -> None:
-    assert _registry is not None
-    now = time.time()
-    for b in _registry.all():
-        if not b.enabled or b.lifecycle != "warming" or b.is_temporarily_disabled(now):
-            continue
-        if b.last_probe_at and now - b.last_probe_at < _READINESS_INTERVAL_S:
-            continue
-        ok, reason, latency_ms = await _run_readiness_checks(b)
-        if ok:
-            b.record_success(now=now)
-            b.record_latency(latency_ms)
-            b.readiness_successes += 1
-            b.ready_at = now
-            if b.readiness_successes >= _READINESS_REQUIRED_SUCCESSES:
-                _activate_backend(b, reason="readiness")
-        else:
-            b.readiness_failures += 1
-            b.record_probe_failure(reason, now=now, threshold=_PROBE_FAILURE_THRESHOLD)
-            if b.readiness_failures >= _PROBE_FAILURE_THRESHOLD:
-                b.mark_failed_rotation(reason, now=now)
-                _persist_backend_runtime_state(b)
-
-
-def _rotate_expired_active_backends() -> None:
-    assert _registry is not None
-    now = time.time()
-    for active in list(_registry.all()):
-        if not active.enabled or active.lifecycle != "active" or not active.active_since:
-            continue
-        if now - active.active_since < _ROTATION_INTERVAL_S:
-            continue
-        nxt = _next_ready_or_warm_peer(active, now=now)
-        if nxt is None:
-            continue
-        if nxt.lifecycle == "active":
-            continue
-        if nxt.lifecycle != "warming":
-            nxt.mark_warming(now=now)
-        # The readiness loop will activate it after the three probe modes pass.
-
-
-def _next_ready_or_warm_peer(active: Backend, *, now: float) -> Backend | None:
-    assert _registry is not None
-    models = set(active.models)
-    peers = [
-        b for b in _registry.all()
-        if b.backend_id != active.backend_id
-        and b.enabled
-        and not b.is_temporarily_disabled(now)
-        and b.lifecycle in ("standby", "warming", "active")
-        and bool(models.intersection(b.models))
-    ]
-    if not peers:
-        return None
-    peers.sort(key=lambda b: (b.active_since or 0.0, b.backend_id))
-    return peers[0]
-
-
-def _activate_backend(backend: Backend, *, reason: str) -> None:
-    """Add a warmed backend to the active load-balancing pool."""
+def _activate_backend(backend: Backend, *, reason: str) -> list[str]:
+    """Make ``backend`` the single active backend."""
     now = time.time()
     backend.mark_active(now=now)
     shared_models = set(backend.models)
     _persist_backend_runtime_state(backend)
-    logger.info("Activated backend %s by %s; load-balancing models=%s", backend.backend_id, reason, sorted(shared_models))
+    retired = _retire_other_backends(backend)
+    logger.info(
+        "Activated backend %s by %s; models=%s retired=%s",
+        backend.backend_id,
+        reason,
+        sorted(shared_models),
+        retired,
+    )
+    return retired
 
 
 def _reap_drained(*, now: float | None = None) -> None:
@@ -809,25 +762,6 @@ def _persisted_backend_ids() -> set[str]:
         return set()
 
 
-async def _run_readiness_checks(backend: Backend) -> tuple[bool, str, float]:
-    started = time.monotonic()
-    checks = (
-        ("non_stream", _readiness_non_stream_body),
-        ("stream", _readiness_stream_body),
-        ("tool_call", _readiness_tool_call_body),
-    )
-    for name, body_factory in checks:
-        try:
-            body = body_factory(backend)
-            ok, reason = await _run_one_readiness_check(backend, name, body)
-        except Exception as e:  # noqa: BLE001
-            ok = False
-            reason = f"{type(e).__name__}: {e}"
-        if not ok:
-            return False, f"{name}: {reason}", (time.monotonic() - started) * 1000
-    return True, "ready", (time.monotonic() - started) * 1000
-
-
 async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, Any]) -> tuple[bool, str]:
     assert _transport is not None
     proxy_url = None
@@ -836,65 +770,20 @@ async def _run_one_readiness_check(backend: Backend, name: str, body: dict[str, 
     if backend.api_key:
         headers["Authorization"] = f"Bearer {backend.api_key}"
     try:
-        if body.get("stream"):
-            status, raw_iter = await _transport.post_stream(
-                url, body, headers=headers, timeout_s=_READINESS_MAX_STREAM_SECONDS,
-                proxy=proxy_url,
-            )
-            if status >= 400:
-                return False, f"http {status}"
-            chunks = 0
-            deadline = time.monotonic() + _READINESS_MAX_STREAM_SECONDS
-            async for _chunk in raw_iter:
-                chunks += 1
-                if chunks >= _READINESS_MAX_STREAM_CHUNKS or time.monotonic() >= deadline:
-                    break
-            return (chunks > 0), "empty stream" if chunks <= 0 else "ok"
-
         status, raw = await _transport.post_json(
             url, body, headers=headers, timeout_s=_PROBE_TIMEOUT_S,
             proxy=proxy_url,
         )
         if status >= 400:
             return False, f"http {status}: {raw[:200]!r}"
-        if name == "tool_call":
-            ok, reason = _raw_response_is_valid(raw)
-            if not ok:
-                return False, reason
         return True, "ok"
     except Exception as e:  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
 
 
-def _raw_response_is_valid(raw: bytes) -> tuple[bool, str]:
-    """Check that the tool-call readiness response is structurally valid.
-
-    The readiness request forces a specific tool choice, so a valid response
-    must include at least one tool call. A normal text-only answer means the
-    endpoint accepted HTTP but did not prove tool-call readiness.
-    """
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        return False, f"invalid JSON: {e}"
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not isinstance(choices, list) or not choices:
-        return False, "response has no choices"
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            continue
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            return True, "ok"
-    return False, "no tool call in response"
-
-
 def _readiness_model(backend: Backend) -> str:
     if not backend.models:
-        raise ValueError("backend has no configured models for readiness checks")
+        raise ValueError("backend has no configured models for probe checks")
     probeable = _probeable_models(backend)
     return probeable[0] if probeable else backend.models[0]
 
@@ -910,37 +799,6 @@ def _readiness_body_for_model(model: str) -> dict[str, Any]:
         "max_tokens": 256,
         "stream": False,
     }
-
-
-def _readiness_stream_body(backend: Backend) -> dict[str, Any]:
-    body = _readiness_non_stream_body(backend)
-    body["stream"] = True
-    body["stream_options"] = {"include_usage": True}
-    return body
-
-
-def _readiness_tool_call_body(backend: Backend) -> dict[str, Any]:
-    body = _readiness_non_stream_body(backend)
-    body["messages"] = [{"role": "user", "content": "Use the gateway_readiness_ping tool."}]
-    body["tools"] = [{
-        "type": "function",
-        "function": {
-            "name": "gateway_readiness_ping",
-            "description": "Return a small readiness acknowledgement.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ok": {"type": "boolean"},
-                },
-                "required": ["ok"],
-            },
-        },
-    }]
-    body["tool_choice"] = {
-        "type": "function",
-        "function": {"name": "gateway_readiness_ping"},
-    }
-    return body
 
 
 def _persist_backend_runtime_state(backend: Backend) -> None:

@@ -124,7 +124,7 @@ def add_backend(
         "weight": max(1, int(weight)),
         "account_id": account_id,
         "enabled": True,
-        "lifecycle": "warming",
+        "lifecycle": "active",
     }
     with _lock:
         data = _load()
@@ -154,7 +154,7 @@ def upsert_account_backend(
             existing_id = None
     if existing_id:
         fields: dict[str, Any] = {"base_url": base_url, "api_key": api_key,
-                                  "enabled": True, "lifecycle": "warming"}
+                                  "enabled": True, "lifecycle": "active"}
         if models:
             fields["models"] = models
         return update_backend(existing_id, **fields)

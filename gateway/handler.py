@@ -12,7 +12,7 @@ the handler:
 
 The handler only tracks per-request ``in_flight`` and metrics. Backend
 health, breaker state, and routing latency are owned by the runtime's active
-chat probes/readiness checks, not by user traffic.
+chat probes, not by user traffic.
 
 The handler owns the upstream lifecycle: the streaming AsyncIterator it
 returns transitively closes the httpx response when fully drained.

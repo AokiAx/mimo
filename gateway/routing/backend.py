@@ -18,11 +18,10 @@ class Backend:
     POSTs ``/v1/chat/completions`` to. ``account_id`` lets the auto-deploy
     pipeline tie a backend back to the Studio account that produced it.
 
-    ``lifecycle`` controls traffic during account rotation:
-    ``standby`` backends are eligible for the next rotation, ``warming``
-    backends are being readiness-checked, ``active`` backends can receive new
-    requests, and ``draining`` backends keep existing requests alive while the
-    router stops assigning fresh traffic to them.
+    ``lifecycle`` controls traffic during account handoff:
+    only ``active`` backends can receive new requests. ``draining`` backends
+    keep existing requests alive while the router stops assigning fresh traffic;
+    ``standby`` / ``warming`` are retained as non-routable compatibility states.
     """
 
     backend_id: str
@@ -235,10 +234,7 @@ class Backend:
     def is_selectable(self, now: float | None = None) -> bool:
         if not self.enabled:
             return False
-        if self.lifecycle == "warming":
-            if self.readiness_successes <= 0:
-                return False
-        elif self.lifecycle != "active":
+        if self.lifecycle != "active":
             return False
         if self.in_detection:
             return False
@@ -271,8 +267,8 @@ class Backend:
     def routing_score(self) -> float:
         """Lower is better. Combines latency, current load, and weight.
 
-        Unobserved latency is deliberately conservative so a newly promoted
-        backend does not steal all traffic before readiness probes seed EWMA.
+        Unobserved latency is deliberately conservative for legacy configs
+        that still contain more than one active backend.
         """
         base = self.ewma_latency_ms if self.ewma_latency_ms > 0 else 100.0
         samples = self.total_requests + self.total_failures
