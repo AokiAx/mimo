@@ -15,7 +15,7 @@ import re
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -843,24 +843,107 @@ async def claw_create():
     success = code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0
     return {"success": success, "code": code, "data": data}
 
+def _claw_status_view(info: dict) -> dict:
+    """Normalize a /mimo-claw/status ``data`` object into the panel view.
+
+    openclaw 2026.5.27 enriched this response with billing edition, cluster
+    region (clusterKey), API-key binding and token-plan state. Surface them all;
+    older/leaner responses just yield empty defaults.
+    """
+    info = info or {}
+    expire_ms = info.get("expireTime", 0)
+    expire_str = ""
+    if expire_ms:
+        try:
+            expire_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_ms / 1000))
+        except Exception:
+            expire_str = str(expire_ms)
+    billing = info.get("billing") or {}
+    api_key = billing.get("apiKey") or {}
+    token_plan = billing.get("tokenPlan") or {}
+    return {
+        "status": info.get("status", ""),
+        "message": info.get("message", ""),
+        "expireTime": expire_ms,
+        "expireStr": expire_str,
+        "clusterKey": info.get("clusterKey", ""),
+        "edition": billing.get("edition", ""),
+        "billingPriority": billing.get("billingPriority", ""),
+        "apiKeyRequired": bool(api_key.get("required", False)),
+        "apiKeyBound": bool(api_key.get("bound", False)),
+        "tokenPlanStatus": token_plan.get("status", ""),
+        "tokenPlanExhausted": bool(token_plan.get("exhausted", False)),
+    }
+
+
+def _account_info_view(info: dict) -> dict:
+    """Extract the openclaw 2026.5.27 account fields from /user/mi/get ``data``.
+
+    Adds the ban flag (bannedStatus — drives risk-control pre-checks), agreement
+    state, IDC region and token-plan state alongside the basic identity fields.
+    """
+    info = info or {}
+    token_plan = info.get("tokenPlan") or {}
+    return {
+        "userId": info.get("userId", ""),
+        "userName": info.get("userName", ""),
+        "bannedStatus": info.get("bannedStatus", ""),
+        "isAgreed": bool(info.get("isAgreed", False)),
+        "isClawDisclaimerAgreed": bool(info.get("isClawDisclaimerAgreed", False)),
+        "idc": info.get("idc", ""),
+        "tokenPlanStatus": token_plan.get("status", ""),
+        "tokenPlanExhausted": bool(token_plan.get("exhausted", False)),
+    }
+
+
+def _account_pool_state(filename: str) -> dict:
+    """Which of the three deploy pools an account is in, for the panel:
+
+    - ``risk``      — bannedStatus tripped, quarantined (risk_blocked tag)
+    - ``cooldown``  — created a Claw today (Beijing day); waiting for reset
+    - ``available`` — enabled and eligible to be picked for a create
+    - ``disabled``  — auto-deploy off and not risk-blocked
+
+    Mirrors claw_activity's calendar-day cooldown (Beijing, resets at midnight).
+    """
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+    except Exception:
+        return {"pool": "", "risk_blocked": False, "in_cooldown": False, "last_create_at": 0}
+    accounts = cfg.get("accounts") or {}
+    acc = accounts.get(filename)
+    if acc is None:
+        alt = filename[:-5] if filename.endswith(".json") else filename + ".json"
+        acc = accounts.get(alt) or {}
+    last = int(acc.get("last_create_at") or 0)
+    in_cooldown = False
+    if last:
+        tz = timezone(timedelta(hours=8))
+        in_cooldown = datetime.fromtimestamp(last, tz).date() >= datetime.now(tz).date()
+    risk_blocked = bool(acc.get("risk_blocked"))
+    enabled = bool(acc.get("enabled"))
+    if risk_blocked:
+        pool = "risk"
+    elif not enabled:
+        pool = "disabled"
+    elif in_cooldown:
+        pool = "cooldown"
+    else:
+        pool = "available"
+    return {
+        "pool": pool,
+        "risk_blocked": risk_blocked,
+        "in_cooldown": in_cooldown,
+        "last_create_at": last,
+    }
+
+
 @app.get("/api/claw/status")
 async def claw_status():
     code, data = await acurl("GET", "/open-apis/user/mimo-claw/status", with_ph=False)
     if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-        info = data.get("data", {})
-        expire_ms = info.get("expireTime", 0)
-        expire_str = ""
-        if expire_ms:
-            try:
-                expire_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_ms / 1000))
-            except Exception:
-                expire_str = str(expire_ms)
-        return {"success": True, "data": {
-            "status": info.get("status", ""),
-            "message": info.get("message", ""),
-            "expireTime": expire_ms,
-            "expireStr": expire_str,
-        }}
+        return {"success": True, "data": _claw_status_view(data.get("data", {}))}
     return {"success": False, "code": code, "data": data}
 
 # ──────────── Claw WebSocket chat ────────────
@@ -1027,7 +1110,7 @@ async def claw_ws_chat(
             await ws.send(json.dumps({
                 "type": "req", "id": req_id, "method": "connect",
                 "params": {
-                    "minProtocol": 3, "maxProtocol": 3,
+                    "minProtocol": 3, "maxProtocol": 4,
                     "client": {"id": "cli", "version": "mimo-manager", "platform": "Linux", "mode": "cli"},
                     "role": "operator",
                     "scopes": ["operator.admin", "operator.read", "operator.write"],
@@ -1133,7 +1216,7 @@ async def claw_ws_set_agent_files(
             await ws.send(json.dumps({
                 "type": "req", "id": req_id, "method": "connect",
                 "params": {
-                    "minProtocol": 3, "maxProtocol": 3,
+                    "minProtocol": 3, "maxProtocol": 4,
                     "client": {"id": "cli", "version": "mimo-manager", "platform": "Linux", "mode": "cli"},
                     "role": "operator",
                     "scopes": ["operator.admin", "operator.read", "operator.write"],
@@ -1293,20 +1376,7 @@ async def account_claw_status(filename: str):
     code, data = await acurl("GET", "/open-apis/user/mimo-claw/status",
                              with_ph=False, cookies=cookies)
     if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-        info = data.get("data", {})
-        expire_ms = info.get("expireTime", 0)
-        expire_str = ""
-        if expire_ms:
-            try:
-                expire_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_ms / 1000))
-            except Exception:
-                expire_str = str(expire_ms)
-        return {"success": True, "data": {
-            "status": info.get("status", ""),
-            "message": info.get("message", ""),
-            "expireTime": expire_ms,
-            "expireStr": expire_str,
-        }}
+        return {"success": True, "data": _claw_status_view(data.get("data", {}))}
     return {"success": False, "code": code, "data": data}
 
 @app.post("/api/account/{filename}/claw/create")
@@ -1368,22 +1438,19 @@ async def account_summary(filename: str):
     (code_u, data_u), (code_c, data_c) = await asyncio.gather(user_task, claw_task)
 
     cookie_valid = code_u == "HTTP_200" and isinstance(data_u, dict) and data_u.get("code") == 0
-    user_id = data_u.get("data", {}).get("userId", "") if isinstance(data_u, dict) else ""
-    user_name = data_u.get("data", {}).get("userName", "") if isinstance(data_u, dict) else ""
+    user_view = _account_info_view(data_u.get("data", {})) if isinstance(data_u, dict) else {}
+    user_id = user_view.get("userId", "")
+    user_name = user_view.get("userName", "")
 
     claw_status = "unknown"
     claw_expire_str = ""
+    claw_view = {}
     if code_c == "HTTP_200" and isinstance(data_c, dict) and data_c.get("code") == 0:
-        info = data_c.get("data", {}) or {}
-        claw_status = info.get("status", "unknown")
-        expire_ms = info.get("expireTime", 0)
-        if expire_ms:
-            try:
-                claw_expire_str = time.strftime("%Y-%m-%d %H:%M:%S",
-                                                time.localtime(expire_ms / 1000))
-            except Exception:
-                pass
+        claw_view = _claw_status_view(data_c.get("data", {}) or {})
+        claw_status = claw_view.get("status") or "unknown"
+        claw_expire_str = claw_view.get("expireStr", "")
 
+    pool_state = _account_pool_state(filename)
     result = {
         "success": True,
         "filename": filename,
@@ -1391,10 +1458,18 @@ async def account_summary(filename: str):
         "email": acc.get("email", ""),
         "user_id": user_id or acc.get("user_id", ""),
         "user_name": user_name or acc.get("user_name", ""),
+        "banned_status": user_view.get("bannedStatus", ""),
+        "token_plan_status": user_view.get("tokenPlanStatus", ""),
         "cookie_valid": cookie_valid,
         "cookie_count": len(cookies),
         "claw_status": claw_status,
         "claw_expire": claw_expire_str,
+        "claw_edition": claw_view.get("edition", ""),
+        "claw_cluster": claw_view.get("clusterKey", ""),
+        "pool": pool_state["pool"],
+        "risk_blocked": pool_state["risk_blocked"],
+        "in_cooldown": pool_state["in_cooldown"],
+        "last_create_at": pool_state["last_create_at"],
         "is_current": filename == _get_current_account_name(),
     }
     # Only cache fresh, non-error snapshots — a transient upstream failure shouldn't get pinned.
@@ -1442,7 +1517,7 @@ async def account_chat(filename: str, request: Request):
             await ws.send(json.dumps({
                 "type": "req", "id": req_id, "method": "connect",
                 "params": {
-                    "minProtocol": 3, "maxProtocol": 3,
+                    "minProtocol": 3, "maxProtocol": 4,
                     "client": {"id": "cli", "version": "mimo-manager", "platform": "Linux", "mode": "cli"},
                     "role": "operator",
                     "scopes": ["operator.admin", "operator.read", "operator.write"],

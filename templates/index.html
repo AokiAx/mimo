@@ -342,9 +342,9 @@ select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%
       <div class="section">
         <h2>账号概览</h2>
         <table class="data-table">
-          <thead><tr><th>账号</th><th>用户</th><th>Cookie</th><th>Claw</th><th>过期</th><th>当前</th></tr></thead>
+          <thead><tr><th>账号</th><th>用户</th><th>Cookie</th><th>Claw</th><th>池</th><th>过期</th><th>当前</th></tr></thead>
           <tbody id="dashAccountsBody">
-            <tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
+            <tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
           </tbody>
         </table>
         <div class="btn-group">
@@ -1041,6 +1041,15 @@ function _dashClawBadge(s) {
   if (s.claw_status === 'DESTROYED') return '<span class="status-text warning">销毁</span>';
   return '<span class="status-text error">' + (s.claw_status || '未知') + '</span>';
 }
+function _dashPoolBadge(s) {
+  if (!s) return '<span class="status-text" style="color:var(--text3)">…</span>';
+  if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))
+    return '<span class="status-text error" title="' + escapeHtml(s.banned_status || 'risk') + '">风控</span>';
+  if (s.pool === 'disabled') return '<span class="status-text" style="color:var(--text3)">停用</span>';
+  if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning">冷却</span>';
+  if (s.pool === 'available') return '<span class="status-text ok">可用</span>';
+  return '<span class="status-text" style="color:var(--text3)">--</span>';
+}
 function _dashRetallyCounters() {
   var clawHealthy = 0, cookieValid = 0;
   for (var i = 0; i < accounts.length; i++) {
@@ -1069,12 +1078,13 @@ function refreshDashboard() {
             '<div style="font-size:0.7rem;color:var(--text3)">' + escapeHtml((cached && cached.user_id) || a.user_id || '') + '</div></td>' +
         '<td class="cellCk">' + (cached ? _dashCkBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
         '<td class="cellClaw">' + (cached ? _dashClawBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
+        '<td class="cellPool">' + (cached ? _dashPoolBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
         '<td class="cellExp" style="font-size:0.78rem;color:var(--text2)">' + escapeHtml((cached && cached.claw_expire) || '--') + '</td>' +
         '<td>' + (a.is_current ? '<span class="status-text ok">当前</span>' : '') + '</td>' +
         '</tr>';
     }
     if (rows === '') {
-      rows = '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">暂无账号，前往「账号 & Claw」添加</td></tr>';
+      rows = '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">暂无账号，前往「账号 & Claw」添加</td></tr>';
     }
     document.getElementById('dashAccountsBody').innerHTML = rows;
     _dashRetallyCounters();
@@ -1086,10 +1096,12 @@ function refreshDashboard() {
       if (!row) return;
       var ckCell = row.querySelector('.cellCk');
       var clawCell = row.querySelector('.cellClaw');
+      var poolCell = row.querySelector('.cellPool');
       var expCell = row.querySelector('.cellExp');
       var userCell = row.querySelector('.cellUser');
       if (ckCell) ckCell.innerHTML = _dashCkBadge(s);
       if (clawCell) clawCell.innerHTML = _dashClawBadge(s);
+      if (poolCell) poolCell.innerHTML = _dashPoolBadge(s);
       if (expCell) expCell.textContent = (s && s.claw_expire) || '--';
       if (userCell && s) {
         userCell.innerHTML = escapeHtml(s.user_name || '--') +
@@ -1151,12 +1163,19 @@ function renderAccountCards() {
               ? '<span class="status-text error">Claw ' + escapeHtml(s.claw_status) + '</span>'
               : '<span class="status-text warning">Claw 待检</span>'));
     var curBadge = a.is_current ? '<span class="status-text ok">当前账号</span>' : '';
+    var poolBadge = (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))
+      ? '<span class="status-text error">风控</span>'
+      : (s.in_cooldown || s.pool === 'cooldown'
+          ? '<span class="status-text warning">冷却</span>'
+          : (s.pool === 'available'
+              ? '<span class="status-text ok">可用</span>'
+              : (s.pool === 'disabled' ? '<span class="status-text" style="color:var(--text3)">停用</span>' : '')));
     var fn = a.filename;
     html += '<div class="acc-card' + (a.is_current ? ' current' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
     html += '<div class="head">';
     html += '<div><div class="name">' + escapeHtml(a.name || fn) + '</div>';
     html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:2px">' + escapeHtml(fn) + '</div></div>';
-    html += '<div class="badges">' + curBadge + ckBadge + clawBadge + '</div>';
+    html += '<div class="badges">' + curBadge + poolBadge + ckBadge + clawBadge + '</div>';
     html += '</div>';
     html += '<div class="meta-row">';
     html += '<div><span class="k">用户名</span><span class="v">' + escapeHtml(s.user_name || a.user_name || '--') + '</span></div>';
@@ -1164,6 +1183,8 @@ function renderAccountCards() {
     html += '<div><span class="k">邮箱</span><span class="v">' + escapeHtml(a.email || '--') + '</span></div>';
     html += '<div><span class="k">Cookie 数</span><span class="v">' + (s.cookie_count || 0) + '</span></div>';
     html += '<div><span class="k">Claw 过期</span><span class="v">' + escapeHtml(s.claw_expire || '--') + '</span></div>';
+    html += '<div><span class="k">风控状态</span><span class="v">' + escapeHtml(s.banned_status || '--') + '</span></div>';
+    html += '<div><span class="k">区域/版本</span><span class="v">' + escapeHtml((s.claw_cluster || '--') + (s.claw_edition ? ' · ' + s.claw_edition : '')) + '</span></div>';
     html += '<div><span class="k">添加时间</span><span class="v" style="font-size:0.76rem">' + escapeHtml((a.added_at || '').replace('T',' ').slice(0,19)) + '</span></div>';
     html += '</div>';
     html += '<div class="actions">';

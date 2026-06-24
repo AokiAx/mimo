@@ -89,7 +89,7 @@ async def mimo_chat(message, on_delta=None, on_event=None):
         await ws.send(json.dumps({
             "type": "req", "id": req_id, "method": "connect",
             "params": {
-                "minProtocol": 3, "maxProtocol": 3,
+                "minProtocol": 3, "maxProtocol": 4,
                 "client": {"id": "cli", "version": "mimo-ws-client", "platform": "Linux", "mode": "cli"},
                 "role": "operator",
                 "scopes": ["operator.admin", "operator.read", "operator.write", "operator.approvals", "operator.pairing"],
@@ -106,7 +106,9 @@ async def mimo_chat(message, on_delta=None, on_event=None):
                 break
         
         # Send chat message
-        session_key = "agent:main:default"
+        # Protocol 4 (openclaw 2026.5.27) renamed the default session key from
+        # "agent:main:default" to "agent:main:main" (confirmed via live capture).
+        session_key = "agent:main:main"
         msg_id = str(uuid.uuid4())
         await ws.send(json.dumps({
             "type": "req", "id": msg_id, "method": "chat.send",
@@ -136,7 +138,8 @@ async def mimo_chat(message, on_delta=None, on_event=None):
                 event = data.get('event', '')
                 payload = data.get('payload', {})
                 
-                if event == 'health':
+                if event in ('health', 'tick'):
+                    # protocol-4 transport heartbeats — ignore
                     continue
                 
                 if on_event:

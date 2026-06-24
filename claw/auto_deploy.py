@@ -225,6 +225,46 @@ def _is_retryable_create_429(data: object) -> bool:
     return isinstance(data, dict) and data.get("code") == 429
 
 
+def quarantine_risk_account(account_filename: str) -> None:
+    """Move an account into the RISK pool: disable auto-deploy and tag it so the
+    proactive scan in claw_activity stops selecting it. Unlike a permanent drop,
+    the risk pool is re-checked every 24h and released if the ban clears
+    (see :func:`release_risk_account`). Idempotent."""
+    cfg = load_config()
+    acc = cfg.setdefault("accounts", {}).setdefault(account_filename, {})
+    acc["enabled"] = False
+    acc["risk_blocked"] = True
+    acc["risk_blocked_reason"] = "账号被 MiMo 风控 (bannedStatus)"
+    acc["risk_blocked_at"] = int(time.time())
+    save_config(cfg)
+
+
+def release_risk_account(account_filename: str) -> None:
+    """Move an account OUT of the risk pool back into the active pool: clear the
+    risk tags and re-enable auto-deploy. Called by the 24h recovery scan when an
+    account's bannedStatus returns to NOT_BANNED. Idempotent."""
+    cfg = load_config()
+    acc = (cfg.get("accounts") or {}).get(account_filename)
+    if not acc:
+        return
+    acc["enabled"] = True
+    acc.pop("risk_blocked", None)
+    acc.pop("risk_blocked_reason", None)
+    acc.pop("risk_blocked_at", None)
+    save_config(cfg)
+
+
+def mark_account_created(account_filename: str) -> None:
+    """Stamp the daily-create cooldown: a MiMo free account may create only ONE
+    Claw per calendar day, so record when we (attempt to) create one. claw_activity uses
+    this to keep the account in the COOLDOWN pool until the Beijing date rolls over before it is eligible
+    to be picked for another create. Idempotent (last write wins)."""
+    cfg = load_config()
+    acc = cfg.setdefault("accounts", {}).setdefault(account_filename, {})
+    acc["last_create_at"] = int(time.time())
+    save_config(cfg)
+
+
 # In-memory log size cap; on-disk log is rotated past this many bytes.
 _LOG_LINES_MAX = 2000
 _LOG_FILE_MAX_BYTES = 1_000_000  # ~1MB → keep current + one .1 backup
@@ -934,6 +974,10 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             claw_ready = True
         else:
             log.log("Step 1: \u521b\u5efa\u65b0 Claw...")
+            # Stamp the daily-create cooldown up-front: the create consumes the
+            # account's once-per-calendar-day free quota regardless of whether the later
+            # steps succeed, so record it before issuing the request.
+            mark_account_created(account_filename)
             if not await _trigger_create():
                 mark_finished("error", history_status="error")
                 return

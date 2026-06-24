@@ -30,6 +30,7 @@ import os
 import random
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -50,16 +51,34 @@ _HISTORY_MAX = 15              # per-account rolling transcript kept for the pan
 # all at once. "age" is the backend's active_for_s (time since it went active ≈
 # time since the claw was deployed). trigger_deploy itself drains the backend
 # and waits for in-flight requests before replacing, so this is graceful.
-_ROTATION_MIN_AGE_S = 40 * 60   # earliest a claw may be electively rotated
-_ROTATION_MAX_AGE_S = 55 * 60   # ~5 min before the 60-min hard TTL
+# NOTE (2026-06): MiMo changed the free-tier Claw lifecycle — TTL is now ~4h
+# (was ~60min) and an account may create only ONE Claw per calendar day (Beijing). So we no longer
+# electively rotate a single account to stay up 24/7; instead the fleet rotates
+# ACROSS accounts (a used account cools down for 24h; a fresh available account
+# is cold-started next). Elective same-account rotation is therefore disabled.
+_ROTATION_MIN_AGE_S = 3 * 60 * 60      # (legacy) earliest a claw may be electively rotated
+_ROTATION_MAX_AGE_S = 3 * 60 * 60 + 45 * 60  # ~15 min before the 4h hard TTL
 
 _SCRIPTS_DIR = "/root/.openclaw/workspace/scripts"
 _LOCAL_PROXY_PORT = 18800
 
 # Fix-in-place threshold: when unhealthy and remaining TTL is below this,
 # redeploy immediately; above this, try repairing SOUL/AGENTS + scripts first.
-_FIX_IN_PLACE_TTL_S = 20 * 60  # 20 min
-_MIMO_HARD_TTL_S = 60 * 60     # ~60 min hard TTL
+_FIX_IN_PLACE_TTL_S = 60 * 60  # 1h
+_MIMO_HARD_TTL_S = 4 * 60 * 60     # ~4h hard TTL
+
+# Daily-create quota: a MiMo free account may create only ONE Claw per calendar
+# day (resets at Beijing midnight, NOT a rolling 24h window). An account that
+# created today is held out of the available pool until the date rolls over.
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+# Staggered relay: keep this many Claws serving concurrently, and start the next
+# available account this long BEFORE the current one's TTL so coverage overlaps
+# (no gap at handoff). With per-day-per-account quota + 4h TTL, the fleet covers
+# the day by relaying across accounts rather than rotating one. The lead must
+# exceed a cold-start's worst case (mainland edge create can take ~12 min).
+_DESIRED_ACTIVE = 1
+_RELAY_LEAD_S = 30 * 60  # bring up the next account 30 min before current expiry
 
 # ─── Prompt pools ───
 # Innocuous "a real owner is using this box" tasks. Kept light so they cost few
@@ -153,6 +172,16 @@ _loop_thread: Optional[threading.Thread] = None
 # account that had no backend yet (cron used to do this; now the loop does).
 _cold_start_last: dict[str, float] = {}
 _COLD_START_RETRY_S = 180
+
+# Proactive risk-control scan: poll each enabled account's bannedStatus and
+# quarantine banned ones before the loop ever picks them for a deploy. Throttled
+# per-account so the loop's fast cadence doesn't hammer /user/mi/get.
+_risk_check_last: dict[str, float] = {}
+_RISK_CHECK_INTERVAL_S = 30 * 60  # re-check each active account at most every 30 min
+# Quarantined (risk-pool) accounts are re-checked less often; released back to
+# the active pool if their bannedStatus has recovered to NOT_BANNED.
+_quarantine_check_last: dict[str, float] = {}
+_QUARANTINE_RECHECK_S = 24 * 60 * 60  # re-check each quarantined account every 24h
 
 
 def _session_key(account: str) -> str:
@@ -481,6 +510,179 @@ def _check_claw_alive(cookies: list) -> Optional[str]:
     return None
 
 
+def _check_account_banned(cookies: list) -> Optional[str]:
+    """Return the account's ``bannedStatus`` (openclaw 2026.5.27 field on
+    /user/mi/get) — e.g. 'NOT_BANNED' or a ban code. None on error / unknown."""
+    try:
+        import importlib
+        app_mod = importlib.import_module("app")
+        code, data = asyncio.run(app_mod.acurl(
+            "GET", "/open-apis/user/mi/get",
+            with_ph=False, cookies=cookies,
+        ))
+        if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+            return (data.get("data") or {}).get("bannedStatus", "")
+    except Exception:
+        pass
+    return None
+
+
+def _all_enabled_accounts() -> list[str]:
+    """Every auto-deploy-enabled account (with or without a backend)."""
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+    except Exception:
+        return []
+    return [a for a, c in (cfg.get("accounts") or {}).items() if c.get("enabled")]
+
+
+def _account_in_cooldown(account: str) -> bool:
+    """True if the account already created a Claw *today* (Beijing calendar day).
+
+    The free create quota is per calendar day (resets at Beijing midnight), so a
+    used account must sit out only until the date rolls over — not a full rolling
+    24h. The fleet pulls a different available account in the meantime.
+    Unknown/never-created accounts are not in cooldown.
+    """
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+    except Exception:
+        return False
+    accounts = cfg.get("accounts") or {}
+    acc = accounts.get(account) or {}
+    last = acc.get("last_create_at")
+    if not last:
+        # also accept the .json-suffixed key form
+        alt = account[:-5] if account.endswith(".json") else account + ".json"
+        last = (accounts.get(alt) or {}).get("last_create_at")
+    if not last:
+        return False
+    today = datetime.now(_BEIJING_TZ).date()
+    created_day = datetime.fromtimestamp(float(last), _BEIJING_TZ).date()
+    return created_day >= today
+
+
+def _quarantined_accounts() -> list[str]:
+    """Accounts currently in the RISK pool (risk_blocked tag set)."""
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+    except Exception:
+        return []
+    return [a for a, c in (cfg.get("accounts") or {}).items() if c.get("risk_blocked")]
+
+
+def _count_active_with_headroom(lead_s: float) -> int:
+    """Count healthy/active claws that will still be alive after ``lead_s`` —
+    i.e. remaining TTL > lead. These are the claws we can rely on to keep
+    serving through the relay window; claws closer to expiry don't count, so a
+    replacement gets started in time."""
+    try:
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+    except Exception:
+        return 0
+    n = 0
+    for b in backends:
+        if not (b.get("enabled", True) and b.get("healthy")
+                and b.get("lifecycle") in ("active", "warming")):
+            continue
+        remaining = float(_MIMO_HARD_TTL_S) - float(b.get("active_for_s") or 0)
+        if remaining > lead_s:
+            n += 1
+    return n
+
+
+def _available_for_create() -> list[str]:
+    """Accounts eligible to create a Claw right now, fairest-first.
+
+    Eligible = enabled, not risk-blocked, not in today's create cooldown, no
+    healthy backend yet, and not already deploying. Sorted by oldest
+    last_create_at first (never-created accounts first) so the fleet cycles
+    through accounts instead of favouring one.
+    """
+    try:
+        from claw.auto_deploy import load_config
+        cfg = load_config()
+        from gateway.runtime import get_all_backends
+        backends = get_all_backends()
+    except Exception:
+        return []
+    have_backend = {
+        str(b.get("account") or "")
+        for b in backends
+        if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") in ("active", "warming")
+    }
+    out: list[tuple[float, str]] = []
+    for acc, c in (cfg.get("accounts") or {}).items():
+        if not c.get("enabled") or c.get("risk_blocked"):
+            continue
+        keys = {acc, acc[:-5] if acc.endswith(".json") else acc + ".json"}
+        if keys & have_backend:
+            continue
+        if _account_is_deploying(acc) or _account_in_cooldown(acc):
+            continue
+        out.append((float(c.get("last_create_at") or 0.0), acc))
+    out.sort(key=lambda t: t[0])
+    return [acc for _, acc in out]
+
+
+def _scan_risk_and_quarantine() -> None:
+    """Proactively detect risk-blocked accounts and disable their auto-deploy
+    BEFORE the loop selects them, so a banned account never burns a destroy+
+    create cycle (which would only worsen the risk gate). Throttled per-account.
+
+    Quarantining flips ``enabled`` to False, so the account drops out of every
+    ``_enabled_*`` list computed later in the same loop iteration — protecting
+    all trigger_deploy paths at once.
+    """
+    try:
+        from claw.auto_deploy import _load_account_cookies, quarantine_risk_account
+    except Exception:
+        return
+    now = time.time()
+    for acc in _all_enabled_accounts():
+        if now - _risk_check_last.get(acc, 0.0) < _RISK_CHECK_INTERVAL_S:
+            continue
+        cookies = _load_account_cookies(acc)
+        if cookies is None:
+            continue
+        banned = _check_account_banned(cookies)
+        _risk_check_last[acc] = now
+        if banned and banned != "NOT_BANNED":
+            logger.warning("[activity] %s: bannedStatus=%s → 风控隔离 (proactive)", acc, banned)
+            try:
+                quarantine_risk_account(acc)
+            except Exception:
+                logger.exception("[activity] %s: proactive quarantine failed", acc)
+
+
+def _scan_quarantine_for_recovery() -> None:
+    """Re-check the RISK pool every 24h: if a quarantined account's bannedStatus
+    has recovered to NOT_BANNED, release it back into the active pool."""
+    try:
+        from claw.auto_deploy import _load_account_cookies, release_risk_account
+    except Exception:
+        return
+    now = time.time()
+    for acc in _quarantined_accounts():
+        if now - _quarantine_check_last.get(acc, 0.0) < _QUARANTINE_RECHECK_S:
+            continue
+        cookies = _load_account_cookies(acc)
+        if cookies is None:
+            continue
+        banned = _check_account_banned(cookies)
+        _quarantine_check_last[acc] = now
+        if banned == "NOT_BANNED":
+            logger.warning("[activity] %s: bannedStatus 已恢复 → 放回可用池", acc)
+            try:
+                release_risk_account(acc)
+            except Exception:
+                logger.exception("[activity] %s: risk release failed", acc)
+
+
 def _run_activity_once(account: str) -> None:
     """One human-like interaction + panel-side health check + escalation."""
     try:
@@ -495,10 +697,19 @@ def _run_activity_once(account: str) -> None:
     if cookies is None:
         return
 
-    # Pre-flight: check if Claw is still alive. If DESTROYED, skip the
-    # WS chat + fix-in-place dance and go straight to redeploy.
+    # Pre-flight: check if Claw is still alive. If DESTROYED, the claw expired
+    # (4h TTL). Don't redeploy the SAME account within the same Beijing calendar day —
+    # it has no quota left today; the fleet cold-starts a different available
+    # account instead. Once the cooldown expires this account becomes eligible
+    # again via the normal cold-start path.
     claw_status = _check_claw_alive(cookies)
     if claw_status in ("DESTROYED", "DESTROYING", ""):
+        if _account_in_cooldown(account):
+            logger.info(
+                "[activity] %s: Claw gone but already created today (quota used) — skip redeploy",
+                account,
+            )
+            return
         logger.warning(
             "[activity] %s: Claw status=%s — triggering redeploy",
             account, claw_status or "empty",
@@ -570,22 +781,34 @@ def _run_activity_once(account: str) -> None:
             # If healthy → streak resets to 0; if still bad → re-enter here
             # (TTL will be shorter, eventually below threshold → redeploy).
         else:
-            logger.warning(
-                "[activity] %s: unhealthy %d cycles, TTL ~%dmin — redeploy",
-                account, streak, ttl // 60,
-            )
-            try:
-                trigger_deploy(account)
-                escalated = True
-            except Exception:
-                logger.exception("[activity] %s: trigger_deploy failed", account)
-            with _state_lock:
-                _state.setdefault(account, {})["unhealthy_streak"] = 0
+            if _account_in_cooldown(account):
+                # No create quota left today — can't redeploy this account. Ride
+                # out the remaining TTL; the fleet will cold-start a fresh
+                # available account when this claw finally expires.
+                logger.info(
+                    "[activity] %s: unhealthy, TTL ~%dmin, but already created today (quota used) — no redeploy",
+                    account, ttl // 60,
+                )
+            else:
+                logger.warning(
+                    "[activity] %s: unhealthy %d cycles, TTL ~%dmin — redeploy",
+                    account, streak, ttl // 60,
+                )
+                try:
+                    trigger_deploy(account)
+                    escalated = True
+                except Exception:
+                    logger.exception("[activity] %s: trigger_deploy failed", account)
+                with _state_lock:
+                    _state.setdefault(account, {})["unhealthy_streak"] = 0
 
     # Healthy this cycle (or not yet at the escalation threshold): consider a
-    # proactive expiry rotation. Skip if a health-failure redeploy just fired.
-    if not escalated and not _account_is_deploying(account):
-        _maybe_rotate_for_expiry(account)
+    # proactive expiry rotation. DISABLED under the once-per-calendar-day create model —
+    # an account can't recreate within the day, so the fleet rotates across
+    # accounts (cooldown + cold-start) instead of rotating a single account.
+    # (Kept as a no-op call site for clarity / easy re-enable.)
+    # if not escalated and not _account_is_deploying(account):
+    #     _maybe_rotate_for_expiry(account)
 
 
 def _schedule_next(account: str) -> None:
@@ -601,26 +824,40 @@ def _loop() -> None:
     print("[claw-activity] 启动拟人 WS 运维循环", flush=True)
     while _loop_running:
         try:
+            # Proactive risk scan FIRST: quarantine banned accounts so they fall
+            # out of the enabled lists computed just below (no deploy attempted).
+            _scan_risk_and_quarantine()
+            # And release any quarantined accounts whose ban has cleared (24h).
+            _scan_quarantine_for_recovery()
             accounts = _enabled_deployed_accounts()
             now = time.time()
             # Drop state for accounts no longer in scope.
             with _state_lock:
                 for gone in [a for a in _state if a not in accounts]:
                     _state.pop(gone, None)
-            # Cold-start: enabled accounts without a backend never enter the
-            # maintained set above, so fire their initial deploy here (throttled).
-            for acc in _enabled_accounts_without_backend():
-                if _account_is_deploying(acc):
-                    continue
-                if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
-                    continue
-                _cold_start_last[acc] = now
-                logger.warning("[activity] %s: enabled but no backend → initial deploy (cold start)", acc)
-                try:
-                    from claw.auto_deploy import trigger_deploy
-                    trigger_deploy(acc)
-                except Exception:
-                    logger.exception("[activity] %s: cold-start trigger_deploy failed", acc)
+            # Staggered relay (replaces blanket cold-start): keep _DESIRED_ACTIVE
+            # claws serving. Count claws with enough TTL headroom to outlast the
+            # relay lead; if short (current one nearing its 4h expiry, or none
+            # up yet), bring up the next available account(s) ahead of time so
+            # coverage overlaps. Each account is used at most once/day (cooldown),
+            # so the fleet relays across accounts to cover the day.
+            in_flight = sum(1 for a in _all_enabled_accounts() if _account_is_deploying(a))
+            healthy_headroom = _count_active_with_headroom(_RELAY_LEAD_S)
+            need = _DESIRED_ACTIVE - healthy_headroom - in_flight
+            if need > 0:
+                for acc in _available_for_create()[:need]:
+                    if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
+                        continue
+                    _cold_start_last[acc] = now
+                    logger.warning(
+                        "[activity] %s: relay deploy (active+headroom=%d, in-flight=%d, need=%d)",
+                        acc, healthy_headroom, in_flight, need,
+                    )
+                    try:
+                        from claw.auto_deploy import trigger_deploy
+                        trigger_deploy(acc)
+                    except Exception:
+                        logger.exception("[activity] %s: relay trigger_deploy failed", acc)
             for acc in accounts:
                 with _state_lock:
                     st = _state.setdefault(acc, {})
