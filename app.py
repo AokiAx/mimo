@@ -468,6 +468,24 @@ def get_ph_encoded():
 def get_cookie_header_all():
     return _cookie_header_all_from(load_cookies())
 
+
+def _ws_handshake_headers(cookies=None):
+    """Headers a browser sends on the same-origin ``/ws/proxy`` WS handshake.
+
+    The session ``Cookie`` is REQUIRED: MiMo's ws-proxy resolves the claw's IDC
+    route from it, so an upgrade carrying only ``ticket``/``userId`` in the query
+    string (no cookies) is rejected with HTTP 401 and
+    ``X-Ws-Proxy-Error: idc_route_decision_unavailable``. ``Origin`` mirrors the
+    browser too. Verified 2026-06-25: adding these flips the operator/chat WS
+    from 401 to connected, from any egress (the cookie carries the IDC affinity).
+    """
+    src = cookies if cookies is not None else load_cookies()
+    return {
+        "Cookie": _cookie_header_all_from(src),
+        "Origin": MIMO_BASE,
+    }
+
+
 # ──────────── API proxy helpers ────────────
 
 _http_client: httpx.AsyncClient | None = None
@@ -1079,7 +1097,10 @@ async def claw_ws_chat(
     full_text = ""
     debug_log: list[str] = []
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
+        async with websockets.connect(
+            ws_url, additional_headers=_ws_handshake_headers(cookies),
+            ping_interval=30, ping_timeout=10,
+        ) as ws:
             init_msg = await asyncio.wait_for(ws.recv(), timeout=10)
             debug_log.append(f"init: {init_msg[:200]}")
 
@@ -1191,7 +1212,10 @@ async def claw_ws_set_agent_files(
         return False, "websockets not installed"
 
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10, max_size=None) as ws:
+        async with websockets.connect(
+            ws_url, additional_headers=_ws_handshake_headers(cookies),
+            ping_interval=30, ping_timeout=10, max_size=None,
+        ) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)  # connect.challenge
             req_id = str(uuid.uuid4())
             await ws.send(json.dumps({
@@ -1524,7 +1548,10 @@ async def account_chat(filename: str, request: Request):
 
     full_text = ""
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
+        async with websockets.connect(
+            ws_url, additional_headers=_ws_handshake_headers(cookies),
+            ping_interval=30, ping_timeout=10,
+        ) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
             req_id = str(uuid.uuid4())
             await ws.send(json.dumps({
