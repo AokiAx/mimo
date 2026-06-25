@@ -135,6 +135,12 @@ def _inject_openclaw_system(path: str, body: bytes) -> bytes:
     if not isinstance(data, dict):
         return body
 
+    # TTS/ASR models reject a system role ("system role is not allowed for TTS
+    # model") and don't need the chat gating — never inject for them.
+    model = str(data.get("model", "")).lower()
+    if "tts" in model or "asr" in model:
+        return body
+
     if anthropic:
         # Anthropic: top-level `system` (string or list of content blocks).
         sys = data.get("system")
