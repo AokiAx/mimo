@@ -115,6 +115,54 @@ def _upstream_path(path: str) -> str:
     return path
 
 
+# MiMo's REST inference rejects any chat request whose system prompt does NOT
+# contain this OpenClaw preamble (HTTP 400 "Param Incorrect"/"Invalid request").
+# We inject it (idempotently) so gateway, probe, and direct requests are accepted;
+# the client's own system prompt is preserved — we only prepend the required line.
+_OPENCLAW_SYSTEM = "You are a personal assistant running inside OpenClaw"
+
+
+def _inject_openclaw_system(path: str, body: bytes) -> bytes:
+    if path not in ("/v1/chat/completions", "/v1/messages") or not body:
+        return body
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+
+    if path == "/v1/messages":
+        # Anthropic: top-level `system` (string or list of content blocks).
+        sys = data.get("system")
+        if isinstance(sys, str):
+            if _OPENCLAW_SYSTEM in sys:
+                return body
+            data["system"] = _OPENCLAW_SYSTEM + (("\n\n" + sys) if sys else "")
+        elif isinstance(sys, list):
+            if any(isinstance(b, dict) and _OPENCLAW_SYSTEM in str(b.get("text", "")) for b in sys):
+                return body
+            data["system"] = [{"type": "text", "text": _OPENCLAW_SYSTEM}, *sys]
+        else:
+            data["system"] = _OPENCLAW_SYSTEM
+    else:
+        # OpenAI: ensure a system message in `messages` carries the preamble.
+        msgs = data.get("messages")
+        if not isinstance(msgs, list):
+            return body
+        sys_msg = next((m for m in msgs if isinstance(m, dict) and m.get("role") == "system"), None)
+        content = sys_msg.get("content") if sys_msg else None
+        if isinstance(content, str):
+            if _OPENCLAW_SYSTEM in content:
+                return body
+            sys_msg["content"] = _OPENCLAW_SYSTEM + (("\n\n" + content) if content else "")
+        else:
+            data["messages"] = [{"role": "system", "content": _OPENCLAW_SYSTEM}, *msgs]
+
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+
+
 def _is_event_stream(content_type: str | None) -> bool:
     return bool(content_type and "text/event-stream" in content_type.lower())
 
@@ -158,6 +206,7 @@ async def handle(req: web.Request) -> web.StreamResponse:
             headers[h] = req.headers[h]
 
     body = await req.read()
+    body = _inject_openclaw_system(req.path, body)
     t0 = time.monotonic()
     resp: web.StreamResponse | None = None
     is_sse = False

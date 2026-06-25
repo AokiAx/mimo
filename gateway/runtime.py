@@ -581,8 +581,14 @@ async def _probe_loop() -> None:
             return
         started = time.monotonic()
         try:
-            body = _probe_non_stream_body(backend)
-            ok, reason = await _run_one_probe_check(backend, "probe", body)
+            # Try each chat-capable model until one answers: MiMo lists models
+            # (e.g. mimo-v2-flash/omni) that /v1/chat/completions rejects as
+            # "Not supported", which must not fail an otherwise-healthy backend.
+            ok, reason = False, "no probeable models"
+            for _m in _probeable_models(backend):
+                ok, reason = await _run_one_probe_check(backend, "probe", _probe_body_for_model(_m))
+                if ok:
+                    break
         except Exception as e:  # noqa: BLE001
             ok = False
             reason = f"{type(e).__name__}: {e}"
