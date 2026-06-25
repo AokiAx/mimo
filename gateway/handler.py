@@ -247,8 +247,8 @@ class GatewayHandler:
             body["model"] = native
             ctx.model = native
 
-        parsed_for_capabilities = adapter.parse_request(body)
-        validate_request_capabilities(parsed_for_capabilities)
+        # Capability gate runs on the raw Anthropic body (handles both base64
+        # and URL image sources); no IES parse needed on the passthrough path.
         validate_anthropic_body_capabilities(native, body)
 
         # Rehydrate missing thinking blocks before sending to upstream.
