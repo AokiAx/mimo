@@ -123,7 +123,10 @@ _OPENCLAW_SYSTEM = "You are a personal assistant running inside OpenClaw"
 
 
 def _inject_openclaw_system(path: str, body: bytes) -> bytes:
-    if path not in ("/v1/chat/completions", "/v1/messages") or not body:
+    # Anthropic clients reach the gateway-forwarded /anthropic/v1/messages
+    # directly; OpenAI clients and the liveness probe use /v1/chat/completions.
+    anthropic = path in ("/v1/messages", "/anthropic/v1/messages")
+    if (path != "/v1/chat/completions" and not anthropic) or not body:
         return body
     try:
         data = json.loads(body)
@@ -132,7 +135,7 @@ def _inject_openclaw_system(path: str, body: bytes) -> bytes:
     if not isinstance(data, dict):
         return body
 
-    if path == "/v1/messages":
+    if anthropic:
         # Anthropic: top-level `system` (string or list of content blocks).
         sys = data.get("system")
         if isinstance(sys, str):
