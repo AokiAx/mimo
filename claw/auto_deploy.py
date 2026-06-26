@@ -276,7 +276,9 @@ def probe_create_risk(cookies: list) -> str:
       'ERROR'    — call failed / unrecognised.
     """
     try:
-        _c, d = curl_api_sync(
+        import importlib
+        curl_api = importlib.import_module("app").curl_api
+        _c, d = curl_api(
             "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
         )
     except Exception:
