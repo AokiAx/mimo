@@ -246,16 +246,73 @@ def _is_retryable_create_429(data: object) -> bool:
     return isinstance(data, dict) and data.get("code") == 429
 
 
-def quarantine_risk_account(account_filename: str) -> None:
+# Account-level risk gate at create. MiMo rejects mimo-claw/create with code!=0
+# and msg "当前账号存在风险，暂无法创建" when the account is risk-flagged. This is
+# NOT capacity (429 / 机器已达上限) and NOT quota (7001), and it is INVISIBLE to
+# /user/mi/get — bannedStatus stays NOT_BANNED — so the create call is the ONLY
+# signal. Probing create on a flagged account is free: it returns this verdict
+# without creating a Claw or consuming the daily quota (verified 2026-06-26).
+_RISK_CREATE_MARKERS = ("存在风险", "暂无法创建", "账号风险")
+
+
+def _is_account_risk_create(data: object) -> bool:
+    """True if a create response is the account-risk rejection (not capacity/quota)."""
+    if not isinstance(data, dict):
+        return False
+    msg = str(data.get("msg") or data.get("message") or "")
+    return any(m in msg for m in _RISK_CREATE_MARKERS)
+
+
+def probe_create_risk(cookies: list) -> str:
+    """Classify an account's create eligibility by calling mimo-claw/create.
+
+    Returns:
+      'RISK'     — risk-gated ("存在风险"); created nothing, quota untouched, so
+                   FREE to call repeatedly on flagged accounts.
+      'QUOTA'    — code 7001, today's create already used (=> NOT risk-gated).
+      'CAPACITY' — pool full (429 / 机器已达上限 / 资源当前不可用) (=> NOT risk-gated).
+      'OK'       — code 0; a Claw is now being created (create has NO dry-run), so
+                   only call where an actual create is acceptable.
+      'ERROR'    — call failed / unrecognised.
+    """
+    try:
+        _c, d = curl_api_sync(
+            "POST", "/open-apis/user/mimo-claw/create", body={}, cookies=cookies,
+        )
+    except Exception:
+        return "ERROR"
+    if isinstance(d, dict):
+        code = d.get("code")
+        if code == 0:
+            return "OK"
+        if code == 7001:
+            return "QUOTA"
+        if _is_account_risk_create(d):
+            return "RISK"
+        if _is_retryable_create_429(d):
+            return "CAPACITY"
+        msg = str(d.get("msg") or d.get("message") or "")
+        if "机器已达上限" in msg or "资源当前不可用" in msg:
+            return "CAPACITY"
+    return "ERROR"
+
+
+def quarantine_risk_account(
+    account_filename: str,
+    reason: str = "账号被 MiMo 风控 (bannedStatus)",
+    kind: str = "banned",
+) -> None:
     """Move an account into the RISK pool: disable auto-deploy and tag it so the
-    proactive scan in claw_activity stops selecting it. Unlike a permanent drop,
-    the risk pool is re-checked every 24h and released if the ban clears
+    proactive scan in claw_activity stops selecting it. ``kind`` records why and
+    drives recovery: 'banned' is re-checked via /user/mi/get bannedStatus;
+    'create_gate' is re-checked via a free create probe. Released when cleared
     (see :func:`release_risk_account`). Idempotent."""
     cfg = load_config()
     acc = cfg.setdefault("accounts", {}).setdefault(account_filename, {})
     acc["enabled"] = False
     acc["risk_blocked"] = True
-    acc["risk_blocked_reason"] = "账号被 MiMo 风控 (bannedStatus)"
+    acc["risk_blocked_reason"] = reason
+    acc["risk_kind"] = kind
     acc["risk_blocked_at"] = int(time.time())
     save_config(cfg)
 
@@ -271,6 +328,7 @@ def release_risk_account(account_filename: str) -> None:
     acc["enabled"] = True
     acc.pop("risk_blocked", None)
     acc.pop("risk_blocked_reason", None)
+    acc.pop("risk_kind", None)
     acc.pop("risk_blocked_at", None)
     save_config(cfg)
 
@@ -996,6 +1054,17 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 # per-day cooldown should normally prevent reaching here.
                 if isinstance(d2, dict) and d2.get("code") == 7001:
                     log.log(f"\u26d4 \u4eca\u65e5\u514d\u8d39\u521b\u5efa\u989d\u5ea6\u5df2\u7528\u5b8c\uff087001\uff09\uff0c\u505c\u6b62: {d2.get('msg')}")
+                    return False
+                if _is_account_risk_create(d2):
+                    log.log(f"⛔ 账号被风控（create 拒绝）: {d2.get('msg')} → 已隔离，停止重试")
+                    try:
+                        quarantine_risk_account(
+                            account_filename,
+                            reason=f"create 风控: {d2.get('msg')}",
+                            kind="create_gate",
+                        )
+                    except Exception as _e:
+                        log.log(f"⚠️ 隔离失败: {_e}")
                     return False
                 if not _is_retryable_create_429(d2):
                     log.log(f"\u274c \u521b\u5efa Claw \u5931\u8d25: {d2}")

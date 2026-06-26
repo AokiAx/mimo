@@ -75,6 +75,10 @@ _RISK_CHECK_INTERVAL_S = 30 * 60  # re-check each active account at most every 3
 # the active pool if their bannedStatus has recovered to NOT_BANNED.
 _quarantine_check_last: dict[str, float] = {}
 _QUARANTINE_RECHECK_S = 24 * 60 * 60  # re-check each quarantined account every 24h
+# 'create_gate' quarantines (account risk gate at create) are re-checked via a
+# FREE create probe (returns RISK without creating anything while still flagged),
+# so we can re-check far more often than the bannedStatus path.
+_CREATE_GATE_RECHECK_S = 2 * 60 * 60  # re-probe create-risk accounts every 2h
 
 
 def _enabled_deployed_accounts() -> list[str]:
@@ -302,18 +306,57 @@ def _scan_risk_and_quarantine() -> None:
 
 
 def _scan_quarantine_for_recovery() -> None:
-    """Re-check the RISK pool every 24h: if a quarantined account's bannedStatus
-    has recovered to NOT_BANNED, release it back into the active pool."""
+    """Re-check the RISK pool and release accounts whose risk has cleared.
+
+    Two quarantine kinds, two probes:
+      * 'create_gate' (account risk gate at create) — the ONLY signal is the
+        create call; probing it is FREE while still flagged (returns RISK and
+        creates nothing). Re-checked every _CREATE_GATE_RECHECK_S; released once
+        the probe no longer returns RISK. bannedStatus is useless here (it stays
+        NOT_BANNED while create-risk-gated), which is exactly why this branch
+        exists — the old bannedStatus-only recovery would have released these
+        immediately and re-hammered them.
+      * 'banned' / legacy — bannedStatus on /user/mi/get; released on
+        NOT_BANNED, 24h cadence.
+    """
     try:
-        from claw.auto_deploy import _load_account_cookies, release_risk_account
+        from claw.auto_deploy import (
+            _load_account_cookies, release_risk_account, load_config,
+            probe_create_risk, mark_account_created,
+        )
     except Exception:
         return
     now = time.time()
+    try:
+        accounts_cfg = (load_config().get("accounts") or {})
+    except Exception:
+        accounts_cfg = {}
     for acc in _quarantined_accounts():
-        if now - _quarantine_check_last.get(acc, 0.0) < _QUARANTINE_RECHECK_S:
-            continue
+        kind = (accounts_cfg.get(acc) or {}).get("risk_kind", "banned")
         cookies = _load_account_cookies(acc)
         if cookies is None:
+            continue
+        if kind == "create_gate":
+            if now - _quarantine_check_last.get(acc, 0.0) < _CREATE_GATE_RECHECK_S:
+                continue
+            _quarantine_check_last[acc] = now
+            verdict = probe_create_risk(cookies)
+            if verdict == "RISK":
+                continue  # still flagged — free probe, nothing created
+            if verdict in ("OK", "QUOTA", "CAPACITY"):
+                logger.warning("[activity] %s: create 风控已解除 (probe=%s) → 放回可用池", acc, verdict)
+                try:
+                    release_risk_account(acc)
+                    if verdict == "OK":
+                        # the probe actually created a Claw; record the daily
+                        # quota so the relay reuses it instead of re-creating.
+                        mark_account_created(acc)
+                except Exception:
+                    logger.exception("[activity] %s: create-gate release failed", acc)
+            # ERROR → leave quarantined, retry next window
+            continue
+        # legacy / banned: bannedStatus recovery
+        if now - _quarantine_check_last.get(acc, 0.0) < _QUARANTINE_RECHECK_S:
             continue
         banned = _check_account_banned(cookies)
         _quarantine_check_last[acc] = now
