@@ -422,6 +422,19 @@ def test_probe_model_picks_v25_over_legacy_v2():
     assert runtime._probe_model(b) == "mimo-v2.5-pro"
 
 
+def test_probeable_models_prefers_pro_over_bare_v25():
+    """Bare mimo-v2.5 often 400s on free Claw; probe pro first to avoid log spam."""
+    b = _backend("x")
+    b.models = [
+        "mimo-v2.5",
+        "mimo-v2.5-asr",
+        "mimo-v2.5-pro",
+        "mimo-v2.5-tts",
+    ]
+    assert runtime._probeable_models(b) == ["mimo-v2.5-pro", "mimo-v2.5"]
+    assert runtime._probe_model(b) == "mimo-v2.5-pro"
+
+
 def test_health_degrades_then_dies_then_recovers():
     b = _backend("x")
     b.record_failure("boom")

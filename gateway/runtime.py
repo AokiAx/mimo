@@ -87,11 +87,29 @@ def _probeable_models(backend: Backend) -> list[str]:
 
     Excludes non-chat (tts/asr) models and keeps only the v2.5 family. The older
     v2 models are delisted upstream, so there is no fallback to them — a backend
-    exposing no v2.5 chat model simply has nothing to probe."""
-    return [
+    exposing no v2.5 chat model simply has nothing to probe.
+
+    Prefer pro / ultraspeed over bare ``mimo-v2.5``: free-tier Claw lists the
+    base id in /v1/models but rejects plain chat with HTTP 400 Param Incorrect,
+    which used to flood error logs every probe tick before falling through to pro.
+    """
+    models = [
         m for m in backend.models
         if m and _PROBE_MODEL_RE.search(m) and not _NON_CHAT_MODEL_RE.search(m)
     ]
+
+    def _rank(name: str) -> tuple[int, str]:
+        n = name.lower()
+        if "ultraspeed" in n:
+            return (0, n)
+        if n.endswith("-pro") or "-pro-" in n:
+            return (1, n)
+        # bare base model last (often multi-modal / free-tier rejects text-only)
+        if n == "mimo-v2.5" or n.endswith("/mimo-v2.5"):
+            return (3, n)
+        return (2, n)
+
+    return sorted(models, key=_rank)
 
 # ────────────── singleton state ──────────────
 

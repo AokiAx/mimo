@@ -888,12 +888,13 @@ def register(
                 print(f"[reg] 图形码未过 ({captcha_try!r}): {desc}")
                 break  # refresh image via next outer loop
             # 85005 = request rejected / rate limit — back off and retry captcha loop
-            if code == 85005 and rate_limit_waits < 3:
+            if code == 85005 and rate_limit_waits < 6:
                 rate_limit_waits += 1
-                wait_s = 20 * rate_limit_waits
+                wait_s = min(300, 45 * rate_limit_waits)
                 print(f"[reg] 限流 85005，等待 {wait_s}s 后重试…", flush=True)
                 time.sleep(wait_s)
                 code = 87001  # re-enter captcha loop
+                captcha_attempts = max(0, captcha_attempts - 1)  # don't burn captcha slots on rate-limit
                 continue
             if code not in (87006, 87001):
                 break

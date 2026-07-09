@@ -115,11 +115,24 @@ def _upstream_path(path: str) -> str:
     return path
 
 
-# MiMo's REST inference rejects any chat request whose system prompt does NOT
-# contain this OpenClaw preamble (HTTP 400 "Param Incorrect"/"Invalid request").
-# We inject it (idempotently) so gateway, probe, and direct requests are accepted;
-# the client's own system prompt is preserved — we only prepend the required line.
+# MiMo free-tier REST is model-dependent about system prompts (A/B on live Claw):
+#   - mimo-v2.5-pro / pro-ultraspeed: MUST include the OpenClaw preamble or
+#     upstream returns HTTP 400 "Param Incorrect"/"Invalid request".
+#   - bare mimo-v2.5 and everything else we tested: system (incl. OpenClaw) → 400;
+#     plain user messages work without injection.
+# Only inject for pro family; client's own system text is preserved (prepend).
 _OPENCLAW_SYSTEM = "You are a personal assistant running inside OpenClaw"
+
+
+def _model_wants_openclaw_system(model: str) -> bool:
+    """True only for pro-family chat models that require the OpenClaw preamble."""
+    m = (model or "").strip().lower()
+    if not m or "tts" in m or "asr" in m:
+        return False
+    # pro / pro-ultraspeed (and legacy v2-pro if ever remapped)
+    if m.endswith("-pro") or "-pro-" in m or m.endswith("-pro-ultraspeed"):
+        return True
+    return False
 
 
 def _inject_openclaw_system(path: str, body: bytes) -> bytes:
@@ -135,10 +148,8 @@ def _inject_openclaw_system(path: str, body: bytes) -> bytes:
     if not isinstance(data, dict):
         return body
 
-    # TTS/ASR models reject a system role ("system role is not allowed for TTS
-    # model") and don't need the chat gating — never inject for them.
     model = str(data.get("model", "")).lower()
-    if "tts" in model or "asr" in model:
+    if not _model_wants_openclaw_system(model):
         return body
 
     if anthropic:

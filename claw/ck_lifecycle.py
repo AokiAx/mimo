@@ -584,10 +584,10 @@ def try_replace(count: int = 1, dry_run: bool = False, enable_deploy: bool = Tru
             "85005" in err or "限流" in err or "请求被拒绝" in err
         ):
             consecutive_rate += 1
-            wait_s = min(180, 30 * consecutive_rate)
+            wait_s = min(600, 60 * consecutive_rate)
             print(f"[replace] rate-limit, sleep {wait_s}s then retry same slot", flush=True)
             time.sleep(wait_s)
-            if consecutive_rate <= 4:
+            if consecutive_rate <= 8:
                 continue  # retry same i
         else:
             consecutive_rate = 0
@@ -611,7 +611,9 @@ def try_replace(count: int = 1, dry_run: bool = False, enable_deploy: bool = Tru
         )
         i += 1
         if i < count and res.get("status") == "ok":
-            time.sleep(3)  # gentle spacing between successful regs
+            time.sleep(15)  # space successes to avoid 85005
+        elif i < count and res.get("status") != "ok":
+            time.sleep(8)
     return results
 
 

@@ -59,7 +59,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,syst
 .pool-pill.bad b{color:var(--red)}
 .pool-pill.muted b{color:var(--text2)}
 .pool-pill .dot{width:7px;height:7px;border-radius:50%}
-.page-hint{font-size:.8rem;color:var(--text3);margin:-4px 0 14px;line-height:1.5}
+.page-hint{display:none}
 .indicator{width:9px;height:9px;border-radius:50%;display:inline-block;flex-shrink:0}
 .indicator.green{background:var(--green);box-shadow:0 0 6px var(--green)}
 .indicator.red{background:var(--red);box-shadow:0 0 6px var(--red)}
@@ -261,13 +261,12 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 <nav class="sidebar">
   <div class="sidebar-brand">
     <h1>MiMo</h1>
-    <div class="sub">账号 · Claw · 网关</div>
   </div>
 
   <div class="nav-section">
     <div class="nav-label">运营</div>
     <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')">
-      <span class="icon">◈</span><span>舰队概览</span>
+<span class="icon">◈</span><span>概览</span>
     </div>
     <div class="nav-item" data-page="accounts" onclick="switchPage('accounts')">
       <span class="icon">◎</span><span>账号池</span>
@@ -324,7 +323,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 <!-- ═══ Main Content ═══ -->
 <div class="main">
   <div class="topbar">
-    <div class="topbar-title" id="pageTitle">舰队概览</div>
+    <div class="topbar-title" id="pageTitle">概览</div>
     <div class="topbar-right">
       <span id="curAccountLabel" style="color:var(--text);font-size:0.82rem">
         <span style="color:var(--text3)">当前：</span><span id="curAccountName">--</span>
@@ -338,32 +337,22 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 
     <!-- ════ Dashboard ════ -->
     <div class="page active" id="page-dashboard">
-      <p class="page-hint">每 2 小时开一只新 Claw，单只约 4 小时；最后 30 分钟只排空不接新请求。目标常备约 12 个可用账号。</p>
-
-      <div class="fleet-banner">
-        <div class="fleet-hero">
-          <h3>舰队状态</h3>
-          <div class="big" id="dashFleetHeadline">加载中…</div>
-          <div class="sub" id="dashFleetSub">正在读取账号池与后端</div>
-          <div class="pool-pills" id="dashPoolPills">
-            <span class="pool-pill muted"><span class="dot" style="background:var(--text3)"></span>可用 <b id="pillAvail">–</b></span>
-            <span class="pool-pill muted"><span class="dot" style="background:var(--accent)"></span>服役 <b id="pillServing">–</b></span>
-            <span class="pool-pill muted"><span class="dot" style="background:var(--yellow)"></span>冷却 <b id="pillCooldown">–</b></span>
-            <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>风控 <b id="pillRisk">–</b></span>
-            <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>失效 <b id="pillDead">–</b></span>
-          </div>
+      <div class="section" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div class="pool-pills" id="dashPoolPills" style="margin:0">
+          <span class="pool-pill muted"><span class="dot" style="background:var(--text3)"></span>可用 <b id="pillAvail">–</b></span>
+          <span class="pool-pill muted"><span class="dot" style="background:var(--accent)"></span>服役 <b id="pillServing">–</b></span>
+          <span class="pool-pill muted"><span class="dot" style="background:var(--yellow)"></span>冷却 <b id="pillCool">–</b></span>
+          <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>风控 <b id="pillRisk">–</b></span>
+          <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>失效 <b id="pillDead">–</b></span>
+          <span class="pool-pill muted">活号 <b id="dashAutoLive">–</b>/<b id="dashPoolTarget">12</b></span>
         </div>
-        <div class="fleet-hero" style="background:var(--card)">
-          <h3>账号库存</h3>
-          <div class="big"><span id="dashAutoLive">–</span> <span style="font-size:.9rem;color:var(--text3);font-weight:500">/ <span id="dashPoolTarget">12</span> 活号</span></div>
-          <div class="sub" id="dashWaterHint">自动注册账号 · 低于目标时后台补号</div>
-          <div class="btn-group" style="margin-top:14px">
-            <button class="btn btn-primary" onclick="refreshDashboard()">刷新</button>
-            <button class="btn btn-ghost" onclick="switchPage('accounts')">账号池</button>
-            <button class="btn btn-ghost" onclick="switchPage('deploy')">部署</button>
-          </div>
+        <div class="btn-group" style="margin:0">
+          <button class="btn btn-primary" onclick="refreshDashboard()">刷新</button>
         </div>
       </div>
+      <div id="dashFleetHeadline" style="display:none"></div>
+      <div id="dashFleetSub" style="display:none"></div>
+      <div id="dashWaterHint" style="display:none"></div>
 
       <div class="grid">
         <div class="metric-card">
@@ -372,15 +361,15 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashCookieValid">--</div>
-          <div class="metric-label">Cookie 有效</div>
+          <div class="metric-label">Cookie</div>
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashGwBackends">--</div>
-          <div class="metric-label">后端 健康/总</div>
+          <div class="metric-label">后端</div>
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashGwActive">--</div>
-          <div class="metric-label">活跃后端</div>
+          <div class="metric-label">活跃</div>
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashGwQps">--</div>
@@ -405,7 +394,6 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 
     <!-- ════ Accounts (unified Account + Claw + Cookie + SSO) ════ -->
     <div class="page" id="page-accounts">
-      <p class="page-hint">主池用自动注册账号；Cookie 失效后归档并补新号（不重登临时邮箱）。也可手动登录或导入 Cookie。</p>
       <div class="section">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px;flex-wrap:wrap">
           <h2 style="margin:0">账号池</h2>
@@ -429,8 +417,8 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         <!-- Tab: SSO login -->
         <div id="addtab-sso" class="addtab-pane">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
-            <input type="text" id="ssoFilename" placeholder="账号文件名（自动生成或自定义）">
-            <input type="text" id="ssoEmail" placeholder="小米账号 / 邮箱" autocomplete="username">
+            <input type="text" id="ssoFilename" placeholder="文件名">
+            <input type="text" id="ssoEmail" placeholder="邮箱" autocomplete="username">
           </div>
           <input type="password" id="ssoPassword" placeholder="密码" autocomplete="current-password" style="margin-bottom:8px">
           <div class="btn-group">
@@ -454,7 +442,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
             <input type="text" id="cookieAccountName" placeholder="账号名称">
             <input type="text" id="cookieAccountEmail" placeholder="邮箱（可选）">
           </div>
-          <textarea id="cookieAccountStr" rows="3" placeholder="粘贴 cookie 字符串（必须含 xiaomichatbot_ph）" style="font-family:monospace;font-size:0.82rem"></textarea>
+          <textarea id="cookieAccountStr" rows="3" placeholder="cookie" style="font-family:monospace;font-size:0.82rem"></textarea>
           <div class="btn-group">
             <button class="btn btn-success" onclick="addAccountCookieString()">添加</button>
           </div>
@@ -463,7 +451,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         <!-- Tab: Cookie JSON -->
         <div id="addtab-json" class="addtab-pane" style="display:none">
           <input type="text" id="jsonAccountName" placeholder="账号名称" style="margin-bottom:8px">
-          <textarea id="jsonAccountCookies" placeholder="粘贴 Cookie JSON 数组..." rows="4" style="font-family:monospace;font-size:0.82rem"></textarea>
+          <textarea id="jsonAccountCookies" placeholder="JSON" rows="4" style="font-family:monospace;font-size:0.82rem"></textarea>
           <div class="btn-group">
             <button class="btn btn-success" onclick="addAccountJson()">添加</button>
           </div>
@@ -482,7 +470,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           </div>
         </div>
         <div class="chat-box">
-          <textarea id="clawInput" placeholder="向 Claw 发送消息...（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
+          <textarea id="clawInput" placeholder="消息" rows="2"></textarea>
           <button class="btn btn-primary" id="clawBtn" onclick="clawSend()">发送</button>
         </div>
         <div style="display:flex;align-items:center;margin-bottom:10px">
@@ -490,7 +478,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           <span class="chat-count" id="chatCount"></span>
         </div>
         <div class="chat-history" id="clawHistory">
-          <div style="color:var(--text3);text-align:center;padding:40px 0">消息将显示在这里...</div>
+          <div style="color:var(--text3);text-align:center;padding:40px 0">暂无消息</div>
         </div>
       </div>
     </div>
@@ -519,7 +507,6 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
       <div class="section" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
         <div>
           <h2 style="margin:0">中转机</h2>
-          <div class="meta">Claw 通过反向 SSH 把 API 转到目标机；网关访问目标机本地端口。</div>
         </div>
         <div class="btn-group" style="margin:0">
           <button class="btn btn-primary" onclick="saveSshTargets()">保存配置</button>
@@ -536,7 +523,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           </div>
           <div>
             <label style="font-size:.8rem;color:var(--text2)">默认目标机 ID</label>
-            <input id="sshDefaultTarget" list="sshTargetIdList" placeholder="留空则每个账号需单独分配" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+            <input id="sshDefaultTarget" list="sshTargetIdList" placeholder="默认目标" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
             <datalist id="sshTargetIdList"></datalist>
           </div>
         </div>
@@ -560,7 +547,6 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px">
           <div>
             <h2 style="margin:0">账号分配</h2>
-            <div class="meta">端口留空时，部署会自动从端口池分配。</div>
           </div>
           <button class="btn" onclick="sshAddAssignmentRow()">新增分配</button>
         </div>
@@ -592,7 +578,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           <select id="logFileSelect" onchange="loadSelectedLog()"></select>
           <input type="number" id="logLines" min="50" max="5000" value="300" title="读取最后 N 行">
           <button class="btn btn-ghost" onclick="loadSelectedLog()">读取尾部</button>
-          <span class="meta">app.log 运行日志；error.log 仅错误。按天切分并自动清理。</span>
+
         </div>
         <pre class="log-viewer" id="logViewer">选择日志后点击刷新。</pre>
       </div>
@@ -625,7 +611,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         </div>
         <div class="section">
           <h2>路由模式</h2>
-          <div id="gwPoolInfo"><div class="stat-row"><span class="label">路由模式</span><span class="value">--</span></div></div>
+          <div id="gwPoolInfo"></div>
         </div>
       </div>
     </div>
@@ -655,16 +641,16 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           </div>
           <div>
             <label style="font-size:.8rem;color:var(--text2)">API Key</label>
-            <input id="beKey" placeholder="(可选，留空使用 secrets.upstream_api_key)" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+            <input id="beKey" placeholder="可选" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
           </div>
         </div>
         <div style="margin-top:12px;max-width:700px">
-          <label style="font-size:.8rem;color:var(--text2)">上游模型 * <span style="color:var(--text3);font-weight:normal">（官方 V2.5 全套）</span></label>
+          <label style="font-size:.8rem;color:var(--text2)">模型 *</label>
           <div id="beModelsChips" style="min-height:42px;padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px">
-            <input id="beModelsInput" type="text" placeholder="输入模型名后按 Enter 或逗号" style="flex:1;min-width:180px;border:none;background:transparent;color:var(--text);font-size:.85rem;outline:none">
+            <input id="beModelsInput" type="text" placeholder="模型名" style="flex:1;min-width:180px;border:none;background:transparent;color:var(--text);font-size:.85rem;outline:none">
           </div>
           <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
-            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()" id="beFillMimoBtn">一键填充 V2.5（7 个）</button>
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()" id="beFillMimoBtn">填充 V2.5</button>
             <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beClearModels()">清空</button>
           </div>
         </div>
@@ -688,9 +674,6 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           <button class="btn" onclick="mgNewGroup()">新建分组</button>
           <button class="btn btn-ghost" onclick="mgImportBackends()">从后端导入</button>
         </div>
-      </div>
-      <div id="mgInfo" style="color:var(--text3);font-size:.82rem;padding:6px 0 12px 0">
-        对外暴露名 → 上游真实模型名。客户端用暴露名调用接口，网关按映射转发。
       </div>
       <div id="mgGroupsContainer"></div>
     </div>
@@ -721,7 +704,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         </div>
       </div>
       <div class="section">
-        <h2>近 24 小时请求量（窗格）</h2>
+        <h2>24h 请求</h2>
         <div class="hour-grid" id="hourGrid"></div>
         <div class="hour-axis" id="hourAxis"></div>
       </div>
@@ -760,54 +743,34 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
     <!-- ════ API Docs ════ -->
     <div class="page" id="page-api-docs">
       <div class="section">
-        <h2>支持的端点</h2>
+        <h2>API</h2>
         <table class="data-table">
-          <thead><tr><th>端点</th><th>方法</th><th>认证</th><th>描述</th></tr></thead>
+          <thead><tr><th>端点</th><th>方法</th><th>认证</th></tr></thead>
           <tbody>
-            <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>Bearer</td><td>OpenAI 原生格式</td></tr>
-            <tr><td><code>/v1/messages</code></td><td>POST</td><td>Bearer</td><td>Anthropic 原生透传</td></tr>
-            <tr><td><code>/v1/responses</code></td><td>POST</td><td>Bearer</td><td>Responses 格式 → OpenAI</td></tr>
-            <tr><td><code>/v1/models</code></td><td>GET</td><td>无</td><td>列出映射后的可用模型</td></tr>
-            <tr><td><code>/health</code></td><td>GET</td><td>无</td><td>公开健康检查</td></tr>
-            <tr><td><code>/api/public/status</code></td><td>GET</td><td>Status Key</td><td>状态页数据（需独立 status_api_token）</td></tr>
+            <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>Bearer</td></tr>
+            <tr><td><code>/v1/messages</code></td><td>POST</td><td>Bearer</td></tr>
+            <tr><td><code>/v1/responses</code></td><td>POST</td><td>Bearer</td></tr>
+            <tr><td><code>/v1/models</code></td><td>GET</td><td>—</td></tr>
+            <tr><td><code>/health</code></td><td>GET</td><td>—</td></tr>
+            <tr><td><code>/api/public/status</code></td><td>GET</td><td>Status Key</td></tr>
           </tbody>
         </table>
-      </div>
-      <div class="section">
-        <h2>认证</h2>
-        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p>数据面写请求（<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/messages</code>）需要：</p>
-          <pre style="background:#0d1b2a;padding:12px;border-radius:6px;margin:10px 0;font-size:0.82rem;color:var(--text)">Authorization: Bearer sk-Aoki-MiMo</pre>
-          <p>网关会自动注入后端 API key，客户端只需提供网关 token。<code>/v1/models</code> 与 <code>/health</code> 公开可读；<code>/api/public/status</code> 使用独立的 <code>status_api_token</code>。</p>
-        </div>
-      </div>
-      <div class="section">
-        <h2>格式转换</h2>
-        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p><strong>OpenAI Chat / Responses</strong>：走统一适配链路，<code>/v1/responses</code> 会转换到上游 Chat 格式并路由到最佳可用后端。</p>
-          <p style="margin-top:8px"><strong>Anthropic Messages</strong>：<code>/v1/messages</code> 先做模型映射和能力校验，再直连上游 Anthropic 原生接口，保留 <code>thinking</code>、<code>signature</code> 与 beta header。</p>
-        </div>
+        <pre style="background:#0d1b2a;padding:12px;border-radius:6px;margin:14px 0 0;font-size:0.82rem;color:var(--text)">Authorization: Bearer &lt;public_api_token&gt;</pre>
       </div>
     </div>
 
     <!-- ════ Panel access control ════ -->
     <div class="page" id="page-panel-acl">
       <div class="section">
-        <h2>🔒 面板访问控制</h2>
-        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p>仅限列表内的 IP 访问管理面板。公开 API（<code>/v1/*</code>）、探针等端点不受此限制。</p>
-          <p style="margin-top:6px">你当前的 IP：<strong id="aclYourIp" style="color:var(--text)">--</strong>
-            <button class="btn btn-ghost" style="padding:3px 10px;margin-left:8px" onclick="aclAddMyIp()">加入我的 IP</button>
-          </p>
-          <p style="margin-top:6px;color:var(--yellow)">⚠️ 留空 = 不限制（任意 IP 可访问）。保存非空列表时，若不含你当前 IP 会被拒绝，避免把自己锁在外面。</p>
+        <h2>访问控制</h2>
+        <div style="margin-bottom:10px;font-size:0.85rem;color:var(--text2)">
+          当前 IP：<strong id="aclYourIp" style="color:var(--text)">--</strong>
+          <button class="btn btn-ghost" style="padding:3px 10px;margin-left:8px" onclick="aclAddMyIp()">加入</button>
         </div>
-      </div>
-      <div class="section">
-        <h2>白名单（每行一个 IP 或 CIDR）</h2>
-        <textarea id="aclTextarea" rows="8" placeholder="例如：&#10;203.0.113.5&#10;198.51.100.0/24" style="min-height:160px;font-family:monospace"></textarea>
+        <textarea id="aclTextarea" rows="8" placeholder="IP / CIDR，每行一个；空=不限制" style="min-height:160px;font-family:monospace"></textarea>
         <div class="btn-group">
           <button class="btn btn-primary" id="aclSaveBtn" onclick="savePanelAcl()">保存</button>
-          <button class="btn btn-ghost" onclick="refreshPanelAcl()">重新加载</button>
+          <button class="btn btn-ghost" onclick="refreshPanelAcl()">重载</button>
         </div>
       </div>
     </div>
@@ -815,25 +778,15 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
     <!-- ════ Secrets management ════ -->
     <div class="page" id="page-secrets">
       <div class="section">
-        <h2>🔑 密钥管理</h2>
-        <div style="font-size:0.88rem;color:var(--text2);line-height:1.7">
-          <p>在此查看 / 修改 / 轮换面板与接口密钥（持久化到 <code>data/secrets.json</code>，改完即时生效，无需重启）。</p>
-          <p style="margin-top:6px;color:var(--yellow)">⚠️ 轮换<strong>公开 API token</strong> 会让现有客户端失效；修改<strong>面板会话 token</strong> 仅当前浏览器会自动续上 cookie，其它已登录会话会掉线。被<span style="color:var(--text)">环境变量锁定</span>的字段不可在此修改。</p>
-        </div>
-      </div>
-      <div class="section">
+        <h2>密钥</h2>
         <div id="secretsBody"></div>
         <div id="secretsStatus" class="secret-status" role="status" aria-live="polite"></div>
         <div class="btn-group" style="margin-top:14px">
-          <button class="btn btn-primary" id="secretsSaveBtn" onclick="saveSecrets()">保存修改</button>
-          <button class="btn btn-ghost" onclick="refreshSecrets()">重新加载</button>
+          <button class="btn btn-primary" id="secretsSaveBtn" onclick="saveSecrets()">保存</button>
+          <button class="btn btn-ghost" onclick="refreshSecrets()">重载</button>
         </div>
       </div>
-    
-</div>
-
-
-</div>
+    </div>
 
   </div><!-- /content -->
 </div><!-- /main -->
@@ -893,7 +846,7 @@ function formatUptime(sec) {
 // Page Navigation
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
-  dashboard: '舰队概览', accounts: '账号池',
+  dashboard: '概览', accounts: '账号池',
   chat: '对话', deploy: '部署', 'ssh-targets': '中转机', logs: '日志',
   gateway: '网关状态', backends: '后端',
   mappings: '模型映射',
@@ -1029,12 +982,12 @@ function _dashPoolBadge(s) {
   // Prefer explicit pool label from account_pool (risk/dead/disabled/serving/cooldown/available)
   if (s.risk_blocked || s.pool === 'risk' || (s.banned_status && s.banned_status !== 'NOT_BANNED')) {
     var _rk = s.risk_kind === 'create_gate' ? '建号风控' : ((s.banned_status && s.banned_status !== 'NOT_BANNED') ? '封禁' : '风控');
-    return '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || 'risk') + '">🚫 ' + _rk + '隔离</span>';
+    return '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || '') + '">' + _rk + '</span>';
   }
-  if (s.pool === 'dead' || s.ck_live === false) return '<span class="status-text" style="color:var(--red)" title="Cookie 失效，需补新号">失效</span>';
+  if (s.pool === 'dead' || s.ck_live === false) return '<span class="status-text" style="color:var(--red)">失效</span>';
   if (s.pool === 'disabled') return '<span class="status-text" style="color:var(--text3)">停用</span>';
-  if (s.pool === 'serving' || s.is_serving) return '<span class="status-text ok" title="已挂载后端并接流量">服役</span>';
-  if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning" title="今日已创建过 Claw">冷却</span>';
+  if (s.pool === 'serving' || s.is_serving) return '<span class="status-text ok">服役</span>';
+  if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning">冷却</span>';
   if (s.pool === 'available' || s.can_create) return '<span class="status-text ok">可用</span>';
   return '<span class="status-text" style="color:var(--text3)">--</span>';
 }
@@ -1073,25 +1026,7 @@ function _applyPoolSnapshot(p) {
   }
   var pt = document.getElementById('dashPoolTarget');
   if (pt) pt.textContent = target;
-  var hl = document.getElementById('dashFleetHeadline');
-  var sub = document.getElementById('dashFleetSub');
-  if (hl) {
-    if (serving > 0 && avail > 0) hl.textContent = '运行中 · 可接力';
-    else if (serving > 0) hl.textContent = '运行中 · 可用号偏少';
-    else if (avail > 0) hl.textContent = '待命 · 尚未部署';
-    else hl.textContent = '告警 · 没有可用账号';
-  }
-  if (sub) {
-    sub.textContent = '可用 ' + avail + ' · 服役 ' + serving + ' · 冷却 ' + cool +
-      ' · 活号 ' + autoLive + '/' + target +
-      (dead ? ' · 失效 ' + dead + ' 待补' : '');
-  }
-  var wh = document.getElementById('dashWaterHint');
-  if (wh) {
-    wh.textContent = autoLive < target
-      ? ('低于目标 ' + target + '，后台会每次最多补 2 个')
-      : '库存正常 · 约每 2 小时开新号 · 末期 30 分钟排空';
-  }
+  // headline/sub/waterHint kept hidden — pills carry the numbers
 }
 
 function _dashRetallyCounters() {
@@ -1184,7 +1119,7 @@ function refreshAccountsFull() {
 function renderAccountCards() {
   var el = document.getElementById('accountCards');
   if (accounts.length === 0) {
-    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">暂无账号。等待自动补号，或点「添加 / 导入」。</div>';
+    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">暂无账号</div>';
     return;
   }
   var html = '';
@@ -1196,31 +1131,26 @@ function renderAccountCards() {
     var shortMail = (a.name || fn || '').replace(/@.*$/, '') + '@…';
     html += '<div class="acc-card' + (a.is_current ? ' current' : '') + (_isRisk ? ' risk' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
     html += '<div class="head">';
-    html += '<div><div class="name" title="' + escapeHtml(a.name || fn) + '">' + escapeHtml(a.name || fn) + '</div>';
-    html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:3px">uid ' + escapeHtml(s.user_id || a.user_id || '–') + '</div></div>';
+    html += '<div><div class="name" title="' + escapeHtml(a.name || fn) + '">' + escapeHtml(a.name || fn) + '</div></div>';
     html += '<div class="badges">' +
       (a.is_current ? '<span class="status-text ok">当前</span>' : '') +
       _dashPoolBadge(s) +
-      (s.cookie_valid === true ? '<span class="status-text ok">Cookie 有效</span>' :
-        (s.cookie_valid === false ? '<span class="status-text error">Cookie 失效</span>' : '')) +
-      (s.claw_status === 'AVAILABLE' ? '<span class="status-text ok">Claw 在线</span>' :
-        (s.claw_status === 'DESTROYED' ? '<span class="status-text warning">无 Claw</span>' : '')) +
+      (s.claw_status === 'AVAILABLE' ? '<span class="status-text ok">Claw</span>' : '') +
       '</div></div>';
-    if (_isRisk) {
-      html += '<div class="risk-reason">' + escapeHtml(s.risk_reason || s.banned_status || '风控隔离') + '</div>';
+    if (_isRisk && s.risk_reason) {
+      html += '<div class="risk-reason">' + escapeHtml(s.risk_reason) + '</div>';
     }
     html += '<div class="meta-row">';
-    html += '<div><span class="k">池</span><span class="v">' + escapeHtml(_poolLabel(s.pool)) + (s.can_create ? ' · 可开 Claw' : '') + '</span></div>';
-    html += '<div><span class="k">Claw</span><span class="v">' + escapeHtml(_clawLabel(s.claw_status)) + (s.claw_expire ? ' · ' + escapeHtml(s.claw_expire) : '') + '</span></div>';
-    html += '<div><span class="k">封禁</span><span class="v">' + escapeHtml(_banLabel(s.banned_status)) + '</span></div>';
+    html += '<div><span class="k">UID</span><span class="v">' + escapeHtml(s.user_id || a.user_id || '–') + '</span></div>';
+    html += '<div><span class="k">Claw</span><span class="v">' + escapeHtml(_clawLabel(s.claw_status)) + '</span></div>';
     html += '</div>';
     html += '<div class="actions">';
-    if (!a.is_current) html += '<button class="btn btn-ghost" onclick="accSwitch(\'' + fn + '\')">设为当前</button>';
-    html += '<button class="btn btn-success" onclick="accClawCreate(\'' + fn + '\')">创建 Claw</button>';
+    if (!a.is_current) html += '<button class="btn btn-ghost" onclick="accSwitch(\'' + fn + '\')">当前</button>';
+    html += '<button class="btn btn-success" onclick="accClawCreate(\'' + fn + '\')">创建</button>';
     html += '<button class="btn btn-ghost" onclick="accClawRefresh(\'' + fn + '\')">重建</button>';
     html += '<button class="btn btn-ghost" onclick="accCheck(\'' + fn + '\')">检查</button>';
     html += '<button class="btn btn-danger" onclick="accClawDestroy(\'' + fn + '\')">销毁</button>';
-    html += '<button class="btn btn-ghost" onclick="accDelete(\'' + fn + '\')" style="opacity:.7">删除</button>';
+    html += '<button class="btn btn-ghost" onclick="accDelete(\'' + fn + '\')" style="opacity:.7">删</button>';
     html += '</div></div>';
   }
   el.innerHTML = html;
@@ -1564,13 +1494,10 @@ function renderAutoDeployAccounts(deployCfg) {
 function renderAutoDeployList(el, deployCfg, scheduler) {
   var head = '';
   var counts = scheduler.counts || {};
-  if (counts.enabled_accounts) {
-    head += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;font-size:0.78rem">';
-    head += '<span>启用：<b>' + counts.enabled_accounts + '</b></span>';
-    head += '<span>Active：<b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
-    head += '<span>目标：<b>' + (counts.desired_active || 0) + '</b></span>';
-    head += '<span>最低：<b>' + (counts.normal_min_active || 0) + '</b></span>';
-    if (counts.emergency_min_active) head += '<span>紧急下限：<b>' + counts.emergency_min_active + '</b></span>';
+  if (counts.enabled_accounts != null) {
+    head += '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;font-size:0.78rem;color:var(--text2)">';
+    head += '<span>启用 <b style="color:var(--text)">' + counts.enabled_accounts + '</b></span>';
+    head += '<span>在线 <b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
     head += '</div>';
   }
   var normalHtml = '', riskHtml = '', nNormal = 0, nRisk = 0;
@@ -1593,11 +1520,10 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<button class="btn btn-danger" onclick="cancelAutoDeploy(\'' + fn + '\')">取消</button>';
     card += '<button class="btn btn-ghost" onclick="showDeployLog(\'' + fn + '\')">日志</button>';
     card += '</div></div>';
-    if (isRisk) card += '<div class="risk-reason">已风控隔离' + (cfg.risk_kind === 'create_gate' ? '（创建被拒）' : '') + '：' + escapeHtml(cfg.risk_blocked_reason || '账号存在风险') + ' · 约每 2 小时复测，通过后自动恢复</div>';
+    if (isRisk && cfg.risk_blocked_reason) card += '<div class="risk-reason">' + escapeHtml(cfg.risk_blocked_reason) + '</div>';
     card += '<div style="margin-bottom:10px">';
     card += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
     card += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
-    card += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4 小时寿命，末期冷启动下一账号</span>';
     card += '</div>';
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
@@ -1607,14 +1533,13 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     card += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
     if (ageMin > 0) card += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
-    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') card += '<span>接力：<b>' + escapeHtml(_relayLabel(relayReason)) + '</b></span>';
-    if (skipReason && skipReason !== 'disabled') card += '<span style="color:var(--yellow)">状态：' + escapeHtml(_skipLabel(skipReason)) + '</span>';
+    if (ageMin > 0) { /* age already shown */ }
     card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     card += '</div>';
     card += '</div>';
     if (isRisk) { riskHtml += card; nRisk++; } else { normalHtml += card; nNormal++; }
   }
-  if (nNormal === 0) normalHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无正常账号（全部在风控隔离分页）</div>';
+  if (nNormal === 0) normalHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无账号</div>';
   if (nRisk === 0) riskHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无风控隔离账号 🎉</div>';
   var tabs = '<div style="display:flex;gap:8px;margin-bottom:14px">' +
     '<button id="adTabBtnNormal" class="btn btn-primary" onclick="switchAdTab(\'normal\')">正常账号 (' + nNormal + ')</button>' +
@@ -1698,9 +1623,7 @@ function refreshGateway() {
       '<div class="stat-row"><span class="label">降级</span><span class="value" style="color:var(--yellow)">' + (d.backends_degraded || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">失败 / 排空</span><span class="value">' + (d.backends_failed || 0) + ' / ' + (d.backends_draining || 0) + '</span></div>';
     document.getElementById('gwPoolInfo').innerHTML =
-      '<div class="stat-row"><span class="label">模式</span><span class="value">多活（优先新后端）</span></div>' +
-      '<div class="stat-row"><span class="label">当前后端</span><span class="value">' + escapeHtml(d.active_backend || '--') + '</span></div>' +
-      '<div class="stat-row"><span class="label">未路由后端</span><span class="value">' + (d.backends_inactive || 0) + '</span></div>';
+      '<div class="stat-row"><span class="label">当前</span><span class="value">' + escapeHtml(d.active_backend || '--') + '</span></div>';
   }).catch(function() {
     document.getElementById('gwHealthInfo').innerHTML = '<div class="stat-row"><span class="label">状态</span><span class="value">网关无法访问</span></div>';
   });
@@ -1827,9 +1750,8 @@ function beApplyModelList(models, source) {
   beRenderChips();
   var btn = document.getElementById('beFillMimoBtn');
   if (btn) {
-    btn.textContent = '已填充 ' + beModels.length + ' 个 V2.5' + (source ? '（' + source + '）' : '');
+    btn.textContent = '已填充 ' + beModels.length;
   }
-  toast('已填充 ' + beModels.length + ' 个 V2.5 模型', 'success');
 }
 function beFillMimoNative() {
   // Prefer live mappings from model_groups (mimo-v25); replace entirely so stale v2 names cannot stick.
