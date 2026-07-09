@@ -961,15 +961,28 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         _active_deploys[account_filename]["state"] = s
 
     def mark_finished(state: str, history_status: str | None = None) -> None:
-        if history_status == "error" and gateway_prepared:
-            _notify_gateway_deploy_failed(account_filename, state, log)
-        elif history_status == "cancelled" and gateway_prepared:
-            _notify_gateway_deploy_aborted(
-                account_filename,
-                restore=gateway_restore_safe,
-                error=state,
-                log=log,
-            )
+        # After prepare_account_deploy the matched backend may already be draining.
+        # If we never destroyed the old Claw/tunnel (gateway_restore_safe=True), a
+        # mid-deploy failure must RESTORE active routing — not fail_account_deploy,
+        # which would take a still-healthy backend offline far before the last-30m
+        # official drain window.
+        if history_status in ("error", "cancelled") and gateway_prepared:
+            if gateway_restore_safe:
+                _notify_gateway_deploy_aborted(
+                    account_filename,
+                    restore=True,
+                    error=state,
+                    log=log,
+                )
+            elif history_status == "error":
+                _notify_gateway_deploy_failed(account_filename, state, log)
+            else:
+                _notify_gateway_deploy_aborted(
+                    account_filename,
+                    restore=False,
+                    error=state,
+                    log=log,
+                )
         set_state(state)
         _active_deploys[account_filename]["finished_ts"] = time.time()
         if history_status is not None:

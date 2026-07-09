@@ -360,8 +360,33 @@ def _available_for_create() -> list[str]:
             out.append((float(c.get("last_create_at") or 0.0), acc))
         out.sort(key=lambda t: t[0])
         candidates = [acc for _, acc in out]
-    # still skip mid-deploy
-    return [a for a in candidates if not _account_is_deploying(a)]
+    # still skip mid-deploy; also skip accounts that already have ANY registered
+    # backend (even failed/inactive). Re-opening those is reuse/redeploy territory
+    # and must not be used for the 2h fleet open cadence (which should create a
+    # different account for overlap).
+    try:
+        from gateway import backend_store
+        have_any = {
+            str(b.get("account_id") or "")
+            for b in backend_store.list_backends()
+            if b.get("account_id")
+        }
+        # also accept .json-less / .json forms
+        have_any |= {
+            (a[:-5] if a.endswith(".json") else a + ".json")
+            for a in list(have_any)
+        }
+    except Exception:
+        have_any = set()
+    out = []
+    for a in candidates:
+        if _account_is_deploying(a):
+            continue
+        keys = {a, a[:-5] if a.endswith(".json") else a + ".json"}
+        if keys & have_any:
+            continue
+        out.append(a)
+    return out
 
 
 def _scan_risk_and_quarantine() -> None:
