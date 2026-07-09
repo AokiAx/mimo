@@ -94,7 +94,7 @@ def _notify_gateway_deploy_start(account_filename: str, log: "DeployLogger") -> 
 
 
 def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> None:
-    """Reload backend state and make the freshly verified Claw the active target."""
+    """Reload backend state and activate the new Claw (peers stay up for overlap)."""
     try:
         from gateway.runtime import complete_account_deploy
         result = complete_account_deploy(account_filename)
@@ -105,9 +105,9 @@ def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> N
     matched = result.get("matched") or []
     activated = result.get("activated") or []
     if activated:
-        log.log(f"Gateway 已重载并激活新 Claw 后端: {', '.join(activated)}")
+        log.log(f"Gateway 已激活新后端（多 active 重叠）: {', '.join(activated)}")
     if not matched:
-        log.log("⚠️ Gateway 重载完成，但未匹配到该账号的后端（请确认面板里已添加 base_url=wss://.../ws?account=该账号 的后端）")
+        log.log("⚠️ Gateway 重载完成但未匹配到该账号后端，请检查 base_url / account_id")
 
 
 def _notify_gateway_deploy_failed(account_filename: str, error: str, log: "DeployLogger") -> None:
@@ -151,11 +151,10 @@ def _notify_gateway_deploy_aborted(
 # treated as idle by ``get_deploy_status``. No cleanup threads needed.
 _STALE_AFTER_S = 300
 
-# MiMo free-tier Claws are reclaimed at roughly 4h. Status reporting mirrors
-# the activity loop relay window: start preparing around 30 minutes before TTL,
-# treat the last 10 minutes as critical, and hard-expire at 4h.
-_RELAY_TARGET_AGE_S = 3 * 60 * 60 + 30 * 60
-_RELAY_CRITICAL_AGE_S = 3 * 60 * 60 + 50 * 60
+# Free-tier Claw ages for status UI (aligned with activity + gateway).
+# Open cadence 2h; last 30m draining; hard reclaim ~4h.
+_RELAY_TARGET_AGE_S = 2 * 60 * 60          # next open due
+_RELAY_CRITICAL_AGE_S = 3 * 60 * 60 + 30 * 60  # entered pre-expiry drain
 _RELAY_HARD_EXPIRY_AGE_S = 4 * 60 * 60
 
 # Per-step timing knobs.
@@ -256,7 +255,13 @@ _RISK_CREATE_MARKERS = ("存在风险", "暂无法创建", "账号风险")
 
 
 def _is_account_risk_create(data: object) -> bool:
-    """True if a create response is the account-risk rejection (not capacity/quota)."""
+    """True if a create response is the account-risk rejection (not capacity/quota).
+
+    Live capture 2026-07-10: MiMo returns HTTP 200 with body
+    ``{"code": 200, "msg": "当前账号存在风险，暂无法创建"}`` while
+    ``bannedStatus`` on ``/user/mi/get`` can still be ``NOT_BANNED``. Match on
+    message markers (and optionally non-zero codes that are not 429/7001).
+    """
     if not isinstance(data, dict):
         return False
     msg = str(data.get("msg") or data.get("message") or "")
@@ -270,10 +275,19 @@ def probe_create_risk(cookies: list) -> str:
       'RISK'     — risk-gated ("存在风险"); created nothing, quota untouched, so
                    FREE to call repeatedly on flagged accounts.
       'QUOTA'    — code 7001, today's create already used (=> NOT risk-gated).
+      'RATE'     — code 429 short-interval create throttle, e.g. 「创建请求过于频繁」
+                   (=> NOT risk-gated; wait and retry).
       'CAPACITY' — pool full (429 / 机器已达上限 / 资源当前不可用) (=> NOT risk-gated).
       'OK'       — code 0; a Claw is now being created (create has NO dry-run), so
                    only call where an actual create is acceptable.
       'ERROR'    — call failed / unrecognised.
+
+    Live capture notes (2026-07-10, free tier):
+      * Immediate re-create after a successful create often returns RATE (429
+        「过于频繁」), not QUOTA.
+      * create while claw is already AVAILABLE the same Beijing day returns QUOTA
+        (7001 「今日额度已用完」).
+      * Neither RATE nor QUOTA should quarantine into the risk pool.
     """
     try:
         import importlib
@@ -285,15 +299,21 @@ def probe_create_risk(cookies: list) -> str:
         return "ERROR"
     if isinstance(d, dict):
         code = d.get("code")
+        msg = str(d.get("msg") or d.get("message") or "")
         if code == 0:
             return "OK"
         if code == 7001:
             return "QUOTA"
         if _is_account_risk_create(d):
             return "RISK"
-        if _is_retryable_create_429(d):
+        if _is_retryable_create_429(d) or code == 429:
+            # Prefer RATE when the message is clearly per-account throttle;
+            # keep CAPACITY for pool-full / resource wording (and bare 429s).
+            if any(x in msg for x in ("过于频繁", "创建请求较多", "请稍后重试")) and (
+                "机器已达上限" not in msg and "资源当前不可用" not in msg
+            ):
+                return "RATE"
             return "CAPACITY"
-        msg = str(d.get("msg") or d.get("message") or "")
         if "机器已达上限" in msg or "资源当前不可用" in msg:
             return "CAPACITY"
     return "ERROR"
@@ -525,23 +545,34 @@ def _gc_active_deploys() -> None:
 # ─── Relay status helpers (read-only) ───
 
 def _relay_policy(enabled_count: int) -> dict:
+    """With 2h open + 4h TTL, steady state aims for ~2 concurrent Claws."""
     enabled = max(0, int(enabled_count or 0))
     if enabled <= 0:
-        return {"desired_active": 0, "normal_min_active": 0, "emergency_min_active": 0}
+        return {
+            "desired_active": 0,
+            "normal_min_active": 0,
+            "emergency_min_active": 0,
+            "open_interval_s": 2 * 60 * 60,
+            "drain_before_s": 30 * 60,
+            "hard_ttl_s": 4 * 60 * 60,
+        }
     return {
-        "desired_active": 1,
+        "desired_active": min(2, enabled),
         "normal_min_active": 1,
         "emergency_min_active": 1,
+        "open_interval_s": 2 * 60 * 60,
+        "drain_before_s": 30 * 60,
+        "hard_ttl_s": 4 * 60 * 60,
     }
 
 
 def _relay_reason(age_s: float) -> str:
     if age_s >= _RELAY_HARD_EXPIRY_AGE_S:
-        return "hard_expiry_age"
+        return "expired"
     if age_s >= _RELAY_CRITICAL_AGE_S:
-        return "critical_age"
+        return "draining_window"
     if age_s >= _RELAY_TARGET_AGE_S:
-        return "target_age"
+        return "open_next_due"
     return "fresh"
 
 

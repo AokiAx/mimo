@@ -147,18 +147,20 @@ def test_router_choose_raises_when_none_available():
     assert "decision" in exc.value.details
 
 
-def test_router_choose_prefers_least_recently_failed():
-    """Ties broken by the backend that's been quiet the longest."""
+def test_router_choose_prefers_newest_active():
+    """Among multi-active candidates, prefer highest active_since (freshest Claw)."""
     import time
+    now = time.time()
     a = _backend(backend_id="a")
-    a.record_success()  # last_failure_at remains 0
+    a.record_success()
+    a.active_since = now - 3600
     b = _backend(backend_id="b")
-    # b had a failure recently but recovered (still selectable)
-    b.last_failure_at = time.time()
-    b.health = "alive"
+    b.record_success()
+    b.active_since = now  # newer
     r = Router(BackendRegistry([a, b]))
-    chosen, _ = r.choose(request_id="r1", model=a.models[0])
-    assert chosen.backend_id == "a"  # last_failure_at = 0
+    chosen, decision = r.choose(request_id="r1", model=a.models[0])
+    assert chosen.backend_id == "b"
+    assert decision.reason == "newest_active"
 
 
 def test_router_decision_records_candidates_considered():
@@ -166,11 +168,13 @@ def test_router_decision_records_candidates_considered():
     b = _backend(backend_id="b")
     a.record_success()
     b.record_success()
+    a.active_since = 100.0
+    b.active_since = 50.0
     r = Router(BackendRegistry([a, b]))
     _, decision = r.choose(request_id="rid-xyz", model=a.models[0])
     assert set(decision.candidates_considered) == {"a", "b"}
     assert decision.request_id == "rid-xyz"
-    assert decision.reason == "active"
+    assert decision.reason in ("active", "newest_active")
 
 
 # ───────── Backend request counters ─────────
@@ -201,19 +205,21 @@ def test_backend_in_flight_counters_dont_go_negative():
 # ───────── Router single-active fallback ─────────
 
 
-def test_router_uses_registry_order_for_legacy_multi_active_candidates():
+def test_router_prefers_newest_among_multi_active_candidates():
     a = _backend(backend_id="a")
     b = _backend(backend_id="b")
     a.record_success()
     b.record_success()
+    a.active_since = 10.0
+    b.active_since = 20.0  # newer
     a.ewma_latency_ms = 500.0
     b.ewma_latency_ms = 50.0
     r = Router(BackendRegistry([a, b]))
 
     chosen, decision = r.choose(request_id="r1", model=a.models[0])
 
-    assert chosen.backend_id == "a"
-    assert decision.reason == "active"
+    assert chosen.backend_id == "b"
+    assert decision.reason == "newest_active"
     assert decision.chosen_score == 0.0
 
 

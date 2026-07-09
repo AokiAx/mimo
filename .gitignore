@@ -64,6 +64,12 @@ gateway.yaml
 # Scratch
 .scratch_*
 
+# Captcha dumps from register_mimo / OCR debug (regenerated at runtime)
+captcha_*.png
+captcha_*.jpg
+captcha_*.jpeg
+captcha_answer.txt
+
 # Application log files
 logs/
 verification.md

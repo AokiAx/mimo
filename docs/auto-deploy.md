@@ -396,7 +396,7 @@ Claw 隧道密钥 (~claw/.ssh/id_tunnel):
         "name": "<account>",
         "base_url": "http://127.0.0.1:19080",
         "api_key": "",
-        "models": ["mimo-v2.5-pro", "mimo-v2-flash"],
+        "models": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-pro-ultraspeed"],
         "account_id": "<account>",
         "enabled": true,
         "lifecycle": "active"

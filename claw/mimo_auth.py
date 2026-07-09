@@ -77,6 +77,21 @@ _ESSENTIAL_COOKIES = {
 }
 
 
+def _cookie_objs(session):
+    """curl_cffi Cookies: iterating yields names (str); use .jar for Cookie objects.
+
+    requests.Session cookies may also expose .jar (CookieJar).
+    """
+    jar = getattr(session.cookies, "jar", None)
+    if jar is not None:
+        return list(jar)
+    # requests-like mapping fallback
+    try:
+        return list(session.cookies)
+    except Exception:
+        return []
+
+
 def _mimo_cookie(name: str, value: str, expires=-1) -> dict:
     return {
         "name": name, "value": value, "domain": ".xiaomimimo.com", "path": "/",
@@ -133,22 +148,44 @@ def load_cookies(email=""):
     return data if isinstance(data, list) else []
 
 
-def save_cookies(email, cookies, user_info=None):
+def save_cookies(email, cookies, user_info=None, password: str | None = None, extra: dict | None = None):
     """Persist an account in the UNIFIED wrapper format the rest of the system
     reads (``auto_deploy._load_account_cookies`` / app.py do ``data["cookies"]``).
-    Saving a bare list here used to make accounts unusable by the deploy pipeline."""
+    Saving a bare list here used to make accounts unusable by the deploy pipeline.
+
+    Preserves existing ``password`` / ``lifecycle`` / ``mailbox`` unless
+    explicitly overridden via ``password`` / ``extra``.
+    """
     ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
     user_info = user_info or {}
+    path = _cookie_path(email)
+    existing: dict = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                existing = raw
+        except Exception:
+            existing = {}
     payload = {
         "name": email,
-        "user_id": user_info.get("userId") or "",
-        "user_info": user_info,
+        "user_id": user_info.get("userId") or existing.get("user_id") or "",
+        "user_info": user_info or existing.get("user_info") or {},
         "cookies": cookies,
         "exported_at": int(time.time()),
         "source": "mimo_auth.py/http",
     }
-    with open(_cookie_path(email), "w", encoding="utf-8") as f:
+    # keep durable fields across re-login
+    for key in ("password", "mailbox", "lifecycle", "email"):
+        if key in existing and existing[key] is not None:
+            payload[key] = existing[key]
+    if password:
+        payload["password"] = password
+    if extra:
+        payload.update(extra)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+    return path
 
 
 def get_cookie_header(cookies=None, domain_filter="xiaomimimo", email=""):
@@ -440,13 +477,20 @@ def _identity_result_check(session, callback, user_id, sid, identity_token, sign
     return resp
 
 
-def _handle_verification(session, notification_url="", original_callback="", user_id_from_auth="", device_fingerprint=""):
+def _handle_verification(
+    session,
+    notification_url="",
+    original_callback="",
+    user_id_from_auth="",
+    device_fingerprint="",
+    email_code_fn=None,
+):
     """处理身份安全验证流程（短信/邮箱验证码）
 
     完整流程（从 HAR 逆向）:
       1. GET /identity/list → 获取 flag, externalId(userId)
       2. GET /identity/auth/verifyEmail?_flag=8 → 触发发送验证码
-      3. 用户输入验证码
+      3. 用户输入验证码（或 email_code_fn 自动取）
       4. POST /identity/auth/verifyEmail → 提交验证码，获取 identityToken, _sign
       5. GET /identity/result/check → 302 到 serviceLoginAuth2/end
       6. 跟随 redirect 链获取 serviceToken
@@ -488,9 +532,28 @@ def _handle_verification(session, notification_url="", original_callback="", use
         # 即使发送失败也继续（可能 identity/list 已经触发了）
         print(f"[login] 验证码发送请求已提交（code={send_result})")
 
-    # Step 3: 等待用户输入验证码
+    # Step 3: 等待验证码（自动 or 手动）
     for attempt in range(3):
-        code = input(f"[login] 请输入{method}验证码（第{attempt+1}次，还剩{3-attempt}次）: ").strip()
+        if email_code_fn is not None:
+            try:
+                code = (email_code_fn() or "").strip()
+            except Exception as ex:
+                print(f"[login] email_code_fn 异常: {type(ex).__name__}: {ex}")
+                code = ""
+            if not code:
+                print(f"[login] 自动取码失败（第{attempt+1}次）")
+                continue
+            print(f"[login] 自动取到{method}验证码")
+        else:
+            try:
+                code = input(
+                    f"[login] 请输入{method}验证码（第{attempt+1}次，还剩{3-attempt}次）: "
+                ).strip()
+            except EOFError:
+                raise Exception(
+                    f"需要{method}验证码但无交互输入；"
+                    "请传 email_code_fn 或用 durable IMAP 邮箱账号"
+                )
         if not code:
             print("[login] 验证码不能为空")
             continue
@@ -662,8 +725,13 @@ def _fetch_user_info(cookies) -> dict:
     return {}
 
 
-def do_login(email, password):
-    """纯 HTTP 登录小米 SSO，返回 xiaomichatbot cookies"""
+def do_login(email, password, email_code_fn=None):
+    """纯 HTTP 登录小米 SSO，返回 xiaomichatbot cookies。
+
+    ``email_code_fn``: 可选 ``() -> str|None``，2FA 时自动取邮箱码；
+    为 None 时 CLI 走终端 input。免费 tempmail 收件箱通常 1h 失效，
+    过期后无法再取码——应走 ck_lifecycle 的 replace 策略。
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -699,6 +767,7 @@ def do_login(email, password):
             original_callback=callback,
             user_id_from_auth=auth_data.get("userId", ""),
             device_fingerprint=device_fp,
+            email_code_fn=email_code_fn,
         )
     elif result == "ok":
         location = auth_data.get("location", "")
@@ -715,14 +784,13 @@ def do_login(email, password):
 
     # 检查是否拿到 serviceToken
     st = None
-    for c in session.cookies:
-        if c.name == "serviceToken" and "xiaomimimo" in (c.domain or ""):
+    for c in _cookie_objs(session):
+        if getattr(c, "name", None) == "serviceToken" and "xiaomimimo" in (getattr(c, "domain", None) or ""):
             st = c.value
             break
     if not st:
-        # 也检查通用域名
-        for c in session.cookies:
-            if c.name == "serviceToken":
+        for c in _cookie_objs(session):
+            if getattr(c, "name", None) == "serviceToken":
                 st = c.value
                 break
 
@@ -736,16 +804,19 @@ def do_login(email, password):
     # Slim: keep ONLY the essential .xiaomimimo.com cookies the API needs.
     cookies = []
     seen = set()
-    for c in session.cookies:
-        if c.name in _ESSENTIAL_COOKIES and "xiaomimimo" in (c.domain or ""):
-            cookies.append(_mimo_cookie(c.name, c.value, c.expires))
-            seen.add(c.name)
+    for c in _cookie_objs(session):
+        name = getattr(c, "name", None)
+        domain = getattr(c, "domain", None) or ""
+        if name in _ESSENTIAL_COOKIES and "xiaomimimo" in domain:
+            cookies.append(_mimo_cookie(name, c.value, getattr(c, "expires", -1)))
+            seen.add(name)
     # serviceToken/userId may have come back on a non-xiaomimimo domain — pin
     # them onto .xiaomimimo.com so API calls authenticate.
-    for c in session.cookies:
-        if c.name in ("serviceToken", "userId") and c.name not in seen:
-            cookies.append(_mimo_cookie(c.name, c.value, c.expires))
-            seen.add(c.name)
+    for c in _cookie_objs(session):
+        name = getattr(c, "name", None)
+        if name in ("serviceToken", "userId") and name not in seen:
+            cookies.append(_mimo_cookie(name, c.value, getattr(c, "expires", -1)))
+            seen.add(name)
 
     # xiaomichatbot_ph is the session handle — fetch it if the flow didn't set it.
     if "xiaomichatbot_ph" not in seen:
@@ -765,8 +836,8 @@ def _fetch_ph(session, auth_data):
             f"{MIMO_BASE}/open-apis/user/mi/get",
             timeout=10,
         )
-        for c in session.cookies:
-            if c.name == "xiaomichatbot_ph":
+        for c in _cookie_objs(session):
+            if getattr(c, "name", None) == "xiaomichatbot_ph":
                 val = c.value
                 if val.startswith('"') and val.endswith('"'):
                     val = val[1:-1]
@@ -777,8 +848,8 @@ def _fetch_ph(session, auth_data):
     # 方法2: 访问 MiMo 首页
     try:
         resp = session.get(MIMO_BASE, timeout=10)
-        for c in session.cookies:
-            if c.name == "xiaomichatbot_ph":
+        for c in _cookie_objs(session):
+            if getattr(c, "name", None) == "xiaomichatbot_ph":
                 val = c.value
                 if val.startswith('"') and val.endswith('"'):
                     val = val[1:-1]
@@ -815,13 +886,13 @@ def _finish_login(session, location, auth_data):
     _xiaomi_exchange_token(session, location)
 
     st = None
-    for c in session.cookies:
-        if c.name == "serviceToken" and "xiaomimimo" in (c.domain or ""):
+    for c in _cookie_objs(session):
+        if getattr(c, "name", None) == "serviceToken" and "xiaomimimo" in (getattr(c, "domain", None) or ""):
             st = c.value
             break
     if not st:
-        for c in session.cookies:
-            if c.name == "serviceToken":
+        for c in _cookie_objs(session):
+            if getattr(c, "name", None) == "serviceToken":
                 st = c.value
                 break
     if not st:
@@ -830,14 +901,17 @@ def _finish_login(session, location, auth_data):
     # Slim: keep only the essential .xiaomimimo.com cookies (see do_login).
     cookies = []
     seen = set()
-    for c in session.cookies:
-        if c.name in _ESSENTIAL_COOKIES and "xiaomimimo" in (c.domain or ""):
-            cookies.append(_mimo_cookie(c.name, c.value, c.expires))
-            seen.add(c.name)
-    for c in session.cookies:
-        if c.name in ("serviceToken", "userId") and c.name not in seen:
-            cookies.append(_mimo_cookie(c.name, c.value, c.expires))
-            seen.add(c.name)
+    for c in _cookie_objs(session):
+        name = getattr(c, "name", None)
+        domain = getattr(c, "domain", None) or ""
+        if name in _ESSENTIAL_COOKIES and "xiaomimimo" in domain:
+            cookies.append(_mimo_cookie(name, c.value, getattr(c, "expires", -1)))
+            seen.add(name)
+    for c in _cookie_objs(session):
+        name = getattr(c, "name", None)
+        if name in ("serviceToken", "userId") and name not in seen:
+            cookies.append(_mimo_cookie(name, c.value, getattr(c, "expires", -1)))
+            seen.add(name)
     if "xiaomichatbot_ph" not in seen:
         ph_val = _fetch_ph(session, auth_data)
         if ph_val:

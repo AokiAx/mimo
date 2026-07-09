@@ -4,9 +4,15 @@ Backends live in the ``backends`` section of ``data/config.json`` (managed by
 ``backend_store``).
 Credentials come from ``data/secrets.json`` (managed by ``secrets_store``).
 
-The runtime owns a single active backend for gateway routing. Claw account
-relay is driven outside the gateway; when a freshly deployed backend is marked
-active, every other active backend is drained out of new traffic.
+Claw fleet policy (free-tier):
+  * Hard TTL ≈ 4h per Claw
+  * Open a new account Claw every 2h (overlap so handoff is never empty)
+  * Last 30 minutes of each Claw: lifecycle=draining (no new requests)
+  * Multiple backends may be ``active`` at once; the router prefers the newest
+
+Age-based drain/disable is applied in the probe loop via
+``reconcile_backend_ages``. Deploy completion activates the new backend
+*without* forcing peers offline.
 """
 from __future__ import annotations
 
@@ -56,10 +62,11 @@ _PROBE_COOLDOWN_S = 30.0
 _DEFAULT_REQUEST_TIMEOUT_S = 600.0
 _CHARSET_RE = re.compile(r"charset=([^;]+)", re.IGNORECASE)
 
-# Gateway no longer owns account/backend relay policy. Claw free-tier TTL and
-# account relay are driven by ``claw.claw_activity``; the gateway keeps one
-# active backend and runs a lightweight health probe for that backend.
-_DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 10 * 60.0)
+# Free-tier Claw lifetime + fleet drain window (also used by claw_activity).
+_CLAW_HARD_TTL_S = _env_float("MIMO_CLAW_TTL_S", 4 * 60 * 60.0)
+_CLAW_DRAIN_BEFORE_EXPIRY_S = _env_float("MIMO_CLAW_DRAIN_BEFORE_S", 30 * 60.0)
+# How long a draining backend may keep in-flight requests after operator drain.
+_DRAIN_TIMEOUT_S = _env_float("GATEWAY_DRAIN_TIMEOUT_S", 30 * 60.0)
 _DEPLOY_DRAIN_GRACE_S = _env_float("GATEWAY_DEPLOY_DRAIN_GRACE_S", 20.0)
 
 _PROBE_PROMPT = "ping"
@@ -159,7 +166,7 @@ def _ensure_initialized() -> None:
 
 
 def _bootstrap_active_lifecycles() -> None:
-    """Seed active timers and collapse legacy multi-active configs to one."""
+    """Seed active timers; multi-active is allowed (2h open / 4h TTL fleet)."""
     assert _registry is not None
     now = time.time()
     for b in _registry.all():
@@ -167,7 +174,7 @@ def _bootstrap_active_lifecycles() -> None:
             b.mark_active(now=now)
         elif b.lifecycle == "draining" and not b.drain_deadline:
             b.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
-    _enforce_single_active_backend()
+    reconcile_backend_ages(now=now)
 
 
 def _make_metrics_recorder():
@@ -183,8 +190,7 @@ def reload_backends() -> int:
 
     Existing Backend objects keep EWMA, breaker, and in-flight state. Removed
     backends are marked draining instead of being dropped while requests are in
-    flight. Legacy configs with several active backends are collapsed to one
-    active backend; extra active entries are drained and then become inactive.
+    flight. Multiple ``active`` backends are allowed (fleet overlap).
     """
     _ensure_initialized()
     assert _registry is not None
@@ -212,7 +218,9 @@ def reload_backends() -> int:
             if fresh.lifecycle == "inactive":
                 existing.mark_inactive()
             elif fresh.lifecycle == "active":
-                existing.mark_active(now=now)
+                # Preserve active_since if already active (age-based drain)
+                if existing.lifecycle != "active" or not existing.active_since:
+                    existing.mark_active(now=now)
             elif fresh.lifecycle == "draining":
                 existing.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
             else:
@@ -226,31 +234,69 @@ def reload_backends() -> int:
                 old.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
         else:
             _registry.remove(old.backend_id)
-    _enforce_single_active_backend()
+    reconcile_backend_ages(now=now)
     _reap_drained(now=now)
     return len(_registry.all())
 
 
-def _enforce_single_active_backend(*, preferred: Backend | None = None) -> list[str]:
-    """Keep only one active backend in the gateway data plane.
+def reconcile_backend_ages(*, now: float | None = None) -> dict[str, list[str]]:
+    """Age-based traffic control for free-tier Claws.
 
-    Older configs may still contain several active entries. Preserve the
-    preferred/current active backend and retire the
-    rest so the router sees a single account at a time.
+    - age >= TTL - 30m  → lifecycle=draining (no new requests)
+    - age >= TTL        → inactive + disabled (Claw effectively expired)
     """
+    _ensure_initialized()
     assert _registry is not None
-    active = [
-        b for b in _registry.all()
-        if b.enabled and b.lifecycle == "active"
-    ]
-    if not active:
-        return []
-    keep = preferred if any(b is preferred for b in active) else active[0]
-    return _retire_other_backends(keep)
+    n = now or time.time()
+    drained: list[str] = []
+    expired: list[str] = []
+    ttl = max(60.0, float(_CLAW_HARD_TTL_S))
+    drain_before = max(0.0, min(float(_CLAW_DRAIN_BEFORE_EXPIRY_S), ttl - 60.0))
+    drain_start_age = ttl - drain_before
+
+    for b in _registry.all():
+        if not b.active_since:
+            continue
+        age = n - b.active_since
+        if age >= ttl:
+            if b.lifecycle != "inactive" or b.enabled:
+                b.mark_inactive()
+                b.enabled = False
+                _persist_backend_runtime_state(b)
+                try:
+                    from gateway.backend_store import update_backend
+                    update_backend(b.backend_id, enabled=False, lifecycle="inactive")
+                except Exception:
+                    pass
+                expired.append(b.backend_id)
+                logger.info(
+                    "Backend %s expired (age=%.0fs >= ttl=%.0fs) → disabled",
+                    b.backend_id, age, ttl,
+                )
+            continue
+        if b.lifecycle == "active" and age >= drain_start_age:
+            remaining = max(30.0, ttl - age)
+            b.mark_draining(drain_timeout_s=remaining, now=n)
+            _persist_backend_runtime_state(b)
+            try:
+                from gateway.backend_store import update_backend
+                update_backend(b.backend_id, lifecycle="draining")
+            except Exception:
+                pass
+            drained.append(b.backend_id)
+            logger.info(
+                "Backend %s entering pre-expiry drain (age=%.0fs, remain=%.0fs)",
+                b.backend_id, age, remaining,
+            )
+    return {"drained": drained, "expired": expired}
 
 
 def _retire_other_backends(active_backend: Backend) -> list[str]:
-    """Move every other routable backend out of new traffic."""
+    """Optional exclusive activation: drain every other active backend.
+
+    Used only for manual ``activate_backend`` (operator hard-switch). Normal
+    fleet deploys do **not** call this so overlap stays up.
+    """
     assert _registry is not None
     retired: list[str] = []
     now = time.time()
@@ -330,20 +376,27 @@ def get_router_status() -> dict[str, Any]:
     latencies = [b.ewma_latency_ms for b in backends if b.ewma_latency_ms > 0]
     avg_lat = round(sum(latencies) / len(latencies), 1) if latencies else 0
     uptime = int(time.time() - _started_at)
-    active_backend = next((b.backend_id for b in backends if b.lifecycle == "active"), "")
+    actives = [b for b in backends if b.lifecycle == "active" and b.enabled]
+    # Prefer newest active for the "primary" status field
+    primary = ""
+    if actives:
+        primary = max(actives, key=lambda b: b.active_since or 0).backend_id
     return {
         "uptime": uptime,
         "total_requests": _total_requests,
         "qps": round(_total_requests / max(uptime, 1), 2),
         "avg_latency_ms": avg_lat,
-        "active_backend": active_backend,
+        "active_backend": primary,
+        "active_backends": [b.backend_id for b in actives],
         "backends_total": len(backends),
         "backends_healthy": healthy,
-        "backends_active": sum(1 for b in backends if b.lifecycle == "active"),
+        "backends_active": len(actives),
         "backends_inactive": sum(1 for b in backends if b.lifecycle == "inactive"),
         "backends_draining": sum(1 for b in backends if b.lifecycle == "draining"),
         "backends_failed": sum(1 for b in backends if b.lifecycle == "failed"),
         "backends_degraded": sum(1 for b in backends if b.lifecycle == "active" and b.health == "degraded"),
+        "claw_ttl_s": int(_CLAW_HARD_TTL_S),
+        "claw_drain_before_s": int(_CLAW_DRAIN_BEFORE_EXPIRY_S),
     }
 
 
@@ -404,13 +457,13 @@ def toggle_backend(backend_id: str) -> dict[str, Any]:
 
 
 def activate_backend(backend_id: str) -> dict[str, Any]:
-    """Hard-switch traffic to one backend and retire every other active backend."""
+    """Operator hard-switch: make one backend active and drain peers."""
     _ensure_initialized()
     assert _registry is not None
     b = _registry.get(backend_id)
     if b is None:
         return {"success": False, "error": f"Backend {backend_id!r} not found"}
-    retired = _activate_backend(b, reason="manual")
+    retired = _activate_backend(b, reason="manual", exclusive=True)
     return {"success": True, "backend": backend_id, "retired": retired}
 
 
@@ -466,13 +519,16 @@ def wait_for_account_drain(
 
 
 def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
-    """Reload and activate backends that belong to a freshly deployed Claw."""
+    """Reload and activate backends for a freshly deployed Claw.
+
+    Does **not** force-drain peer actives — fleet keeps overlap (2h open / 4h TTL).
+    Age-based drain still retires Claws in their last 30 minutes.
+    """
     reload_backends()
     assert _registry is not None
     now = time.time()
     targets = _matching_account_backends(account_id, api_port=api_port)
     activated: list[str] = []
-    retired: list[str] = []
     for backend in targets:
         backend.enabled = True
         backend.reset_breaker()
@@ -480,15 +536,20 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         backend.consecutive_failures = 0
         backend.last_error = ""
         backend.mark_active(now=now)
-        retired.extend(_retire_other_backends(backend))
         activated.append(backend.backend_id)
         _persist_backend_runtime_state(backend)
+        try:
+            from gateway.backend_store import update_backend
+            update_backend(backend.backend_id, enabled=True, lifecycle="active")
+        except Exception:
+            pass
+    reconcile_backend_ages(now=now)
     return {
         "success": True,
         "account": account_id,
         "matched": [b.backend_id for b in targets],
         "activated": activated,
-        "retired": retired,
+        "retired": [],
     }
 
 
@@ -611,11 +672,12 @@ async def _probe_loop() -> None:
 
     while True:
         try:
-            active = next(
-                (b for b in _registry.all() if b.enabled and b.lifecycle == "active"),
-                None,
-            )
-            if active is not None:
+            reconcile_backend_ages()
+            actives = [
+                b for b in _registry.all()
+                if b.enabled and b.lifecycle == "active"
+            ]
+            for active in actives:
                 await _probe_one(active)
             _reap_drained()
         except Exception:  # noqa: BLE001
@@ -623,18 +685,19 @@ async def _probe_loop() -> None:
         await asyncio.sleep(_PROBE_INTERVAL_S)
 
 
-def _activate_backend(backend: Backend, *, reason: str) -> list[str]:
-    """Make ``backend`` the single active backend."""
+def _activate_backend(backend: Backend, *, reason: str, exclusive: bool = False) -> list[str]:
+    """Activate ``backend``. If ``exclusive``, drain all other actives (manual switch)."""
     now = time.time()
     backend.enabled = True
     backend.mark_active(now=now)
     shared_models = set(backend.models)
     _persist_backend_runtime_state(backend)
-    retired = _retire_other_backends(backend)
+    retired = _retire_other_backends(backend) if exclusive else []
     logger.info(
-        "Activated backend %s by %s; models=%s retired=%s",
+        "Activated backend %s by %s exclusive=%s models=%s retired=%s",
         backend.backend_id,
         reason,
+        exclusive,
         sorted(shared_models),
         retired,
     )

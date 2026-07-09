@@ -1,12 +1,11 @@
 """
 Backend selection + decision logging.
 
-The Router's only job is: given a RequestContext, pick the active backend
-that can serve the requested model. Retry still lives in the handler, which can
-call ``choose`` again after excluding a backend. The gateway enforces one active
-backend at lifecycle boundaries, so legacy multi-active configs fall back to the
-first selectable backend in registry order until lifecycle reconciliation drains
-the extras.
+The Router's only job is: given a RequestContext, pick a selectable active
+backend that can serve the requested model. Multiple active backends are
+allowed (fleet overlap); among candidates we prefer the **newest** (highest
+``active_since``) so traffic leans on the freshest Claw while older ones
+still accept until pre-expiry drain.
 """
 from __future__ import annotations
 
@@ -105,13 +104,17 @@ class Router:
                 details={"decision": decision.to_dict()},
             )
 
-        chosen = candidates[0]
+        # Newest active first (freshest Claw); ties keep registry / probe order
+        chosen = max(
+            enumerate(candidates),
+            key=lambda ib: (ib[1].active_since or 0.0, -ib[0]),
+        )[1]
 
         decision = RoutingDecision(
             request_id=request_id,
             model_requested=model,
             chosen_backend=chosen.backend_id,
-            reason="active",
+            reason="newest_active" if len(candidates) > 1 else "active",
             candidates_considered=considered,
             excluded=excluded,
             chosen_score=0.0,

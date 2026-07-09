@@ -11,10 +11,9 @@ side — and cannot be done by the Claw itself — is:
   * Health: probe the forwarded proxy (``/v1/models`` through the tunnel). If it
     stays unreachable for a few cycles while the Claw is still AVAILABLE, the
     local keepalive can't fix it (e.g. key deauthorized / box wedged) → redeploy.
-  * Relay: MiMo free Claws are hard-reclaimed at ~4h and an account may create
-    only ONE Claw per Beijing calendar day, so the fleet relays ACROSS accounts —
-    a fresh available account is cold-started ~30 min before the current one
-    expires so coverage overlaps.
+  * Relay: free Claws last ~4h; the fleet opens a **new account Claw every 2h**
+    so there is always overlap. Gateway drains each backend in its last 30
+    minutes (no new requests) until the Claw is reclaimed.
   * Risk control: poll each account's ``bannedStatus`` and quarantine banned
     accounts before they are ever picked for a deploy; release them after 24h
     once recovered.
@@ -26,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import threading
 import time
@@ -42,20 +42,16 @@ _TICK_S = 20                   # scheduler granularity
 # claw-side keepalive recovering it and rebuild.
 _ESCALATE_AFTER_UNHEALTHY = 2
 
-_MIMO_HARD_TTL_S = 4 * 60 * 60     # ~4h hard TTL
+_MIMO_HARD_TTL_S = int(float(os.environ.get("MIMO_CLAW_TTL_S", 4 * 60 * 60)))
+# Fixed open cadence: start one new account Claw this often (overlap with 4h TTL).
+_OPEN_INTERVAL_S = int(float(os.environ.get("MIMO_CLAW_OPEN_INTERVAL_S", 2 * 60 * 60)))
+# Last N seconds of Claw life: gateway puts backend in draining (no new reqs).
+_DRAIN_BEFORE_S = int(float(os.environ.get("MIMO_CLAW_DRAIN_BEFORE_S", 30 * 60)))
 
 # Daily-create quota: a MiMo free account may create only ONE Claw per calendar
 # day (resets at Beijing midnight, NOT a rolling 24h window). An account that
 # created today is held out of the available pool until the date rolls over.
 _BEIJING_TZ = timezone(timedelta(hours=8))
-
-# Staggered relay: keep this many Claws serving concurrently, and start the next
-# available account this long BEFORE the current one's TTL so coverage overlaps
-# (no gap at handoff). With per-day-per-account quota + 4h TTL, the fleet covers
-# the day by relaying across accounts rather than rotating one. The lead must
-# exceed a cold-start's worst case (mainland edge create can take ~12 min).
-_DESIRED_ACTIVE = 1
-_RELAY_LEAD_S = 30 * 60  # bring up the next account 30 min before current expiry
 
 # ─── Per-account state ───
 _state: dict[str, dict] = {}
@@ -65,6 +61,12 @@ _loop_thread: Optional[threading.Thread] = None
 # Cold-start throttle: last time we fired an initial/relay deploy for an account.
 _cold_start_last: dict[str, float] = {}
 _COLD_START_RETRY_S = 180
+
+# Auto-reg pool top-up for 24h coverage (~12 creates/day at 2h cadence).
+_maintain_last: float = 0.0
+_maintain_running: bool = False
+_MAINTAIN_CHECK_S = int(float(os.environ.get("MIMO_POOL_MAINTAIN_INTERVAL_S", 30 * 60)))
+_MAINTAIN_BATCH = int(float(os.environ.get("MIMO_POOL_MAINTAIN_BATCH", 2)))  # max new regs per cycle
 
 # Proactive risk-control scan: poll each enabled account's bannedStatus and
 # quarantine banned ones before the loop ever picks them for a deploy. Throttled
@@ -220,59 +222,136 @@ def _quarantined_accounts() -> list[str]:
     return [a for a, c in (cfg.get("accounts") or {}).items() if c.get("risk_blocked")]
 
 
-def _count_active_with_headroom(lead_s: float) -> int:
-    """Count healthy/active claws that will still be alive after ``lead_s`` —
-    i.e. remaining TTL > lead. These are the claws we can rely on to keep
-    serving through the relay window; claws closer to expiry don't count, so a
-    replacement gets started in time."""
+def _active_backend_ages() -> list[float]:
+    """Ages (seconds) of enabled active backends, newest first."""
     try:
         from gateway.runtime import get_all_backends
         backends = get_all_backends()
     except Exception:
-        return 0
-    n = 0
+        return []
+    ages = []
     for b in backends:
-        if not (b.get("enabled", True) and b.get("healthy")
-                and b.get("lifecycle") == "active"):
+        if not (b.get("enabled", True) and b.get("lifecycle") == "active"):
             continue
-        remaining = float(_MIMO_HARD_TTL_S) - float(b.get("active_for_s") or 0)
-        if remaining > lead_s:
-            n += 1
-    return n
+        ages.append(float(b.get("active_for_s") or 0))
+    ages.sort()  # youngest first
+    return ages
+
+
+def _need_open_new_claw() -> bool:
+    """True if fleet should cold-start another account now.
+
+    Policy: open every ``_OPEN_INTERVAL_S`` (default 2h). If nothing is active,
+    open immediately. If the youngest active backend is already older than the
+    open interval, open the next one.
+    """
+    ages = _active_backend_ages()
+    if not ages:
+        return True
+    youngest = ages[0]
+    return youngest >= float(_OPEN_INTERVAL_S)
+
+
+def _maybe_top_up_account_pool() -> None:
+    """Background top-up of auto-reg accounts so 24h create cadence never starves.
+
+    Runs at most every ``_MAINTAIN_CHECK_S``. Registers at most ``_MAINTAIN_BATCH``
+    accounts per cycle (full ``maintain --target 12`` in one shot is too heavy).
+    """
+    global _maintain_last, _maintain_running
+    now = time.time()
+    if _maintain_running or now - _maintain_last < _MAINTAIN_CHECK_S:
+        return
+    _maintain_last = now
+    try:
+        from claw.account_pool import snapshot
+        from claw.ck_lifecycle import POOL_TARGET
+
+        snap = snapshot(probe=True, include_archive=False)
+        auto_live = len(snap.get("auto_live") or [])
+        available = len(snap.get("available_for_create") or [])
+        target = int(POOL_TARGET)
+        if auto_live >= target and available >= 1:
+            logger.info(
+                "[activity] pool ok auto_live=%d available=%d target=%d",
+                auto_live, available, target,
+            )
+            return
+        need = max(0, target - auto_live)
+        if need <= 0 and available >= 1:
+            return
+        batch = max(1, min(_MAINTAIN_BATCH, need if need > 0 else 1))
+        if available == 0 and auto_live > 0:
+            # all in cooldown/serving — can't create more today; just log
+            logger.warning(
+                "[activity] pool: available=0 (all cooldown/serving) auto_live=%d — wait Beijing day roll or add accounts",
+                auto_live,
+            )
+            if auto_live >= target:
+                return
+        logger.warning(
+            "[activity] pool low auto_live=%d available=%d target=%d → register batch=%d",
+            auto_live, available, target, batch,
+        )
+    except Exception:
+        logger.exception("[activity] pool check failed")
+        return
+
+    def _worker(n: int = batch) -> None:
+        global _maintain_running
+        _maintain_running = True
+        try:
+            from claw.ck_lifecycle import try_replace
+            results = try_replace(count=n, dry_run=False, enable_deploy=True)
+            ok = sum(1 for r in results if r.get("status") == "ok")
+            logger.warning("[activity] pool top-up done ok=%d/%d", ok, n)
+        except Exception:
+            logger.exception("[activity] pool top-up failed")
+        finally:
+            _maintain_running = False
+
+    threading.Thread(target=_worker, name="pool-topup", daemon=True).start()
 
 
 def _available_for_create() -> list[str]:
     """Accounts eligible to create a Claw right now, fairest-first.
 
-    Eligible = enabled, not risk-blocked, not in today's create cooldown, no
-    healthy backend yet, and not already deploying. Sorted by oldest
-    last_create_at first (never-created accounts first) so the fleet cycles
-    through accounts instead of favouring one.
+    Single source: ``claw.account_pool.available_for_create`` —
+    enabled + ck live + not risk + not today's cooldown + no active backend.
+    Filters out dead cookies (401) so the fleet never burns a create on a
+    temp-mail account whose SSO session already expired.
     """
     try:
-        from claw.auto_deploy import load_config
-        cfg = load_config()
-        from gateway.runtime import get_all_backends
-        backends = get_all_backends()
+        from claw.account_pool import available_for_create
+        candidates = available_for_create(require_auto_reg=True)
     except Exception:
-        return []
-    have_backend = {
-        str(b.get("account") or "")
-        for b in backends
-        if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
-    }
-    out: list[tuple[float, str]] = []
-    for acc, c in (cfg.get("accounts") or {}).items():
-        if not c.get("enabled") or c.get("risk_blocked"):
-            continue
-        keys = {acc, acc[:-5] if acc.endswith(".json") else acc + ".json"}
-        if keys & have_backend:
-            continue
-        if _account_is_deploying(acc) or _account_in_cooldown(acc):
-            continue
-        out.append((float(c.get("last_create_at") or 0.0), acc))
-    out.sort(key=lambda t: t[0])
-    return [acc for _, acc in out]
+        # fallback without live probe (legacy behaviour)
+        try:
+            from claw.auto_deploy import load_config
+            cfg = load_config()
+            from gateway.runtime import get_all_backends
+            backends = get_all_backends()
+        except Exception:
+            return []
+        have_backend = {
+            str(b.get("account") or b.get("account_id") or "")
+            for b in backends
+            if b.get("enabled", True) and b.get("healthy") and b.get("lifecycle") == "active"
+        }
+        out: list[tuple[float, str]] = []
+        for acc, c in (cfg.get("accounts") or {}).items():
+            if not c.get("enabled") or c.get("risk_blocked"):
+                continue
+            keys = {acc, acc[:-5] if acc.endswith(".json") else acc + ".json"}
+            if keys & have_backend:
+                continue
+            if _account_is_deploying(acc) or _account_in_cooldown(acc):
+                continue
+            out.append((float(c.get("last_create_at") or 0.0), acc))
+        out.sort(key=lambda t: t[0])
+        candidates = [acc for _, acc in out]
+    # still skip mid-deploy
+    return [a for a in candidates if not _account_is_deploying(a)]
 
 
 def _scan_risk_and_quarantine() -> None:
@@ -343,7 +422,9 @@ def _scan_quarantine_for_recovery() -> None:
             verdict = probe_create_risk(cookies)
             if verdict == "RISK":
                 continue  # still flagged — free probe, nothing created
-            if verdict in ("OK", "QUOTA", "CAPACITY"):
+            # RATE is also a non-risk signal (short create throttle after a
+            # successful create / burst). Treat like CAPACITY/QUOTA for release.
+            if verdict in ("OK", "QUOTA", "CAPACITY", "RATE"):
                 logger.warning("[activity] %s: create 风控已解除 (probe=%s) → 放回可用池", acc, verdict)
                 try:
                     release_risk_account(acc)
@@ -461,35 +542,52 @@ def _loop() -> None:
             _scan_risk_and_quarantine()
             # And release any quarantined accounts whose ban has cleared (24h).
             _scan_quarantine_for_recovery()
-            accounts = _enabled_deployed_accounts()
             now = time.time()
+            # Keep auto-reg inventory high enough for 2h open cadence all day.
+            _maybe_top_up_account_pool()
+            # Hourly one-line fleet snapshot (append logs/fleet.log)
+            try:
+                hr = int(now) // 3600
+                if hr != int(getattr(_loop, "_last_fleet_hour", -1)):
+                    _loop._last_fleet_hour = hr  # type: ignore[attr-defined]
+                    from claw.fleet_report import report
+                    report(write_file=True)
+            except Exception:
+                logger.debug("[activity] fleet_report skipped", exc_info=True)
+            accounts = _enabled_deployed_accounts()
             # Drop state for accounts no longer in scope.
             with _state_lock:
                 for gone in [a for a in _state if a not in accounts]:
                     _state.pop(gone, None)
-            # Staggered relay: keep _DESIRED_ACTIVE claws serving. Count claws
-            # with enough TTL headroom to outlast the relay lead; if short
-            # (current one nearing its 4h expiry, or none up yet), bring up the
-            # next available account(s) ahead of time so coverage overlaps. Each
-            # account is used at most once/day (cooldown), so the fleet relays
-            # across accounts to cover the day.
+            # Fixed-cadence open: every ~2h start one new account Claw so the
+            # previous (4h TTL) still has ≥1.5h of accepting traffic left, and
+            # gateway drains the old one in its last 30m.
+            try:
+                from gateway.runtime import reconcile_backend_ages
+                reconcile_backend_ages()
+            except Exception:
+                logger.debug("[activity] reconcile_backend_ages skipped", exc_info=True)
+
             in_flight = sum(1 for a in _all_enabled_accounts() if _account_is_deploying(a))
-            healthy_headroom = _count_active_with_headroom(_RELAY_LEAD_S)
-            need = _DESIRED_ACTIVE - healthy_headroom - in_flight
-            if need > 0:
-                for acc in _available_for_create()[:need]:
+            if not in_flight and _need_open_new_claw():
+                ages = _active_backend_ages()
+                for acc in _available_for_create()[:1]:
                     if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
                         continue
                     _cold_start_last[acc] = now
                     logger.warning(
-                        "[activity] %s: relay deploy (active+headroom=%d, in-flight=%d, need=%d)",
-                        acc, healthy_headroom, in_flight, need,
+                        "[activity] %s: open new Claw (cadence=%ds, youngest_age=%.0fs, actives=%d)",
+                        acc,
+                        _OPEN_INTERVAL_S,
+                        ages[0] if ages else -1,
+                        len(ages),
                     )
                     try:
                         from claw.auto_deploy import trigger_deploy
                         trigger_deploy(acc)
                     except Exception:
-                        logger.exception("[activity] %s: relay trigger_deploy failed", acc)
+                        logger.exception("[activity] %s: open trigger_deploy failed", acc)
+                    break
             for acc in accounts:
                 with _state_lock:
                     st = _state.setdefault(acc, {})

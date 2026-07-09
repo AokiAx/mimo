@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 
 import pytest
@@ -102,7 +103,8 @@ def test_toggle_backend_enable_activates_disabled_backend(monkeypatch):
     assert result["success"] is True
     assert disabled.enabled is True
     assert disabled.lifecycle == "active"
-    assert old.lifecycle == "draining"
+    # multi-active fleet: enabling one does not force-drain peers
+    assert old.lifecycle == "active"
 
 
 def test_reap_drained_keeps_in_flight_until_deadline(monkeypatch, caplog):
@@ -237,7 +239,8 @@ def test_persist_backend_runtime_state_logs_failures(monkeypatch, caplog):
     assert "Failed to persist backend state for candidate" in caplog.text
 
 
-def test_single_active_enforcement_drains_extra_active_backends(monkeypatch):
+def test_manual_retire_other_backends_drains_peers(monkeypatch):
+    """Exclusive activate (operator) still drains peers; fleet deploy does not."""
     chosen = _backend("chosen")
     extra_a = _backend("extra-a")
     extra_b = _backend("extra-b")
@@ -252,6 +255,35 @@ def test_single_active_enforcement_drains_extra_active_backends(monkeypatch):
     assert active == {"chosen"}
     assert draining == {"extra-a", "extra-b"}
     assert retired == ["extra-a", "extra-b"]
+
+
+def test_reconcile_backend_ages_drains_last_30m(monkeypatch):
+    b = _backend("aging")
+    now = time.time()
+    b.active_since = now - (3 * 3600 + 40 * 60)  # 3h40m into 4h life
+    reg = BackendRegistry([b])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.reconcile_backend_ages(now=now)
+
+    assert b.backend_id in result["drained"]
+    assert b.lifecycle == "draining"
+
+
+def test_reconcile_backend_ages_expires_after_ttl(monkeypatch):
+    b = _backend("old")
+    now = time.time()
+    b.active_since = now - (4 * 3600 + 10)
+    reg = BackendRegistry([b])
+    monkeypatch.setattr(runtime, "_registry", reg)
+    monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+
+    result = runtime.reconcile_backend_ages(now=now)
+
+    assert b.backend_id in result["expired"]
+    assert b.lifecycle == "inactive"
+    assert b.enabled is False
 
 
 def test_retire_other_backends_leaves_inactive_backends_alone(monkeypatch):
@@ -299,7 +331,8 @@ def test_prepare_account_deploy_drains_even_when_no_peer_exists(monkeypatch):
     assert only.lifecycle == "draining"
 
 
-def test_complete_account_deploy_activates_target_and_drains_other_active(monkeypatch):
+def test_complete_account_deploy_activates_without_draining_peers(monkeypatch):
+    """Fleet overlap: new Claw activates; peer stays active until age drain."""
     old = _backend("old", lifecycle="draining")
     old.account_id = "alice"
     peer = _backend("peer")
@@ -308,13 +341,14 @@ def test_complete_account_deploy_activates_target_and_drains_other_active(monkey
     monkeypatch.setattr(runtime, "_registry", reg)
     monkeypatch.setattr(runtime, "reload_backends", lambda: len(reg.all()))
     monkeypatch.setattr(runtime, "_persist_backend_runtime_state", lambda _backend: None)
+    monkeypatch.setattr(runtime, "reconcile_backend_ages", lambda now=None: {"drained": [], "expired": []})
 
     result = runtime.complete_account_deploy("alice")
 
     assert result["activated"] == ["old"]
-    assert result["retired"] == ["peer"]
+    assert result["retired"] == []
     assert old.lifecycle == "active"
-    assert peer.lifecycle == "draining"
+    assert peer.lifecycle == "active"
 
 
 def test_complete_account_deploy_activates_when_no_peer_exists(monkeypatch):
@@ -345,7 +379,8 @@ def test_abort_account_deploy_restores_restorable_draining_backend(monkeypatch):
     assert result["restored"] == ["old"]
     assert result["failed"] == []
     assert old.lifecycle == "active"
-    assert peer.lifecycle == "draining"
+    # restore is non-exclusive: peer stays active
+    assert peer.lifecycle == "active"
 
 
 def test_abort_account_deploy_marks_unrestorable_backend_failed(monkeypatch):

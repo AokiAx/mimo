@@ -892,48 +892,51 @@ def _account_info_view(info: dict) -> dict:
 
 
 def _account_pool_state(filename: str) -> dict:
-    """Which of the three deploy pools an account is in, for the panel:
+    """Deploy-pool classification for the panel (single source: claw.account_pool).
 
-    - ``risk``      — bannedStatus tripped, quarantined (risk_blocked tag)
-    - ``cooldown``  — created a Claw today (Beijing day); waiting for reset
-    - ``available`` — enabled and eligible to be picked for a create
-    - ``disabled``  — auto-deploy off and not risk-blocked
+    Labels (mutually exclusive):
+      risk / dead / disabled / serving / cooldown / available
 
-    Mirrors claw_activity's calendar-day cooldown (Beijing, resets at midnight).
+    See ``claw/account_pool.py`` for the full model (inventory + ck + deploy).
     """
     try:
-        from claw.auto_deploy import load_config
-        cfg = load_config()
+        from claw.account_pool import pool_state_for_panel
+        return pool_state_for_panel(filename)
     except Exception:
-        return {"pool": "", "risk_blocked": False, "in_cooldown": False, "last_create_at": 0}
-    accounts = cfg.get("accounts") or {}
-    acc = accounts.get(filename)
-    if acc is None:
-        alt = filename[:-5] if filename.endswith(".json") else filename + ".json"
-        acc = accounts.get(alt) or {}
-    last = int(acc.get("last_create_at") or 0)
-    in_cooldown = False
-    if last:
-        tz = timezone(timedelta(hours=8))
-        in_cooldown = datetime.fromtimestamp(last, tz).date() >= datetime.now(tz).date()
-    risk_blocked = bool(acc.get("risk_blocked"))
-    enabled = bool(acc.get("enabled"))
-    if risk_blocked:
-        pool = "risk"
-    elif not enabled:
-        pool = "disabled"
-    elif in_cooldown:
-        pool = "cooldown"
-    else:
-        pool = "available"
-    return {
-        "pool": pool,
-        "risk_blocked": risk_blocked,
-        "risk_kind": acc.get("risk_kind") or "",
-        "risk_reason": acc.get("risk_blocked_reason") or "",
-        "in_cooldown": in_cooldown,
-        "last_create_at": last,
-    }
+        # fallback without live probe
+        try:
+            from claw.auto_deploy import load_config
+            cfg = load_config()
+        except Exception:
+            return {"pool": "", "risk_blocked": False, "in_cooldown": False, "last_create_at": 0}
+        accounts = cfg.get("accounts") or {}
+        acc = accounts.get(filename)
+        if acc is None:
+            alt = filename[:-5] if filename.endswith(".json") else filename + ".json"
+            acc = accounts.get(alt) or {}
+        last = int(acc.get("last_create_at") or 0)
+        in_cooldown = False
+        if last:
+            tz = timezone(timedelta(hours=8))
+            in_cooldown = datetime.fromtimestamp(last, tz).date() >= datetime.now(tz).date()
+        risk_blocked = bool(acc.get("risk_blocked"))
+        enabled = bool(acc.get("enabled"))
+        if risk_blocked:
+            pool = "risk"
+        elif not enabled:
+            pool = "disabled"
+        elif in_cooldown:
+            pool = "cooldown"
+        else:
+            pool = "available"
+        return {
+            "pool": pool,
+            "risk_blocked": risk_blocked,
+            "risk_kind": acc.get("risk_kind") or "",
+            "risk_reason": acc.get("risk_blocked_reason") or "",
+            "in_cooldown": in_cooldown,
+            "last_create_at": last,
+        }
 
 
 @app.get("/api/claw/status")
@@ -1511,6 +1514,10 @@ async def account_summary(filename: str):
         "risk_reason": pool_state.get("risk_reason", ""),
         "in_cooldown": pool_state["in_cooldown"],
         "last_create_at": pool_state["last_create_at"],
+        "can_create": pool_state.get("can_create"),
+        "is_serving": pool_state.get("is_serving"),
+        "ck_live": pool_state.get("ck_live", cookie_valid),
+        "auto_reg": pool_state.get("auto_reg"),
         "is_current": filename == _get_current_account_name(),
     }
     # Only cache fresh, non-error snapshots — a transient upstream failure shouldn't get pinned.
@@ -1910,6 +1917,15 @@ async def auto_deploy_status():
         "deploys": get_deploy_status(),
         "scheduler": get_scheduler_status(),
     }
+
+
+@app.get("/api/account-pool/status")
+async def account_pool_status():
+    """Unified account pool snapshot (available/serving/cooldown/risk/dead/...)."""
+    from claw.account_pool import snapshot
+    # probe=True hits Xiaomi once per account — run in thread
+    snap = await asyncio.to_thread(snapshot, probe=True, include_archive=False)
+    return {"success": True, **snap}
 
 
 @app.get("/api/auto-deploy/status/{account_filename}")

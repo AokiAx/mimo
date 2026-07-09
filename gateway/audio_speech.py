@@ -46,6 +46,8 @@ def map_openai_tts_model(model: Optional[str]) -> str:
         "mimo-v2.5-tts": "mimo-v2.5-tts",
         "mimo-v2.5-tts-voicedesign": "mimo-v2.5-tts-voicedesign",
         "mimo-v2.5-tts-voiceclone": "mimo-v2.5-tts-voiceclone",
+        # V2 TTS deprecated 2026-06-30 → V2.5
+        "mimo-v2-tts": "mimo-v2.5-tts",
     }
     return model_map.get(model, model)
 

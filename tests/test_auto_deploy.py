@@ -1,10 +1,12 @@
 from claw.auto_deploy import (
+    _is_account_risk_create,
     _is_retryable_create_429,
     _parse_ssh_pubkey,
     _render_ssh_payload,
     _relay_policy,
     _relay_reason,
     _REVERSE_TUNNEL_SH,
+    probe_create_risk,
 )
 
 
@@ -22,11 +24,72 @@ def test_create_429_too_many_requests_message_is_retryable():
     })
 
 
+def test_create_429_too_frequent_message_is_retryable():
+    """Live capture 2026-07-10: immediate re-create after success."""
+    assert _is_retryable_create_429({
+        "code": 429,
+        "msg": "Mimo Claw创建请求过于频繁，请稍后重试",
+    })
+
+
 def test_create_non_429_error_is_not_retryable():
     assert not _is_retryable_create_429({
         "code": 500,
         "msg": "internal error",
     })
+
+
+def test_risk_create_markers_match_live_wording():
+    # Live capture 2026-07-10: body code is 200 (not 0), msg is the gate text.
+    assert _is_account_risk_create({
+        "code": 200,
+        "msg": "当前账号存在风险，暂无法创建",
+    })
+    assert _is_account_risk_create({
+        "code": 1,
+        "msg": "当前账号存在风险，暂无法创建",
+    })
+    assert not _is_account_risk_create({
+        "code": 429,
+        "msg": "Mimo Claw创建请求过于频繁，请稍后重试",
+    })
+    assert not _is_account_risk_create({
+        "code": 7001,
+        "msg": "每天可创建1次免费使用4小时，您今日额度已用完，可前往订阅解锁更多权益",
+    })
+
+
+def test_probe_create_risk_classifies_rate_quota_capacity(monkeypatch):
+    """probe_create_risk must not treat rate/quota as RISK."""
+    import importlib
+
+    responses = iter([
+        ("HTTP_200", {"code": 429, "msg": "Mimo Claw创建请求过于频繁，请稍后重试"}),
+        ("HTTP_200", {"code": 7001, "msg": "每天可创建1次免费使用4小时，您今日额度已用完"}),
+        ("HTTP_200", {"code": 429, "msg": "Mimo Claw使用中机器已达上限"}),
+        ("HTTP_200", {"code": 1, "msg": "当前账号存在风险，暂无法创建"}),
+        ("HTTP_200", {"code": 0, "msg": "成功", "data": {"status": "CREATING"}}),
+    ])
+
+    class _App:
+        @staticmethod
+        def curl_api(*_a, **_k):
+            return next(responses)
+
+    real_import = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "app":
+            return _App()
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+    assert probe_create_risk([]) == "RATE"
+    assert probe_create_risk([]) == "QUOTA"
+    assert probe_create_risk([]) == "CAPACITY"
+    assert probe_create_risk([]) == "RISK"
+    assert probe_create_risk([]) == "OK"
 
 
 def test_create_malformed_response_is_not_retryable():
@@ -61,21 +124,18 @@ def test_render_ssh_payload_substitutes_target_placeholders():
     assert 'TARGET_USER="tunnel"' in rendered
 
 
-def test_relay_policy_targets_single_active_backend():
-    assert _relay_policy(0) == {
-        "desired_active": 0,
-        "normal_min_active": 0,
-        "emergency_min_active": 0,
-    }
-    assert _relay_policy(5) == {
-        "desired_active": 1,
-        "normal_min_active": 1,
-        "emergency_min_active": 1,
-    }
+def test_relay_policy_targets_two_active_for_overlap_fleet():
+    p0 = _relay_policy(0)
+    assert p0["desired_active"] == 0
+    p5 = _relay_policy(5)
+    assert p5["desired_active"] == 2
+    assert p5["open_interval_s"] == 2 * 60 * 60
+    assert p5["drain_before_s"] == 30 * 60
+    assert p5["hard_ttl_s"] == 4 * 60 * 60
 
 
-def test_relay_reason_uses_four_hour_ttl_window():
-    assert _relay_reason((3 * 60 * 60) + (29 * 60)) == "fresh"
-    assert _relay_reason((3 * 60 * 60) + (30 * 60)) == "target_age"
-    assert _relay_reason((3 * 60 * 60) + (50 * 60)) == "critical_age"
-    assert _relay_reason(4 * 60 * 60) == "hard_expiry_age"
+def test_relay_reason_uses_two_hour_open_and_drain_window():
+    assert _relay_reason((1 * 60 * 60) + (59 * 60)) == "fresh"
+    assert _relay_reason(2 * 60 * 60) == "open_next_due"
+    assert _relay_reason((3 * 60 * 60) + (30 * 60)) == "draining_window"
+    assert _relay_reason(4 * 60 * 60) == "expired"

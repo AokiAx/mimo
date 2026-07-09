@@ -6,9 +6,16 @@
 <title>MiMo Manager</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0e17;--sidebar:#0d1117;--card:#111827;--border:#1e293b;--text:#c8d6e5;--text2:#8899aa;--text3:#556677;--accent:#3b82f6;--accent2:#2563eb;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--green-bg:#052e16;--red-bg:#2d0a0a;--yellow-bg:#2d1f05}
+:root{
+  --bg:#070b12;--sidebar:#0b1018;--card:#0f1623;--card2:#121b2b;--border:#1a2436;
+  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
+  --accent:#38bdf8;--accent2:#0ea5e9;--accent-dim:rgba(56,189,248,.12);
+  --green:#34d399;--red:#f87171;--yellow:#fbbf24;--violet:#a78bfa;
+  --green-bg:rgba(52,211,153,.1);--red-bg:rgba(248,113,113,.1);--yellow-bg:rgba(251,191,36,.1);
+  --radius:12px;--shadow:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(0,0,0,.25);
+}
 html,body{height:100%}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;display:flex;overflow:hidden}
+body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;display:flex;overflow:hidden;letter-spacing:.01em}
 
 /* ── Sidebar ── */
 .sidebar{width:220px;min-width:220px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;height:100vh;overflow-y:auto;transition:width .2s}
@@ -35,9 +42,24 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .content{flex:1;overflow-y:auto;padding:20px 24px 40px}
 
 /* ── Cards & Components ── */
-.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:16px}
-.card{background:var(--card);border-radius:10px;padding:18px;border:1px solid var(--border)}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px}
+.card{background:var(--card);border-radius:var(--radius);padding:18px;border:1px solid var(--border);box-shadow:var(--shadow)}
 .card h2{font-size:0.95rem;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.fleet-banner{display:grid;grid-template-columns:1.2fr 1fr;gap:12px;margin-bottom:16px}
+@media(max-width:960px){.fleet-banner{grid-template-columns:1fr}}
+.fleet-hero{background:linear-gradient(135deg,rgba(14,165,233,.14),rgba(167,139,250,.08)),var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow)}
+.fleet-hero h3{font-size:.78rem;color:var(--text3);font-weight:600;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px}
+.fleet-hero .big{font-size:1.35rem;font-weight:700;color:var(--text);line-height:1.35}
+.fleet-hero .sub{font-size:.8rem;color:var(--text2);margin-top:8px;line-height:1.5}
+.pool-pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.pool-pill{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:var(--card2);border:1px solid var(--border);font-size:.8rem}
+.pool-pill b{font-variant-numeric:tabular-nums;font-size:1rem}
+.pool-pill.ok b{color:var(--green)}
+.pool-pill.warn b{color:var(--yellow)}
+.pool-pill.bad b{color:var(--red)}
+.pool-pill.muted b{color:var(--text2)}
+.pool-pill .dot{width:7px;height:7px;border-radius:50%}
+.page-hint{font-size:.8rem;color:var(--text3);margin:-4px 0 14px;line-height:1.5}
 .indicator{width:9px;height:9px;border-radius:50%;display:inline-block;flex-shrink:0}
 .indicator.green{background:var(--green);box-shadow:0 0 6px var(--green)}
 .indicator.red{background:var(--red);box-shadow:0 0 6px var(--red)}
@@ -46,11 +68,11 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .stat-row{display:flex;justify-content:space-between;padding:3px 0;font-size:0.85rem;color:#aabbcc}
 .stat-row .label{color:var(--text2)}
 .stat-row .value{font-weight:500}
-.section{background:var(--card);border-radius:10px;padding:18px;border:1px solid var(--border);margin-bottom:14px}
-.section h2{font-size:1rem;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.btn{padding:7px 14px;border:none;border-radius:6px;cursor:pointer;font-size:0.82rem;font-weight:500;transition:all .2s;white-space:nowrap}
-.btn-primary{background:var(--accent2);color:#fff}
-.btn-primary:hover{background:var(--accent)}
+.section{background:var(--card);border-radius:var(--radius);padding:18px 20px;border:1px solid var(--border);margin-bottom:14px;box-shadow:var(--shadow)}
+.section h2{font-size:.95rem;margin-bottom:14px;display:flex;align-items:center;gap:8px;font-weight:650;color:var(--text)}
+.btn{padding:8px 14px;border:none;border-radius:8px;cursor:pointer;font-size:0.82rem;font-weight:550;transition:all .15s;white-space:nowrap}
+.btn-primary{background:linear-gradient(180deg,#38bdf8,#0ea5e9);color:#041018;font-weight:650}
+.btn-primary:hover{filter:brightness(1.06)}
 .btn-danger{background:#991b1b;color:#fff}
 .btn-danger:hover{background:var(--red)}
 .btn-success{background:#166534;color:#fff}
@@ -159,12 +181,13 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 .data-table tr:hover td{background:rgba(59,130,246,.04)}
 
 /* Metric cards */
-.metric-card{background:var(--card);border-radius:10px;padding:16px;border:1px solid var(--border);text-align:center}
-.metric-card .metric-value{font-size:1.6rem;font-weight:700;color:var(--text)}
-.metric-card .metric-label{font-size:0.75rem;color:var(--text3);margin-top:4px}
+.metric-card{background:var(--card);border-radius:var(--radius);padding:14px 12px;border:1px solid var(--border);text-align:left;box-shadow:var(--shadow)}
+.metric-card .metric-value{font-size:1.45rem;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.metric-card .metric-label{font-size:0.72rem;color:var(--text3);margin-top:6px;text-transform:uppercase;letter-spacing:.06em;font-weight:600}
 .metric-card .metric-change{font-size:0.75rem;margin-top:2px}
 .metric-card .metric-change.up{color:var(--green)}
 .metric-card .metric-change.down{color:var(--red)}
+.data-table th{position:sticky;top:0;background:var(--card)}
 
 /* 24h hourly grid (cells) */
 .hour-grid{display:grid;grid-template-columns:repeat(24,1fr);gap:4px;margin-top:6px}
@@ -237,35 +260,23 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 <!-- ═══ Sidebar ═══ -->
 <nav class="sidebar">
   <div class="sidebar-brand">
-    <h1>MiMo Manager</h1>
-    <div class="sub">Claw & 网关控制台</div>
+    <h1>MiMo</h1>
+    <div class="sub">账号 · Claw · 网关</div>
   </div>
 
   <div class="nav-section">
-    <div class="nav-label">管理</div>
+    <div class="nav-label">运营</div>
     <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')">
-      <span class="icon">📊</span><span>概览</span>
+      <span class="icon">◈</span><span>舰队概览</span>
     </div>
     <div class="nav-item" data-page="accounts" onclick="switchPage('accounts')">
-      <span class="icon">👤</span><span>账号 & Claw</span>
-    </div>
-    <div class="nav-item" data-page="chat" onclick="switchPage('chat')">
-      <span class="icon">💬</span><span>Claw 对话</span>
+      <span class="icon">◎</span><span>账号池</span>
     </div>
     <div class="nav-item" data-page="deploy" onclick="switchPage('deploy')">
-      <span class="icon">🚀</span><span>自动部署</span>
+      <span class="icon">⇢</span><span>部署</span>
     </div>
-    <div class="nav-item" data-page="ssh-targets" onclick="switchPage('ssh-targets')">
-      <span class="icon">🛤️</span><span>中转机配置</span>
-    </div>
-    <div class="nav-item" data-page="logs" onclick="switchPage('logs')">
-      <span class="icon">🧾</span><span>系统日志</span>
-    </div>
-    <div class="nav-item" data-page="panel-acl" onclick="switchPage('panel-acl')">
-      <span class="icon">🔒</span><span>访问控制</span>
-    </div>
-    <div class="nav-item" data-page="secrets" onclick="switchPage('secrets')">
-      <span class="icon">🔑</span><span>密钥管理</span>
+    <div class="nav-item" data-page="chat" onclick="switchPage('chat')">
+      <span class="icon">✦</span><span>对话</span>
     </div>
   </div>
 
@@ -274,20 +285,38 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
   <div class="nav-section">
     <div class="nav-label">网关</div>
     <div class="nav-item" data-page="gateway" onclick="switchPage('gateway')">
-      <span class="icon">⚡</span><span>网关状态</span>
-      <span class="badge green" id="gwBadge">正常</span>
+      <span class="icon">⚡</span><span>状态</span>
+      <span class="badge green" id="gwBadge">ok</span>
     </div>
     <div class="nav-item" data-page="backends" onclick="switchPage('backends')">
-      <span class="icon">🖥️</span><span>后端</span>
+      <span class="icon">▣</span><span>后端</span>
     </div>
     <div class="nav-item" data-page="mappings" onclick="switchPage('mappings')">
-      <span class="icon">🔗</span><span>模型映射</span>
+      <span class="icon">⇄</span><span>模型</span>
     </div>
     <div class="nav-item" data-page="metrics" onclick="switchPage('metrics')">
-      <span class="icon">📈</span><span>指标</span>
+      <span class="icon">▤</span><span>指标</span>
+    </div>
+  </div>
+
+  <div class="nav-sep"></div>
+
+  <div class="nav-section">
+    <div class="nav-label">系统</div>
+    <div class="nav-item" data-page="ssh-targets" onclick="switchPage('ssh-targets')">
+      <span class="icon">⬡</span><span>中转机</span>
+    </div>
+    <div class="nav-item" data-page="logs" onclick="switchPage('logs')">
+      <span class="icon">☰</span><span>日志</span>
+    </div>
+    <div class="nav-item" data-page="secrets" onclick="switchPage('secrets')">
+      <span class="icon">⚿</span><span>密钥</span>
+    </div>
+    <div class="nav-item" data-page="panel-acl" onclick="switchPage('panel-acl')">
+      <span class="icon">⊘</span><span>访问控制</span>
     </div>
     <div class="nav-item" data-page="api-docs" onclick="switchPage('api-docs')">
-      <span class="icon">📖</span><span>API 文档</span>
+      <span class="icon">?</span><span>API</span>
     </div>
   </div>
 </nav>
@@ -295,10 +324,10 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 <!-- ═══ Main Content ═══ -->
 <div class="main">
   <div class="topbar">
-    <div class="topbar-title" id="pageTitle">概览</div>
+    <div class="topbar-title" id="pageTitle">舰队概览</div>
     <div class="topbar-right">
       <span id="curAccountLabel" style="color:var(--text);font-size:0.82rem">
-        <span style="color:var(--text3)">当前账号：</span><span id="curAccountName">--</span>
+        <span style="color:var(--text3)">当前：</span><span id="curAccountName">--</span>
       </span>
       <span id="gwIndicator" title="网关"><span class="indicator gray" id="indGw"></span> 网关</span>
       <span id="clock">--:--:--</span>
@@ -309,60 +338,80 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
 
     <!-- ════ Dashboard ════ -->
     <div class="page active" id="page-dashboard">
+      <p class="page-hint">每 2 小时开一只新 Claw，单只约 4 小时；最后 30 分钟只排空不接新请求。目标常备约 12 个可用账号。</p>
+
+      <div class="fleet-banner">
+        <div class="fleet-hero">
+          <h3>舰队状态</h3>
+          <div class="big" id="dashFleetHeadline">加载中…</div>
+          <div class="sub" id="dashFleetSub">正在读取账号池与后端</div>
+          <div class="pool-pills" id="dashPoolPills">
+            <span class="pool-pill muted"><span class="dot" style="background:var(--text3)"></span>可用 <b id="pillAvail">–</b></span>
+            <span class="pool-pill muted"><span class="dot" style="background:var(--accent)"></span>服役 <b id="pillServing">–</b></span>
+            <span class="pool-pill muted"><span class="dot" style="background:var(--yellow)"></span>冷却 <b id="pillCooldown">–</b></span>
+            <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>风控 <b id="pillRisk">–</b></span>
+            <span class="pool-pill muted"><span class="dot" style="background:var(--red)"></span>失效 <b id="pillDead">–</b></span>
+          </div>
+        </div>
+        <div class="fleet-hero" style="background:var(--card)">
+          <h3>账号库存</h3>
+          <div class="big"><span id="dashAutoLive">–</span> <span style="font-size:.9rem;color:var(--text3);font-weight:500">/ <span id="dashPoolTarget">12</span> 活号</span></div>
+          <div class="sub" id="dashWaterHint">自动注册账号 · 低于目标时后台补号</div>
+          <div class="btn-group" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="refreshDashboard()">刷新</button>
+            <button class="btn btn-ghost" onclick="switchPage('accounts')">账号池</button>
+            <button class="btn btn-ghost" onclick="switchPage('deploy')">部署</button>
+          </div>
+        </div>
+      </div>
+
       <div class="grid">
         <div class="metric-card">
           <div class="metric-value" id="dashAccCount">--</div>
           <div class="metric-label">账号数</div>
         </div>
         <div class="metric-card">
-          <div class="metric-value" id="dashClawHealthy">--</div>
-          <div class="metric-label">Claw 在线</div>
-        </div>
-        <div class="metric-card">
           <div class="metric-value" id="dashCookieValid">--</div>
           <div class="metric-label">Cookie 有效</div>
         </div>
         <div class="metric-card">
-          <div class="metric-value" id="dashRiskCount" style="color:var(--red)">--</div>
-          <div class="metric-label">风控隔离</div>
-        </div>
-        <div class="metric-card">
           <div class="metric-value" id="dashGwBackends">--</div>
-          <div class="metric-label">网关后端 (健康/总)</div>
+          <div class="metric-label">后端 健康/总</div>
         </div>
         <div class="metric-card">
-          <div class="metric-value" id="dashGwReq">--</div>
-          <div class="metric-label">网关总请求</div>
+          <div class="metric-value" id="dashGwActive">--</div>
+          <div class="metric-label">活跃后端</div>
         </div>
         <div class="metric-card">
           <div class="metric-value" id="dashGwQps">--</div>
           <div class="metric-label">QPS</div>
         </div>
+        <div class="metric-card">
+          <div class="metric-value" id="dashGwReq">--</div>
+          <div class="metric-label">总请求</div>
+        </div>
       </div>
+
       <div class="section">
-        <h2>账号概览</h2>
+        <h2>账号一览</h2>
         <table class="data-table">
-          <thead><tr><th>账号</th><th>用户</th><th>Cookie</th><th>Claw</th><th>池</th><th>过期</th><th>当前</th></tr></thead>
+          <thead><tr><th>账号</th><th>池</th><th>Cookie</th><th>Claw</th><th>UID</th><th></th></tr></thead>
           <tbody id="dashAccountsBody">
-            <tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
+            <tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">加载中…</td></tr>
           </tbody>
         </table>
-        <div class="btn-group">
-          <button class="btn btn-primary" onclick="refreshDashboard()">刷新</button>
-          <button class="btn btn-ghost" onclick="switchPage('accounts')">前往账号管理</button>
-          <button class="btn btn-ghost" onclick="switchPage('chat')">打开对话</button>
-        </div>
       </div>
     </div>
 
     <!-- ════ Accounts (unified Account + Claw + Cookie + SSO) ════ -->
     <div class="page" id="page-accounts">
+      <p class="page-hint">主池用自动注册账号；Cookie 失效后归档并补新号（不重登临时邮箱）。也可手动登录或导入 Cookie。</p>
       <div class="section">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <h2 style="margin:0">账号列表</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px;flex-wrap:wrap">
+          <h2 style="margin:0">账号池</h2>
           <div class="btn-group" style="margin:0">
-            <button class="btn btn-primary" onclick="refreshAccountsFull()">全部刷新</button>
-            <button class="btn btn-ghost" onclick="toggleAddPanel()">+ 添加账号</button>
+            <button class="btn btn-primary" onclick="refreshAccountsFull()">刷新</button>
+            <button class="btn btn-ghost" onclick="toggleAddPanel()">添加 / 导入</button>
           </div>
         </div>
         <div id="accountCards"></div>
@@ -449,7 +498,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
     <!-- ════ Auto Deploy ════ -->
     <div class="page" id="page-deploy">
       <div class="section">
-        <h2>部署计划</h2>
+        <h2>部署</h2>
         <div id="autoDeployAccounts"></div>
       </div>
       <div id="deployLogPanel" style="display:none" class="section">
@@ -469,8 +518,8 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
     <div class="page" id="page-ssh-targets">
       <div class="section" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
         <div>
-          <h2 style="margin:0">目标机 / 中转机配置</h2>
-          <div class="meta">用于 Claw 反向 SSH 隧道：目标机接收 <code>ssh -R</code>，网关访问目标机 loopback 暴露出的 API 端口。</div>
+          <h2 style="margin:0">中转机</h2>
+          <div class="meta">Claw 通过反向 SSH 把 API 转到目标机；网关访问目标机本地端口。</div>
         </div>
         <div class="btn-group" style="margin:0">
           <button class="btn btn-primary" onclick="saveSshTargets()">保存配置</button>
@@ -511,7 +560,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px">
           <div>
             <h2 style="margin:0">账号分配</h2>
-            <div class="meta">端口留空时，部署会从目标机端口池自动分配并写回配置。</div>
+            <div class="meta">端口留空时，部署会自动从端口池分配。</div>
           </div>
           <button class="btn" onclick="sshAddAssignmentRow()">新增分配</button>
         </div>
@@ -543,7 +592,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           <select id="logFileSelect" onchange="loadSelectedLog()"></select>
           <input type="number" id="logLines" min="50" max="5000" value="300" title="读取最后 N 行">
           <button class="btn btn-ghost" onclick="loadSelectedLog()">读取尾部</button>
-          <span class="meta">app.log 记录运行信息，error.log 仅记录 ERROR 及以上级别；日志按天分割并自动删除过期历史。</span>
+          <span class="meta">app.log 运行日志；error.log 仅错误。按天切分并自动清理。</span>
         </div>
         <pre class="log-viewer" id="logViewer">选择日志后点击刷新。</pre>
       </div>
@@ -576,7 +625,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         </div>
         <div class="section">
           <h2>路由模式</h2>
-          <div id="gwPoolInfo"><div class="stat-row"><span class="label">单活后端</span><span class="value">--</span></div></div>
+          <div id="gwPoolInfo"><div class="stat-row"><span class="label">路由模式</span><span class="value">--</span></div></div>
         </div>
       </div>
     </div>
@@ -610,12 +659,12 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
           </div>
         </div>
         <div style="margin-top:12px;max-width:700px">
-          <label style="font-size:.8rem;color:var(--text2)">Models 服务的原生模型 * <span style="color:var(--text3);font-weight:normal">（一个 Claw 通常服务 9 个）</span></label>
+          <label style="font-size:.8rem;color:var(--text2)">上游模型 * <span style="color:var(--text3);font-weight:normal">（官方 V2.5 全套）</span></label>
           <div id="beModelsChips" style="min-height:42px;padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px">
             <input id="beModelsInput" type="text" placeholder="输入模型名后按 Enter 或逗号" style="flex:1;min-width:180px;border:none;background:transparent;color:var(--text);font-size:.85rem;outline:none">
           </div>
           <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
-            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()">一键填充 9 个 MiMo 原生模型</button>
+            <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beFillMimoNative()" id="beFillMimoBtn">一键填充 V2.5（7 个）</button>
             <button type="button" class="btn btn-ghost" style="padding:2px 8px;font-size:.72rem" onclick="beClearModels()">清空</button>
           </div>
         </div>
@@ -641,7 +690,7 @@ tr.row-risk td{background:rgba(239,68,68,.09)}
         </div>
       </div>
       <div id="mgInfo" style="color:var(--text3);font-size:.82rem;padding:6px 0 12px 0">
-        客户端用 <code>exposed_name</code> 调 <code>/v1/chat/completions</code>、<code>/v1/responses</code> 或 <code>/v1/messages</code>；网关查到映射后用 <code>native_model</code> 转发上游。映射持久化在 <code>data/model_groups.json</code>，无匹配返回 <code>model_not_found</code>。
+        对外暴露名 → 上游真实模型名。客户端用暴露名调用接口，网关按映射转发。
       </div>
       <div id="mgGroupsContainer"></div>
     </div>
@@ -844,12 +893,12 @@ function formatUptime(sec) {
 // Page Navigation
 // ══════════════════════════════════════════════════════
 var PAGE_TITLES = {
-  dashboard: '概览', accounts: '账号 & Claw',
-  chat: 'Claw 对话', deploy: '自动部署', 'ssh-targets': '中转机配置', logs: '系统日志',
-  gateway: '网关状态', backends: '后端服务器',
+  dashboard: '舰队概览', accounts: '账号池',
+  chat: '对话', deploy: '部署', 'ssh-targets': '中转机', logs: '日志',
+  gateway: '网关状态', backends: '后端',
   mappings: '模型映射',
-  metrics: '指标与日志',
-  'api-docs': 'API 文档', 'panel-acl': '访问控制', secrets: '密钥管理'
+  metrics: '指标',
+  'api-docs': 'API', 'panel-acl': '访问控制', secrets: '密钥'
 };
 
 function switchPage(name) {
@@ -942,6 +991,33 @@ function _dashCkBadge(s) {
     ? '<span class="status-text ok">有效</span>'
     : '<span class="status-text error">失效</span>';
 }
+function _poolLabel(p) {
+  var m = {available:'可用', serving:'服役', cooldown:'冷却', risk:'风控', dead:'失效', disabled:'停用', archive:'归档'};
+  return m[p] || p || '–';
+}
+function _clawLabel(s) {
+  var m = {AVAILABLE:'在线', CREATING:'创建中', DESTROYED:'已销毁', DESTROYING:'销毁中', FAILED:'失败'};
+  return m[s] || s || '–';
+}
+function _banLabel(s) {
+  if (!s || s === 'NOT_BANNED') return '正常';
+  return s;
+}
+function _relayLabel(s) {
+  var m = {fresh:'空闲', open_due:'到点开新', drain:'排空中', emergency:'紧急补位', expiry:'临近过期'};
+  return m[s] || s;
+}
+function _skipLabel(s) {
+  var m = {
+    skipped_unmatched:'尚未部署',
+    disabled:'已停用',
+    cooldown:'冷却中',
+    risk:'风控中',
+    no_quota:'今日额度用尽',
+    healthy:'健康，无需动作'
+  };
+  return m[s] || s;
+}
 function _dashClawBadge(s) {
   if (!s) return '<span class="status-text error">未知</span>';
   if (s.claw_status === 'AVAILABLE') return '<span class="status-text ok">在线</span>';
@@ -950,58 +1026,109 @@ function _dashClawBadge(s) {
 }
 function _dashPoolBadge(s) {
   if (!s) return '<span class="status-text" style="color:var(--text3)">…</span>';
-  if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED')) {
+  // Prefer explicit pool label from account_pool (risk/dead/disabled/serving/cooldown/available)
+  if (s.risk_blocked || s.pool === 'risk' || (s.banned_status && s.banned_status !== 'NOT_BANNED')) {
     var _rk = s.risk_kind === 'create_gate' ? '建号风控' : ((s.banned_status && s.banned_status !== 'NOT_BANNED') ? '封禁' : '风控');
     return '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || 'risk') + '">🚫 ' + _rk + '隔离</span>';
   }
+  if (s.pool === 'dead' || s.ck_live === false) return '<span class="status-text" style="color:var(--red)" title="Cookie 失效，需补新号">失效</span>';
   if (s.pool === 'disabled') return '<span class="status-text" style="color:var(--text3)">停用</span>';
-  if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning">冷却</span>';
-  if (s.pool === 'available') return '<span class="status-text ok">可用</span>';
+  if (s.pool === 'serving' || s.is_serving) return '<span class="status-text ok" title="已挂载后端并接流量">服役</span>';
+  if (s.in_cooldown || s.pool === 'cooldown') return '<span class="status-text warning" title="今日已创建过 Claw">冷却</span>';
+  if (s.pool === 'available' || s.can_create) return '<span class="status-text ok">可用</span>';
   return '<span class="status-text" style="color:var(--text3)">--</span>';
 }
+function _setPill(id, n, kind) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = (n == null ? '–' : n);
+  var pill = el && el.closest ? el.closest('.pool-pill') : null;
+  if (pill) {
+    pill.classList.remove('ok', 'warn', 'bad', 'muted');
+    pill.classList.add(kind || 'muted');
+  }
+}
+
+function _applyPoolSnapshot(p) {
+  if (!p || !p.counts) return;
+  var c = p.counts || {};
+  var avail = c.available || 0;
+  var serving = c.serving || 0;
+  var cool = c.cooldown || 0;
+  var risk = c.risk || 0;
+  var dead = c.dead || 0;
+  var autoLive = (p.auto_live || []).length;
+  var target = 12;
+  try {
+    if (window._poolTarget) target = window._poolTarget;
+  } catch (e) {}
+  _setPill('pillAvail', avail, avail > 0 ? 'ok' : 'bad');
+  _setPill('pillServing', serving, serving > 0 ? 'ok' : 'muted');
+  _setPill('pillCool', cool, cool > 0 ? 'warn' : 'muted');
+  _setPill('pillRisk', risk, risk > 0 ? 'bad' : 'muted');
+  _setPill('pillDead', dead, dead > 0 ? 'bad' : 'muted');
+  var al = document.getElementById('dashAutoLive');
+  if (al) {
+    al.textContent = autoLive;
+    al.style.color = autoLive >= target ? 'var(--green)' : (autoLive >= 3 ? 'var(--yellow)' : 'var(--red)');
+  }
+  var pt = document.getElementById('dashPoolTarget');
+  if (pt) pt.textContent = target;
+  var hl = document.getElementById('dashFleetHeadline');
+  var sub = document.getElementById('dashFleetSub');
+  if (hl) {
+    if (serving > 0 && avail > 0) hl.textContent = '运行中 · 可接力';
+    else if (serving > 0) hl.textContent = '运行中 · 可用号偏少';
+    else if (avail > 0) hl.textContent = '待命 · 尚未部署';
+    else hl.textContent = '告警 · 没有可用账号';
+  }
+  if (sub) {
+    sub.textContent = '可用 ' + avail + ' · 服役 ' + serving + ' · 冷却 ' + cool +
+      ' · 活号 ' + autoLive + '/' + target +
+      (dead ? ' · 失效 ' + dead + ' 待补' : '');
+  }
+  var wh = document.getElementById('dashWaterHint');
+  if (wh) {
+    wh.textContent = autoLive < target
+      ? ('低于目标 ' + target + '，后台会每次最多补 2 个')
+      : '库存正常 · 约每 2 小时开新号 · 末期 30 分钟排空';
+  }
+}
+
 function _dashRetallyCounters() {
-  var clawHealthy = 0, cookieValid = 0, riskCount = 0;
+  var cookieValid = 0;
   for (var i = 0; i < accounts.length; i++) {
     var s = accountSummaries[accounts[i].filename];
-    if (s) {
-      if (s.claw_status === 'AVAILABLE') clawHealthy++;
-      if (s.cookie_valid) cookieValid++;
-      if (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED')) riskCount++;
-    }
+    if (s && s.cookie_valid) cookieValid++;
   }
-  document.getElementById('dashClawHealthy').textContent = clawHealthy + ' / ' + accounts.length;
-  document.getElementById('dashCookieValid').textContent = cookieValid + ' / ' + accounts.length;
-  var rc = document.getElementById('dashRiskCount');
-  if (rc) { rc.textContent = riskCount; rc.style.color = riskCount > 0 ? 'var(--red)' : 'var(--text3)'; }
+  var el = document.getElementById('dashCookieValid');
+  if (el) el.textContent = cookieValid + ' / ' + accounts.length;
 }
 
 function refreshDashboard() {
   fetchAccounts().then(function() {
-    document.getElementById('dashAccCount').textContent = accounts.length;
-    // Render skeleton rows immediately so the table doesn't sit blank.
+    var elAcc = document.getElementById('dashAccCount');
+    if (elAcc) elAcc.textContent = accounts.length;
     var rows = '';
     for (var i = 0; i < accounts.length; i++) {
       var a = accounts[i];
       var rowId = 'dashRow_' + encodeURIComponent(a.filename).replace(/%/g, '_');
       var cached = accountSummaries[a.filename];
-      rows += '<tr id="' + rowId + '">' +
-        '<td><strong>' + escapeHtml(a.name || a.filename) + '</strong></td>' +
-        '<td class="cellUser">' + escapeHtml((cached && cached.user_name) || a.user_name || '--') +
-            '<div style="font-size:0.7rem;color:var(--text3)">' + escapeHtml((cached && cached.user_id) || a.user_id || '') + '</div></td>' +
-        '<td class="cellCk">' + (cached ? _dashCkBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
-        '<td class="cellClaw">' + (cached ? _dashClawBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
+      rows += '<tr id="' + rowId + '"' + (a.is_current ? ' class="row-current"' : '') + '>' +
+        '<td><strong style="font-size:.86rem">' + escapeHtml(a.name || a.filename) + '</strong></td>' +
         '<td class="cellPool">' + (cached ? _dashPoolBadge(cached) : '<span class="status-text" style="color:var(--text3)">…</span>') + '</td>' +
-        '<td class="cellExp" style="font-size:0.78rem;color:var(--text2)">' + escapeHtml((cached && cached.claw_expire) || '--') + '</td>' +
+        '<td class="cellCk">' + (cached ? _dashCkBadge(cached) : '…') + '</td>' +
+        '<td class="cellClaw">' + (cached ? _dashClawBadge(cached) : '…') + '</td>' +
+        '<td class="cellUser" style="font-size:.78rem;color:var(--text2)">' + escapeHtml((cached && cached.user_id) || a.user_id || '–') + '</td>' +
         '<td>' + (a.is_current ? '<span class="status-text ok">当前</span>' : '') + '</td>' +
         '</tr>';
     }
     if (rows === '') {
-      rows = '<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:18px">暂无账号，前往「账号 & Claw」添加</td></tr>';
+      rows = '<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:18px">暂无账号</td></tr>';
     }
-    document.getElementById('dashAccountsBody').innerHTML = rows;
+    var body = document.getElementById('dashAccountsBody');
+    if (body) body.innerHTML = rows;
     _dashRetallyCounters();
 
-    // Progressive update: each summary patches its own row as it arrives.
     fetchAllSummaries(function(filename, s) {
       var rowId = 'dashRow_' + encodeURIComponent(filename).replace(/%/g, '_');
       var row = document.getElementById(rowId);
@@ -1009,35 +1136,36 @@ function refreshDashboard() {
       var ckCell = row.querySelector('.cellCk');
       var clawCell = row.querySelector('.cellClaw');
       var poolCell = row.querySelector('.cellPool');
-      var expCell = row.querySelector('.cellExp');
       var userCell = row.querySelector('.cellUser');
       if (ckCell) ckCell.innerHTML = _dashCkBadge(s);
       if (clawCell) clawCell.innerHTML = _dashClawBadge(s);
       if (poolCell) poolCell.innerHTML = _dashPoolBadge(s);
-      if (s && (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'))) row.classList.add('row-risk'); else row.classList.remove('row-risk');
-      if (expCell) expCell.textContent = (s && s.claw_expire) || '--';
-      if (userCell && s) {
-        userCell.innerHTML = escapeHtml(s.user_name || '--') +
-          '<div style="font-size:0.7rem;color:var(--text3)">' + escapeHtml(s.user_id || '') + '</div>';
-      }
+      if (s && (s.risk_blocked || s.pool === 'risk' || (s.banned_status && s.banned_status !== 'NOT_BANNED'))) row.classList.add('row-risk'); else row.classList.remove('row-risk');
+      if (userCell && s) userCell.textContent = s.user_id || '–';
       _dashRetallyCounters();
     });
   });
 
+  api('GET', '/api/account-pool/status').then(function(d) {
+    if (d && d.success !== false) _applyPoolSnapshot(d);
+  }).catch(function() {});
+
   api('GET', '/api/gateway/status').then(function(d) {
     if (d.error) {
       setInd('indGw', 'gray');
-      document.getElementById('dashGwBackends').textContent = '--';
-      document.getElementById('dashGwReq').textContent = '--';
-      document.getElementById('dashGwQps').textContent = '--';
       return;
     }
     setInd('indGw', 'ok');
-    document.getElementById('gwBadge').textContent = '正常';
-    document.getElementById('gwBadge').className = 'badge green';
-    document.getElementById('dashGwBackends').textContent = (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0);
-    document.getElementById('dashGwReq').textContent = d.total_requests || 0;
-    document.getElementById('dashGwQps').textContent = d.qps || 0;
+    var badge = document.getElementById('gwBadge');
+    if (badge) { badge.textContent = 'ok'; badge.className = 'badge green'; }
+    var b = document.getElementById('dashGwBackends');
+    if (b) b.textContent = (d.backends_healthy || 0) + ' / ' + (d.backends_total || 0);
+    var a = document.getElementById('dashGwActive');
+    if (a) a.textContent = d.backends_active != null ? d.backends_active : ((d.active_backends || []).length || 0);
+    var r = document.getElementById('dashGwReq');
+    if (r) r.textContent = d.total_requests || 0;
+    var q = document.getElementById('dashGwQps');
+    if (q) q.textContent = d.qps || 0;
   }).catch(function() {
     setInd('indGw', 'gray');
   });
@@ -1056,65 +1184,44 @@ function refreshAccountsFull() {
 function renderAccountCards() {
   var el = document.getElementById('accountCards');
   if (accounts.length === 0) {
-    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">暂无账号。点击右上角 “+ 添加账号” 开始。</div>';
+    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">暂无账号。等待自动补号，或点「添加 / 导入」。</div>';
     return;
   }
   var html = '';
   for (var i = 0; i < accounts.length; i++) {
     var a = accounts[i];
     var s = accountSummaries[a.filename] || {};
-    var ckBadge = s.cookie_valid === true
-      ? '<span class="status-text ok">Cookie 有效</span>'
-      : (s.cookie_valid === false
-          ? '<span class="status-text error">Cookie 失效</span>'
-          : '<span class="status-text warning">Cookie 待检</span>');
-    var clawBadge = s.claw_status === 'AVAILABLE'
-      ? '<span class="status-text ok">Claw 在线</span>'
-      : (s.claw_status === 'DESTROYED'
-          ? '<span class="status-text warning">Claw 已销毁</span>'
-          : (s.claw_status
-              ? '<span class="status-text error">Claw ' + escapeHtml(s.claw_status) + '</span>'
-              : '<span class="status-text warning">Claw 待检</span>'));
-    var curBadge = a.is_current ? '<span class="status-text ok">当前账号</span>' : '';
-    var _isRisk = (s.risk_blocked || (s.banned_status && s.banned_status !== 'NOT_BANNED'));
-    var _riskKind = s.risk_kind === 'create_gate' ? '建号风控' : ((s.banned_status && s.banned_status !== 'NOT_BANNED') ? '封禁' : '风控');
-    var poolBadge = _isRisk
-      ? '<span class="badge-risk" title="' + escapeHtml(s.risk_reason || s.banned_status || '') + '">🚫 ' + _riskKind + '隔离</span>'
-      : (s.in_cooldown || s.pool === 'cooldown'
-          ? '<span class="status-text warning">冷却</span>'
-          : (s.pool === 'available'
-              ? '<span class="status-text ok">可用</span>'
-              : (s.pool === 'disabled' ? '<span class="status-text" style="color:var(--text3)">停用</span>' : '')));
+    var _isRisk = (s.risk_blocked || s.pool === 'risk' || (s.banned_status && s.banned_status !== 'NOT_BANNED'));
     var fn = a.filename;
+    var shortMail = (a.name || fn || '').replace(/@.*$/, '') + '@…';
     html += '<div class="acc-card' + (a.is_current ? ' current' : '') + (_isRisk ? ' risk' : '') + '" id="acccard-' + escapeHtml(fn) + '">';
     html += '<div class="head">';
-    html += '<div><div class="name">' + escapeHtml(a.name || fn) + '</div>';
-    html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:2px">' + escapeHtml(fn) + '</div></div>';
-    html += '<div class="badges">' + curBadge + poolBadge + ckBadge + clawBadge + '</div>';
-    html += '</div>';
-    if (_isRisk) html += '<div class="risk-reason">🚫 已风控隔离' + (s.risk_kind === 'create_gate' ? '（建号 create 被拒）' : '') + '：' + escapeHtml(s.risk_reason || s.banned_status || '账号存在风险') + '</div>';
+    html += '<div><div class="name" title="' + escapeHtml(a.name || fn) + '">' + escapeHtml(a.name || fn) + '</div>';
+    html += '<div style="font-size:0.74rem;color:var(--text3);margin-top:3px">uid ' + escapeHtml(s.user_id || a.user_id || '–') + '</div></div>';
+    html += '<div class="badges">' +
+      (a.is_current ? '<span class="status-text ok">当前</span>' : '') +
+      _dashPoolBadge(s) +
+      (s.cookie_valid === true ? '<span class="status-text ok">Cookie 有效</span>' :
+        (s.cookie_valid === false ? '<span class="status-text error">Cookie 失效</span>' : '')) +
+      (s.claw_status === 'AVAILABLE' ? '<span class="status-text ok">Claw 在线</span>' :
+        (s.claw_status === 'DESTROYED' ? '<span class="status-text warning">无 Claw</span>' : '')) +
+      '</div></div>';
+    if (_isRisk) {
+      html += '<div class="risk-reason">' + escapeHtml(s.risk_reason || s.banned_status || '风控隔离') + '</div>';
+    }
     html += '<div class="meta-row">';
-    html += '<div><span class="k">用户名</span><span class="v">' + escapeHtml(s.user_name || a.user_name || '--') + '</span></div>';
-    html += '<div><span class="k">User ID</span><span class="v">' + escapeHtml(s.user_id || a.user_id || '--') + '</span></div>';
-    html += '<div><span class="k">邮箱</span><span class="v">' + escapeHtml(a.email || '--') + '</span></div>';
-    html += '<div><span class="k">Cookie 数</span><span class="v">' + (s.cookie_count || 0) + '</span></div>';
-    html += '<div><span class="k">Claw 过期</span><span class="v">' + escapeHtml(s.claw_expire || '--') + '</span></div>';
-    html += '<div><span class="k">风控状态</span><span class="v">' + escapeHtml(s.banned_status || '--') + '</span></div>';
-    html += '<div><span class="k">区域/版本</span><span class="v">' + escapeHtml((s.claw_cluster || '--') + (s.claw_edition ? ' · ' + s.claw_edition : '')) + '</span></div>';
-    html += '<div><span class="k">添加时间</span><span class="v" style="font-size:0.76rem">' + escapeHtml((a.added_at || '').replace('T',' ').slice(0,19)) + '</span></div>';
+    html += '<div><span class="k">池</span><span class="v">' + escapeHtml(_poolLabel(s.pool)) + (s.can_create ? ' · 可开 Claw' : '') + '</span></div>';
+    html += '<div><span class="k">Claw</span><span class="v">' + escapeHtml(_clawLabel(s.claw_status)) + (s.claw_expire ? ' · ' + escapeHtml(s.claw_expire) : '') + '</span></div>';
+    html += '<div><span class="k">封禁</span><span class="v">' + escapeHtml(_banLabel(s.banned_status)) + '</span></div>';
     html += '</div>';
     html += '<div class="actions">';
-    if (!a.is_current) html += '<button class="btn btn-primary" onclick="accSwitch(\'' + fn + '\')">切换为当前</button>';
+    if (!a.is_current) html += '<button class="btn btn-ghost" onclick="accSwitch(\'' + fn + '\')">设为当前</button>';
     html += '<button class="btn btn-success" onclick="accClawCreate(\'' + fn + '\')">创建 Claw</button>';
-    html += '<button class="btn btn-primary" onclick="accClawRefresh(\'' + fn + '\')">重建 Claw</button>';
-    html += '<button class="btn btn-ghost" onclick="accClawOp(\'' + fn + '\',\'repair\')" title="MiMo 修复：换一个新的空白 Claw（同一 4h 窗口），需重新部署隧道">修复</button>';
-    html += '<button class="btn btn-ghost" onclick="accClawOp(\'' + fn + '\',\'restart\')" title="MiMo 重启：换一个新的空白 Claw（同一 4h 窗口），需重新部署隧道">重启</button>';
-    html += '<button class="btn btn-danger" onclick="accClawDestroy(\'' + fn + '\')">销毁 Claw</button>';
-    html += '<button class="btn btn-ghost" onclick="accCheck(\'' + fn + '\')">检查状态</button>';
-    html += '<button class="btn btn-ghost" onclick="accRelogin(\'' + fn + '\',\'' + escapeHtml(a.email || '') + '\')">重新登录</button>';
-    html += '<button class="btn btn-danger" onclick="accDelete(\'' + fn + '\')">删除</button>';
-    html += '</div>';
-    html += '</div>';
+    html += '<button class="btn btn-ghost" onclick="accClawRefresh(\'' + fn + '\')">重建</button>';
+    html += '<button class="btn btn-ghost" onclick="accCheck(\'' + fn + '\')">检查</button>';
+    html += '<button class="btn btn-danger" onclick="accClawDestroy(\'' + fn + '\')">销毁</button>';
+    html += '<button class="btn btn-ghost" onclick="accDelete(\'' + fn + '\')" style="opacity:.7">删除</button>';
+    html += '</div></div>';
   }
   el.innerHTML = html;
 }
@@ -1486,11 +1593,11 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<button class="btn btn-danger" onclick="cancelAutoDeploy(\'' + fn + '\')">取消</button>';
     card += '<button class="btn btn-ghost" onclick="showDeployLog(\'' + fn + '\')">日志</button>';
     card += '</div></div>';
-    if (isRisk) card += '<div class="risk-reason">🚫 已风控隔离' + (cfg.risk_kind === 'create_gate' ? '（建号 create 被拒）' : '') + '：' + escapeHtml(cfg.risk_blocked_reason || '账号存在风险') + ' · 每 2h 自动复测，解除后自动放回可用池</div>';
+    if (isRisk) card += '<div class="risk-reason">已风控隔离' + (cfg.risk_kind === 'create_gate' ? '（创建被拒）' : '') + '：' + escapeHtml(cfg.risk_blocked_reason || '账号存在风险') + ' · 约每 2 小时复测，通过后自动恢复</div>';
     card += '<div style="margin-bottom:10px">';
     card += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
     card += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
-    card += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4h TTL，剩余约 30 分钟冷启动下一个可用账号，无需 Cron</span>';
+    card += '<span style="font-size:0.74rem;color:var(--text3);margin-left:12px">自动接力：约 4 小时寿命，末期冷启动下一账号</span>';
     card += '</div>';
     var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
@@ -1500,8 +1607,8 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     card += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
     if (ageMin > 0) card += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
-    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') card += '<span>接力原因：<b>' + escapeHtml(relayReason) + '</b></span>';
-    if (skipReason && skipReason !== 'disabled') card += '<span style="color:var(--yellow)">跳过：' + escapeHtml(skipReason) + '</span>';
+    if (relayReason && relayReason !== 'fresh' && relayReason !== 'disabled') card += '<span>接力：<b>' + escapeHtml(_relayLabel(relayReason)) + '</b></span>';
+    if (skipReason && skipReason !== 'disabled') card += '<span style="color:var(--yellow)">状态：' + escapeHtml(_skipLabel(skipReason)) + '</span>';
     card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     card += '</div>';
     card += '</div>';
@@ -1591,9 +1698,9 @@ function refreshGateway() {
       '<div class="stat-row"><span class="label">降级</span><span class="value" style="color:var(--yellow)">' + (d.backends_degraded || 0) + '</span></div>' +
       '<div class="stat-row"><span class="label">失败 / 排空</span><span class="value">' + (d.backends_failed || 0) + ' / ' + (d.backends_draining || 0) + '</span></div>';
     document.getElementById('gwPoolInfo').innerHTML =
-      '<div class="stat-row"><span class="label">模式</span><span class="value">单活</span></div>' +
+      '<div class="stat-row"><span class="label">模式</span><span class="value">多活（优先新后端）</span></div>' +
       '<div class="stat-row"><span class="label">当前后端</span><span class="value">' + escapeHtml(d.active_backend || '--') + '</span></div>' +
-      '<div class="stat-row"><span class="label">非路由后端</span><span class="value">' + (d.backends_inactive || 0) + '</span></div>';
+      '<div class="stat-row"><span class="label">未路由后端</span><span class="value">' + (d.backends_inactive || 0) + '</span></div>';
   }).catch(function() {
     document.getElementById('gwHealthInfo').innerHTML = '<div class="stat-row"><span class="label">状态</span><span class="value">网关无法访问</span></div>';
   });
@@ -1650,9 +1757,16 @@ var BK_STATUS = {
 };
 
 // ── Multi-model tag input for backend form ──
-var MIMO_NATIVE_MODELS = [
-  'mimo-v2.5', 'mimo-v2.5-pro', 'mimo-v2.5-tts',
-  'mimo-v2.5-tts-voiceclone', 'mimo-v2.5-tts-voicedesign'
+// Fallback when /api/model-groups is empty. Official V2.5 only (V2 retired 2026-06-30).
+// Keep aligned with data/model_groups.json group id=mimo-v25.
+var MIMO_NATIVE_MODELS_FALLBACK = [
+  'mimo-v2.5-pro',
+  'mimo-v2.5-pro-ultraspeed',
+  'mimo-v2.5',
+  'mimo-v2.5-tts',
+  'mimo-v2.5-tts-voiceclone',
+  'mimo-v2.5-tts-voicedesign',
+  'mimo-v2.5-asr'
 ];
 var beModels = [];  // current list in the form
 
@@ -1688,8 +1802,49 @@ function beRemoveModel(name) {
   beModels = beModels.filter(function(m) { return m !== name; });
   beRenderChips();
 }
+function beExtractV25NativeModels(groups) {
+  if (!Array.isArray(groups)) return null;
+  var prefer = null;
+  var i, g, m, n, seen, list;
+  for (i = 0; i < groups.length; i++) {
+    g = groups[i] || {};
+    if (g.id === 'mimo-v25' || /v2\.5|V2\.5/.test(String(g.id || '')) || /V2\.5|v2\.5/.test(String(g.name || ''))) {
+      prefer = g;
+      break;
+    }
+  }
+  if (!prefer) return null;
+  seen = {};
+  list = [];
+  (prefer.mappings || []).forEach(function(m) {
+    n = ((m && m.native_model) || '').trim();
+    if (n && !seen[n]) { seen[n] = 1; list.push(n); }
+  });
+  return list.length ? list : null;
+}
+function beApplyModelList(models, source) {
+  beModels = (models || []).slice();
+  beRenderChips();
+  var btn = document.getElementById('beFillMimoBtn');
+  if (btn) {
+    btn.textContent = '已填充 ' + beModels.length + ' 个 V2.5' + (source ? '（' + source + '）' : '');
+  }
+  toast('已填充 ' + beModels.length + ' 个 V2.5 模型', 'success');
+}
 function beFillMimoNative() {
-  for (var i = 0; i < MIMO_NATIVE_MODELS.length; i++) beAddModel(MIMO_NATIVE_MODELS[i]);
+  // Prefer live mappings from model_groups (mimo-v25); replace entirely so stale v2 names cannot stick.
+  var btn = document.getElementById('beFillMimoBtn');
+  if (btn) btn.textContent = '拉取中…';
+  api('GET', '/api/model-groups').then(function(d) {
+    var fromApi = beExtractV25NativeModels(d && d.groups);
+    if (fromApi && fromApi.length) {
+      beApplyModelList(fromApi, '映射表');
+    } else {
+      beApplyModelList(MIMO_NATIVE_MODELS_FALLBACK, '内置');
+    }
+  }).catch(function() {
+    beApplyModelList(MIMO_NATIVE_MODELS_FALLBACK, '内置');
+  });
 }
 function beClearModels() {
   beModels = [];

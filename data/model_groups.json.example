@@ -1,0 +1,84 @@
+{
+  "groups": [
+    {
+      "id": "mimo-v25",
+      "name": "MiMo V2.5 主力",
+      "description": "官方 V2 已于 2026-06-30 下线；当前主力为 V2.5 系列（含 UltraSpeed / ASR）",
+      "mappings": [
+        {
+          "id": "m_pro",
+          "exposed_name": "mimo-v2.5-pro",
+          "native_model": "mimo-v2.5-pro",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_pro_us",
+          "exposed_name": "mimo-v2.5-pro-ultraspeed",
+          "native_model": "mimo-v2.5-pro-ultraspeed",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_base",
+          "exposed_name": "mimo-v2.5",
+          "native_model": "mimo-v2.5",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_tts",
+          "exposed_name": "mimo-v2.5-tts",
+          "native_model": "mimo-v2.5-tts",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_tts_vc",
+          "exposed_name": "mimo-v2.5-tts-voiceclone",
+          "native_model": "mimo-v2.5-tts-voiceclone",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_tts_vd",
+          "exposed_name": "mimo-v2.5-tts-voicedesign",
+          "native_model": "mimo-v2.5-tts-voicedesign",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "m_asr",
+          "exposed_name": "mimo-v2.5-asr",
+          "native_model": "mimo-v2.5-asr",
+          "protocols": ["openai", "anthropic"]
+        }
+      ]
+    },
+    {
+      "id": "mimo-v2-compat",
+      "name": "V2 兼容别名（已下线 → V2.5）",
+      "description": "2026-06-30 后旧名应已失效；网关侧仍映射到 V2.5 便于老客户端过渡",
+      "mappings": [
+        {
+          "id": "c_pro",
+          "exposed_name": "mimo-v2-pro",
+          "native_model": "mimo-v2.5-pro",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "c_omni",
+          "exposed_name": "mimo-v2-omni",
+          "native_model": "mimo-v2.5",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "c_flash",
+          "exposed_name": "mimo-v2-flash",
+          "native_model": "mimo-v2.5",
+          "protocols": ["openai", "anthropic"]
+        },
+        {
+          "id": "c_tts",
+          "exposed_name": "mimo-v2-tts",
+          "native_model": "mimo-v2.5-tts",
+          "protocols": ["openai", "anthropic"]
+        }
+      ]
+    }
+  ]
+}
