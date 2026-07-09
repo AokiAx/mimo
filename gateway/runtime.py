@@ -151,6 +151,7 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         metadata=meta,
         lifecycle=lifecycle,
         generation_id=entry.get("generation_id") or entry.get("id") or "",
+        expire_at=float(entry.get("expire_at") or 0) or 0.0,
     )
     return backend
 
@@ -232,6 +233,8 @@ def reload_backends() -> int:
         existing.enabled = fresh.enabled
         existing.metadata = fresh.metadata
         existing.generation_id = fresh.generation_id
+        if getattr(fresh, "expire_at", 0):
+            existing.expire_at = float(fresh.expire_at)
         if fresh.lifecycle != existing.lifecycle:
             if fresh.lifecycle == "inactive":
                 existing.mark_inactive()
@@ -260,8 +263,11 @@ def reload_backends() -> int:
 def reconcile_backend_ages(*, now: float | None = None) -> dict[str, list[str]]:
     """Age-based traffic control for free-tier Claws.
 
-    - age >= TTL - 30m  → lifecycle=draining (no new requests)
-    - age >= TTL        → inactive + disabled (Claw effectively expired)
+    Prefer official MiMo ``expireTime`` (stored as ``Backend.expire_at``) when
+    known. Fall back to ``active_since + hard TTL`` only when expire_at is unset.
+
+    - remain <= 30m  → lifecycle=draining (no new requests)
+    - remain <= 0    → inactive + disabled (Claw effectively expired)
     """
     _ensure_initialized()
     assert _registry is not None
@@ -270,13 +276,17 @@ def reconcile_backend_ages(*, now: float | None = None) -> dict[str, list[str]]:
     expired: list[str] = []
     ttl = max(60.0, float(_CLAW_HARD_TTL_S))
     drain_before = max(0.0, min(float(_CLAW_DRAIN_BEFORE_EXPIRY_S), ttl - 60.0))
-    drain_start_age = ttl - drain_before
 
     for b in _registry.all():
-        if not b.active_since:
+        if getattr(b, "expire_at", 0) and b.expire_at > 0:
+            remain = float(b.expire_at) - n
+            age = max(0.0, ttl - remain)
+        elif b.active_since:
+            age = n - b.active_since
+            remain = ttl - age
+        else:
             continue
-        age = n - b.active_since
-        if age >= ttl:
+        if remain <= 0 or age >= ttl:
             if b.lifecycle != "inactive" or b.enabled:
                 b.mark_inactive()
                 b.enabled = False
@@ -288,12 +298,12 @@ def reconcile_backend_ages(*, now: float | None = None) -> dict[str, list[str]]:
                     pass
                 expired.append(b.backend_id)
                 logger.info(
-                    "Backend %s expired (age=%.0fs >= ttl=%.0fs) → disabled",
-                    b.backend_id, age, ttl,
+                    "Backend %s expired (age=%.0fs remain=%.0fs ttl=%.0fs expire_at=%.0f) → disabled",
+                    b.backend_id, age, remain, ttl, float(getattr(b, "expire_at", 0) or 0),
                 )
             continue
-        if b.lifecycle == "active" and age >= drain_start_age:
-            remaining = max(30.0, ttl - age)
+        if b.lifecycle == "active" and remain <= drain_before:
+            remaining = max(30.0, remain)
             b.mark_draining(drain_timeout_s=remaining, now=n)
             _persist_backend_runtime_state(b)
             try:
@@ -440,7 +450,20 @@ def get_all_backends() -> list[dict[str, Any]]:
             "lifecycle": b.lifecycle,
             "generation_id": b.generation_id,
             "in_flight": b.in_flight,
-            "active_for_s": round(now - b.active_since, 1) if b.active_since else 0,
+            "active_for_s": (
+                round(max(0.0, float(_CLAW_HARD_TTL_S) - (float(b.expire_at) - now)), 1)
+                if getattr(b, "expire_at", 0) and b.expire_at > 0
+                else (round(now - b.active_since, 1) if b.active_since else 0)
+            ),
+            "expire_at": float(getattr(b, "expire_at", 0) or 0),
+            "remain_s": (
+                round(float(b.expire_at) - now, 1)
+                if getattr(b, "expire_at", 0) and b.expire_at > 0
+                else (
+                    round(float(_CLAW_HARD_TTL_S) - (now - b.active_since), 1)
+                    if b.active_since else 0
+                )
+            ),
             "draining_for_s": round(now - b.draining_since, 1) if b.draining_since else 0,
             "drain_deadline_s": round(b.drain_deadline - now, 1) if b.drain_deadline else 0,
         })
@@ -536,11 +559,19 @@ def wait_for_account_drain(
     return {"success": not pending, "pending": pending}
 
 
-def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> dict[str, Any]:
+def complete_account_deploy(
+    account_id: str,
+    *,
+    api_port: int | None = None,
+    expire_at: float | None = None,
+) -> dict[str, Any]:
     """Reload and activate backends for a freshly deployed Claw.
 
     Does **not** force-drain peer actives — fleet keeps overlap (2h open / 4h TTL).
     Age-based drain still retires Claws in their last 30 minutes.
+
+    ``expire_at`` is the official MiMo status.expireTime converted to epoch
+    seconds. When provided it becomes the source of truth for remain/drain/open.
     """
     reload_backends()
     assert _registry is not None
@@ -554,11 +585,16 @@ def complete_account_deploy(account_id: str, *, api_port: int | None = None) -> 
         backend.consecutive_failures = 0
         backend.last_error = ""
         backend.mark_active(now=now)
+        if expire_at and float(expire_at) > 0:
+            backend.expire_at = float(expire_at)
         activated.append(backend.backend_id)
         _persist_backend_runtime_state(backend)
         try:
             from gateway.backend_store import update_backend
-            update_backend(backend.backend_id, enabled=True, lifecycle="active")
+            fields: dict[str, Any] = {"enabled": True, "lifecycle": "active"}
+            if backend.expire_at > 0:
+                fields["expire_at"] = backend.expire_at
+            update_backend(backend.backend_id, **fields)
         except Exception:
             pass
     reconcile_backend_ages(now=now)
@@ -794,12 +830,14 @@ def _probe_body_for_model(model: str) -> dict[str, Any]:
 def _persist_backend_runtime_state(backend: Backend) -> None:
     try:
         from gateway.backend_store import update_backend
-        update_backend(
-            backend.backend_id,
-            enabled=backend.enabled,
-            lifecycle=backend.lifecycle,
-            generation_id=backend.generation_id,
-        )
+        fields: dict[str, Any] = {
+            "enabled": backend.enabled,
+            "lifecycle": backend.lifecycle,
+            "generation_id": backend.generation_id,
+        }
+        if getattr(backend, "expire_at", 0):
+            fields["expire_at"] = float(backend.expire_at)
+        update_backend(backend.backend_id, **fields)
     except Exception:
         logger.exception("Failed to persist backend state for %s", backend.backend_id)
 

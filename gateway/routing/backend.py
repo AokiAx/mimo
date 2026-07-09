@@ -46,6 +46,9 @@ class Backend:
     generation_id: str = ""
     ready_at: float = 0.0
     active_since: float = 0.0
+    # Official MiMo claw expiry (epoch seconds from status.expireTime).
+    # 0 = unknown → fall back to active_since + hard TTL.
+    expire_at: float = 0.0
     draining_since: float = 0.0
     drain_deadline: float = 0.0
 

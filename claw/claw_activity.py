@@ -223,17 +223,27 @@ def _quarantined_accounts() -> list[str]:
 
 
 def _active_backend_ages() -> list[float]:
-    """Ages (seconds) of enabled active backends, newest first."""
+    """Ages (seconds) of enabled active backends, youngest first.
+
+    Prefer official MiMo expireTime-derived age (HARD_TTL - remain_s). Falls
+    back to process-local active_for_s when expire_at is unknown.
+    """
     try:
         from gateway.runtime import get_all_backends
         backends = get_all_backends()
     except Exception:
         return []
     ages = []
+    hard = float(_MIMO_HARD_TTL_S)
     for b in backends:
         if not (b.get("enabled", True) and b.get("lifecycle") == "active"):
             continue
-        ages.append(float(b.get("active_for_s") or 0))
+        remain = b.get("remain_s")
+        exp = b.get("expire_at")
+        if exp and float(exp) > 0 and remain is not None:
+            ages.append(max(0.0, hard - float(remain)))
+        else:
+            ages.append(float(b.get("active_for_s") or 0))
     ages.sort()  # youngest first
     return ages
 

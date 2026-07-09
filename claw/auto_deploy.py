@@ -93,11 +93,15 @@ def _notify_gateway_deploy_start(account_filename: str, log: "DeployLogger") -> 
         log.log("⚠️ Gateway 未匹配到该账号的后端，部署完成后可能需要检查后端配置")
 
 
-def _notify_gateway_deploy_done(account_filename: str, log: "DeployLogger") -> None:
+def _notify_gateway_deploy_done(
+    account_filename: str,
+    log: "DeployLogger",
+    expire_at: float | None = None,
+) -> None:
     """Reload backend state and activate the new Claw (peers stay up for overlap)."""
     try:
         from gateway.runtime import complete_account_deploy
-        result = complete_account_deploy(account_filename)
+        result = complete_account_deploy(account_filename, expire_at=expire_at)
     except Exception as e:  # noqa: BLE001
         log.log(f"⚠️ Gateway 自动重载/激活失败，请手动重载: {type(e).__name__}: {e}")
         logger_module.exception("Gateway deploy-done hook failed for %s", account_filename)
@@ -1029,19 +1033,45 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             "GET", "/open-apis/user/mimo-claw/status",
             with_ph=False, cookies=cookies,
         )
+        # MiMo status values that mean "nothing to destroy".
+        # NOT_CREATED = never created / already cleaned (dataCleaned=true) \u2014 NOT an
+        # old claw. Older code treated it as has_claw and always ran a useless destroy.
+        _NO_CLAW_STATUSES = ("", "DESTROYED", "DESTROYING", "NOT_CREATED")
         has_claw = False
         cur_status = ""
+        expire_ms = 0
         if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
-            cur_status = (data.get("data") or {}).get("status", "")
-            if cur_status not in ("", "DESTROYED", "DESTROYING"):
+            info = data.get("data") or {}
+            cur_status = str(info.get("status") or "")
+            expire_ms = int(info.get("expireTime") or 0)
+            if cur_status not in _NO_CLAW_STATUSES:
                 has_claw = True
+        else:
+            log.log(f"\u26a0\ufe0f Step 0 status \u67e5\u8be2\u5f02\u5e38: http={code} body={data!r}")
+
+        # Official status carries expireTime (ms epoch) while AVAILABLE \u2014 log it so
+        # deploy history shows the platform TTL, not just our local active_for_s.
+        if cur_status:
+            if expire_ms > 0:
+                remain_s = expire_ms / 1000.0 - time.time()
+                try:
+                    exp_str = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(expire_ms / 1000.0)
+                    )
+                except Exception:
+                    exp_str = str(expire_ms)
+                log.log(
+                    f"  MiMo status={cur_status} expireTime={exp_str} remain={remain_s:.0f}s"
+                )
+            else:
+                log.log(f"  MiMo status={cur_status} (no expireTime)")
 
         # force=False + an already-AVAILABLE claw -> reuse it (skip destroy+create)
         reuse_existing = (not force) and cur_status == "AVAILABLE"
         if reuse_existing:
             log.log("[reuse] existing claw is AVAILABLE and force=False; skip destroy/create")
         elif has_claw:
-            log.log("\u53d1\u73b0\u65e7 Claw\uff0c\u9500\u6bc1\u4e2d...")
+            log.log(f"\u53d1\u73b0\u65e7 Claw (status={cur_status})\uff0c\u9500\u6bc1\u4e2d...")
             gateway_restore_safe = False
             await acurl("POST", "/open-apis/user/mimo-claw/destroy", body={}, cookies=cookies)
             for _ in range(_DESTROY_POLL_MAX_ITERS):
@@ -1055,11 +1085,13 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                     with_ph=False, cookies=cookies,
                 )
                 if code == "HTTP_200" and isinstance(data, dict):
-                    if (data.get("data") or {}).get("status") in ("DESTROYED", ""):
+                    st = (data.get("data") or {}).get("status") or ""
+                    # NOT_CREATED also means gone (platform cleaned the resource).
+                    if st in ("DESTROYED", "", "NOT_CREATED"):
                         break
             log.log("\u65e7 Claw \u5df2\u9500\u6bc1")
         else:
-            log.log("\u65e0\u65e7 Claw\uff0c\u8df3\u8fc7\u9500\u6bc1")
+            log.log(f"\u65e0\u65e7 Claw (status={cur_status or 'empty'})\uff0c\u8df3\u8fc7\u9500\u6bc1")
         if cancelled():
             mark_finished("cancelled", history_status="cancelled")
             return
@@ -1110,9 +1142,12 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                 await asyncio.sleep(s)
 
         claw_ready = False
+        claw_expire_at = 0.0
         if reuse_existing:
             log.log("[reuse] claw already AVAILABLE; skip Step1 create")
             claw_ready = True
+            if expire_ms > 0:
+                claw_expire_at = float(expire_ms) / 1000.0
         else:
             log.log("Step 1: \u521b\u5efa\u65b0 Claw...")
             # Stamp the daily-create cooldown up-front: the create consumes the
@@ -1138,6 +1173,10 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
                     sv = (data.get("data") or {}).get("status", "")
                 if sv == "AVAILABLE":
                     claw_ready = True
+                    try:
+                        claw_expire_at = float((data.get("data") or {}).get("expireTime") or 0) / 1000.0
+                    except Exception:
+                        claw_expire_at = 0.0
                     break
                 if sv in ("CREATE_FAILED", "FAILED"):
                     msg = (data.get("data") or {}).get("message", "")
@@ -1151,6 +1190,12 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
             mark_finished("error", history_status="error")
             return
         log.log("\u2705 Claw \u5c31\u7eea")
+        if claw_expire_at > 0:
+            remain = claw_expire_at - time.time()
+            log.log(
+                f"  official expire_at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(claw_expire_at))} "
+                f"remain={remain:.0f}s"
+            )
 
         # Step 2.5: neutralize the obstructive Security CoT by overwriting
         # SOUL.md + AGENTS.md via the operator agents.files.set method. This is a
@@ -1268,7 +1313,9 @@ async def run_deploy_async(account_filename: str, force: bool = False) -> None:
         _register_account_backend(account_filename, ssh_target, log)
 
         # Hand off to the gateway: reload and switch to the verified backend.
-        _notify_gateway_deploy_done(account_filename, log)
+        _notify_gateway_deploy_done(
+            account_filename, log, expire_at=(claw_expire_at or None),
+        )
         log.log("=== \u2705 \u90e8\u7f72\u5b8c\u6210\uff08\u53cd\u5411\u96a7\u9053\u5df2\u901a\uff0c\u540e\u7aef\u5df2\u767b\u8bb0\uff09===")
         mark_finished("done", history_status="done")
 
