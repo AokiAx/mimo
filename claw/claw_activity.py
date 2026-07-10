@@ -17,10 +17,14 @@ side — and cannot be done by the Claw itself — is:
   * Risk control: poll each account's ``bannedStatus`` and quarantine banned
     accounts before they are ever picked for a deploy; release them after 24h
     once recovered.
+  * Auto-reg: when create candidates are empty (all live accounts in daily
+    cooldown / serving), register fresh free accounts so the 2h open cadence
+    is not stuck waiting for Beijing midnight.
 
 Health is judged by a direct GET on the forwarded ``/v1/models`` (proves the
 tunnel is up AND the injected upstream key works), never by parsing Claw text.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -67,6 +71,13 @@ _maintain_last: float = 0.0
 _maintain_running: bool = False
 _MAINTAIN_CHECK_S = int(float(os.environ.get("MIMO_POOL_MAINTAIN_INTERVAL_S", 30 * 60)))
 _MAINTAIN_BATCH = int(float(os.environ.get("MIMO_POOL_MAINTAIN_BATCH", 2)))  # max new regs per cycle
+# Hard ceiling so available=0 emergency growth cannot register forever.
+_POOL_MAX = int(float(os.environ.get("MIMO_CK_POOL_MAX", 24)))
+# When open cadence is starved (0 create candidates), allow an urgent top-up
+# even if the regular maintain interval has not elapsed.
+_URGENT_TOPUP_COOLDOWN_S = int(float(os.environ.get("MIMO_POOL_URGENT_TOPUP_S", 10 * 60)))
+_urgent_topup_last: float = 0.0
+
 
 # Proactive risk-control scan: poll each enabled account's bannedStatus and
 # quarantine banned ones before the loop ever picks them for a deploy. Throttled
@@ -262,17 +273,29 @@ def _need_open_new_claw() -> bool:
     return youngest >= float(_OPEN_INTERVAL_S)
 
 
-def _maybe_top_up_account_pool() -> None:
+def _maybe_top_up_account_pool(*, urgent: bool = False) -> None:
     """Background top-up of auto-reg accounts so 24h create cadence never starves.
 
-    Runs at most every ``_MAINTAIN_CHECK_S``. Registers at most ``_MAINTAIN_BATCH``
-    accounts per cycle (full ``maintain --target 12`` in one shot is too heavy).
+    Runs at most every ``_MAINTAIN_CHECK_S`` (or ``_URGENT_TOPUP_COOLDOWN_S`` when
+    ``urgent=True``). Registers at most ``_MAINTAIN_BATCH`` accounts per cycle.
+
+    Key policy: **available_for_create == 0 is always a starve signal**, even when
+    ``auto_live >= target``. Live-but-cooldown accounts cannot open a new Claw
+    today; only a freshly registered account has unused daily create quota.
+    Growth is capped at ``_POOL_MAX`` so the pool cannot expand without bound.
     """
-    global _maintain_last, _maintain_running
+    global _maintain_last, _maintain_running, _urgent_topup_last
     now = time.time()
-    if _maintain_running or now - _maintain_last < _MAINTAIN_CHECK_S:
+    if _maintain_running:
+        return
+    if urgent:
+        if now - _urgent_topup_last < _URGENT_TOPUP_COOLDOWN_S:
+            return
+    elif now - _maintain_last < _MAINTAIN_CHECK_S:
         return
     _maintain_last = now
+    if urgent:
+        _urgent_topup_last = now
     try:
         from claw.account_pool import snapshot
         from claw.ck_lifecycle import POOL_TARGET
@@ -281,28 +304,44 @@ def _maybe_top_up_account_pool() -> None:
         auto_live = len(snap.get("auto_live") or [])
         available = len(snap.get("available_for_create") or [])
         target = int(POOL_TARGET)
-        if auto_live >= target and available >= 1:
+        pool_max = max(target, _POOL_MAX)
+
+        # Healthy: have at least one create candidate and inventory is full.
+        if available >= 1 and auto_live >= target:
             logger.info(
                 "[activity] pool ok auto_live=%d available=%d target=%d",
                 auto_live, available, target,
             )
             return
-        need = max(0, target - auto_live)
-        if need <= 0 and available >= 1:
-            return
-        batch = max(1, min(_MAINTAIN_BATCH, need if need > 0 else 1))
-        if available == 0 and auto_live > 0:
-            # all in cooldown/serving — can't create more today; just log
-            logger.warning(
-                "[activity] pool: available=0 (all cooldown/serving) auto_live=%d — wait Beijing day roll or add accounts",
-                auto_live,
-            )
-            if auto_live >= target:
+
+        # Create-starved: every live account is cooldown/serving/risk. Must
+        # register new free accounts even if auto_live already looks "full".
+        create_starved = available == 0
+        need_for_target = max(0, target - auto_live)
+        if create_starved:
+            if auto_live >= pool_max:
+                logger.warning(
+                    "[activity] pool: available=0 but auto_live=%d >= pool_max=%d — stop auto-reg",
+                    auto_live, pool_max,
+                )
                 return
-        logger.warning(
-            "[activity] pool low auto_live=%d available=%d target=%d → register batch=%d",
-            auto_live, available, target, batch,
-        )
+            # Prefer filling up to target; if already at/above target still add a
+            # small batch so mid-day cooldown can be bypassed with fresh quota.
+            room = max(0, pool_max - auto_live)
+            batch = max(1, min(_MAINTAIN_BATCH, room if room > 0 else 1))
+            logger.warning(
+                "[activity] pool create-starved available=0 auto_live=%d target=%d "
+                "pool_max=%d urgent=%s → register batch=%d",
+                auto_live, target, pool_max, urgent, batch,
+            )
+        elif need_for_target > 0:
+            batch = max(1, min(_MAINTAIN_BATCH, need_for_target))
+            logger.warning(
+                "[activity] pool low auto_live=%d available=%d target=%d → register batch=%d",
+                auto_live, available, target, batch,
+            )
+        else:
+            return
     except Exception:
         logger.exception("[activity] pool check failed")
         return
@@ -665,7 +704,8 @@ def _loop() -> None:
                 ages = _active_backend_ages()
                 # Primary: create a fresh Claw on a never-deployed account.
                 opened = False
-                for acc in _available_for_create()[:1]:
+                create_candidates = _available_for_create()
+                for acc in create_candidates[:1]:
                     if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
                         continue
                     _cold_start_last[acc] = now
@@ -683,6 +723,16 @@ def _loop() -> None:
                         logger.exception("[activity] %s: open trigger_deploy failed", acc)
                     opened = True
                     break
+                # No create candidates: auto-register fresh accounts (they have
+                # unused daily create quota). Do this before emergency reuse so
+                # fleet recovery is not stuck waiting for Beijing day roll.
+                if not opened and not create_candidates:
+                    logger.warning(
+                        "[activity] open starved: no create candidates "
+                        "(actives=%d) → urgent auto-reg",
+                        len(ages),
+                    )
+                    _maybe_top_up_account_pool(urgent=True)
                 # Fallback: zero active backends AND no create candidates →
                 # try reusing an existing registered account whose MiMo Claw
                 # is still AVAILABLE (no create quota burned).
@@ -701,6 +751,7 @@ def _loop() -> None:
                         except Exception:
                             logger.exception("[activity] %s: emergency reuse trigger failed", acc)
                         break
+
             for acc in accounts:
                 with _state_lock:
                     st = _state.setdefault(acc, {})
