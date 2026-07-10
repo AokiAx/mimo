@@ -21,6 +21,8 @@
     python claw/mailbox.py mailtm        # 建临时邮箱, 打印地址, 等 60s 看能否收码
 """
 
+from __future__ import annotations
+
 import re
 import sys
 import time
