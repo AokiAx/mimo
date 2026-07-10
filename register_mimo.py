@@ -28,6 +28,8 @@
 可选全自动: 2Captcha key；mail.tm 免 key（域名可能被小米拒）
 """
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import json
