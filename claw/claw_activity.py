@@ -359,7 +359,6 @@ def _available_for_reuse() -> list[str]:
 
     # Probe MiMo status: only pick accounts whose Claw is AVAILABLE (reuse)
     out = []
-    import asyncio
     for acc in candidates:
         cookies = _load_account_cookies(acc)
         if cookies is None:
@@ -367,9 +366,9 @@ def _available_for_reuse() -> list[str]:
         try:
             import importlib
             app_mod = importlib.import_module("app")
-            code, data = asyncio.get_event_loop().run_until_complete(
-                app_mod.acurl("GET", "/open-apis/user/mimo-claw/status",
-                              with_ph=False, cookies=cookies)
+            code, data = app_mod.curl_api(
+                "GET", "/open-apis/user/mimo-claw/status",
+                with_ph=False, cookies=cookies,
             )
             status = ""
             if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
@@ -688,7 +687,7 @@ def _loop() -> None:
                 # try reusing an existing registered account whose MiMo Claw
                 # is still AVAILABLE (no create quota burned).
                 if not opened and not ages:
-                    for acc in _accounts_for_emergency_reuse()[:1]:
+                    for acc in _available_for_reuse()[:1]:
                         if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
                             continue
                         _cold_start_last[acc] = now
