@@ -323,6 +323,64 @@ def _maybe_top_up_account_pool() -> None:
     threading.Thread(target=_worker, name="pool-topup", daemon=True).start()
 
 
+def _available_for_reuse() -> list[str]:
+    """Accounts that already have a registered backend and can be redeployed
+    via reuse (Claw still AVAILABLE on MiMo side). This is the recovery path
+    when all claws have expired and there are no available-for-create accounts.
+
+    Only picks accounts whose MiMo Claw is still AVAILABLE — avoids burning a
+    daily-create quota on a reuse attempt.
+    """
+    try:
+        from claw.auto_deploy import load_config, _load_account_cookies
+        from gateway import backend_store
+        from gateway.runtime import get_all_backends
+    except Exception:
+        return []
+
+    cfg = load_config()
+    accounts = cfg.get("accounts") or {}
+    # Accounts with a registered backend (any lifecycle)
+    registered = {
+        str(b.get("account_id") or "")
+        for b in backend_store.list_backends()
+        if b.get("account_id")
+    }
+    candidates = []
+    for acc in registered:
+        acc_cfg = accounts.get(acc) or {}
+        if not acc_cfg.get("enabled", True):
+            continue
+        if acc_cfg.get("risk_blocked"):
+            continue
+        if _account_is_deploying(acc):
+            continue
+        candidates.append(acc)
+
+    # Probe MiMo status: only pick accounts whose Claw is AVAILABLE (reuse)
+    out = []
+    import asyncio
+    for acc in candidates:
+        cookies = _load_account_cookies(acc)
+        if cookies is None:
+            continue
+        try:
+            import importlib
+            app_mod = importlib.import_module("app")
+            code, data = asyncio.get_event_loop().run_until_complete(
+                app_mod.acurl("GET", "/open-apis/user/mimo-claw/status",
+                              with_ph=False, cookies=cookies)
+            )
+            status = ""
+            if code == "HTTP_200" and isinstance(data, dict) and data.get("code") == 0:
+                status = (data.get("data") or {}).get("status", "")
+            if status == "AVAILABLE":
+                out.append(acc)
+        except Exception:
+            continue
+    return out
+
+
 def _available_for_create() -> list[str]:
     """Accounts eligible to create a Claw right now, fairest-first.
 
@@ -606,6 +664,8 @@ def _loop() -> None:
             in_flight = sum(1 for a in _all_enabled_accounts() if _account_is_deploying(a))
             if not in_flight and _need_open_new_claw():
                 ages = _active_backend_ages()
+                # Primary: create a fresh Claw on a never-deployed account.
+                opened = False
                 for acc in _available_for_create()[:1]:
                     if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
                         continue
@@ -622,7 +682,26 @@ def _loop() -> None:
                         trigger_deploy(acc)
                     except Exception:
                         logger.exception("[activity] %s: open trigger_deploy failed", acc)
+                    opened = True
                     break
+                # Fallback: zero active backends AND no create candidates →
+                # try reusing an existing registered account whose MiMo Claw
+                # is still AVAILABLE (no create quota burned).
+                if not opened and not ages:
+                    for acc in _accounts_for_emergency_reuse()[:1]:
+                        if now - _cold_start_last.get(acc, 0.0) < _COLD_START_RETRY_S:
+                            continue
+                        _cold_start_last[acc] = now
+                        logger.warning(
+                            "[activity] %s: emergency reuse (no active backends, no create candidates)",
+                            acc,
+                        )
+                        try:
+                            from claw.auto_deploy import trigger_deploy
+                            trigger_deploy(acc)
+                        except Exception:
+                            logger.exception("[activity] %s: emergency reuse trigger failed", acc)
+                        break
             for acc in accounts:
                 with _state_lock:
                     st = _state.setdefault(acc, {})
