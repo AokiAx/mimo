@@ -182,7 +182,7 @@ def upsert_account_backend(
 
 def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
     allowed = {"name", "base_url", "models", "api_key",
-               "account_id", "enabled", "lifecycle", "generation_id", "expire_at"}
+               "account_id", "enabled", "lifecycle", "generation_id", "expire_at", "active_since"}
     # Legacy: caller passes {model, aliases} — fold into models.
     if "model" in fields or "aliases" in fields:
         legacy = []
@@ -214,6 +214,11 @@ def update_backend(backend_id: str, **fields: Any) -> dict[str, Any] | None:
                     if k == "lifecycle":
                         v = _normalize_lifecycle(v)
                     if k == "expire_at":
+                        try:
+                            v = float(v or 0)
+                        except (TypeError, ValueError):
+                            v = 0.0
+                    if k == "active_since":
                         try:
                             v = float(v or 0)
                         except (TypeError, ValueError):

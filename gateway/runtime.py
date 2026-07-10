@@ -153,6 +153,10 @@ def _build_backend_from_entry(entry: dict[str, Any]) -> Backend:
         generation_id=entry.get("generation_id") or entry.get("id") or "",
         expire_at=float(entry.get("expire_at") or 0) or 0.0,
     )
+    # Restore persisted active_since so age survives panel restart.
+    saved_active = float(entry.get("active_since") or 0)
+    if saved_active > 0:
+        backend.active_since = saved_active
     return backend
 
 
@@ -185,14 +189,45 @@ def _ensure_initialized() -> None:
 
 
 def _bootstrap_active_lifecycles() -> None:
-    """Seed active timers; multi-active is allowed (2h open / 4h TTL fleet)."""
+    """Seed active timers; multi-active is allowed (2h open / 4h TTL fleet).
+
+    On startup, backends marked ``failed`` from a previous bad deploy are
+    probed: if the upstream tunnel is actually healthy, restore to ``active``
+    so a stale ``lifecycle=failed`` in the store doesn't permanently kill a
+    still-live backend after a panel restart.
+    """
     assert _registry is not None
     now = time.time()
+    import httpx as _httpx
     for b in _registry.all():
         if b.lifecycle == "active" and not b.active_since:
             b.mark_active(now=now)
         elif b.lifecycle == "draining" and not b.drain_deadline:
             b.mark_draining(drain_timeout_s=_DRAIN_TIMEOUT_S, now=now)
+        elif b.lifecycle == "failed" and b.enabled and b.base_url:
+            # Probe the upstream: if /health responds 200, the backend is
+            # actually fine — the "failed" was from a mid-deploy glitch.
+            try:
+                url = b.base_url.rstrip("/") + "/health"
+                r = _httpx.get(url, timeout=5, trust_env=False)
+                if r.status_code == 200:
+                    b.mark_active(now=now)
+                    b.enabled = True
+                    _persist_backend_runtime_state(b)
+                    try:
+                        from gateway.backend_store import update_backend
+                        update_backend(
+                            b.backend_id, enabled=True, lifecycle="active",
+                            expire_at=getattr(b, "expire_at", 0) or 0,
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        "Bootstrap: restored failed backend %s → active (upstream healthy)",
+                        b.backend_id,
+                    )
+            except Exception:
+                pass  # upstream unreachable — stay failed
     reconcile_backend_ages(now=now)
 
 
@@ -837,6 +872,8 @@ def _persist_backend_runtime_state(backend: Backend) -> None:
         }
         if getattr(backend, "expire_at", 0):
             fields["expire_at"] = float(backend.expire_at)
+        if backend.active_since:
+            fields["active_since"] = float(backend.active_since)
         update_backend(backend.backend_id, **fields)
     except Exception:
         logger.exception("Failed to persist backend state for %s", backend.backend_id)
