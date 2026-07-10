@@ -15,17 +15,18 @@
    risk       risk_blocked（ban / create_gate）
    dead       ck 探活失败（401 等）— 不能再部署
    disabled   enabled=false 且非 risk
-   serving    已有 healthy+active 后端（正在扛流量/有 Claw）
-   cooldown   今日北京时间已 create（无额度），暂不能再 create
+   serving    已有 active 后端（正在服役；优先于 cooldown）
+   cooldown   今日北京时间已 create，且当前无 active 后端
    available  enabled + ck 活 + 未 risk + 未冷却 + 尚无 active 后端
               → 可被 activity relay 选中去 create
 
 另有布尔位（可与主标签并存语义）:
    can_create   是否可被 _available_for_create 选中
-   is_serving   是否有 healthy active backend
+   is_serving   是否有 active backend
    ck_live      mi/get 是否成功
-   in_cooldown  今日是否已 create
+   in_cooldown  今日是否已 create（与 serving 可并存）
    risk_blocked 是否在风控隔离
+
 
 自动注册号策略（当前运营）:
    - 只养 auto_reg 库存（tempmail 注册）
@@ -179,33 +180,44 @@ def _load_deploy_cfg() -> dict:
 
 
 def _list_backends() -> list[dict]:
+    # Prefer runtime view (has healthy/lifecycle live state). Fall back to store.
+    try:
+        from gateway.runtime import get_all_backends
+
+        runtime = get_all_backends() or []
+        if runtime:
+            return runtime
+    except Exception:
+        pass
     try:
         from gateway import backend_store
 
         return backend_store.list_backends() or []
     except Exception:
-        try:
-            from gateway.runtime import get_all_backends
-
-            return get_all_backends() or []
-        except Exception:
-            return []
+        return []
 
 
 def _serving_account_ids(backends: list[dict]) -> set[str]:
-    """Account keys that have a healthy+active backend right now."""
+    """Account keys that currently have an active backend in the gateway.
+
+    Runtime backends expose ``healthy``; store-only rows usually don't. Treat
+    enabled + lifecycle=active as serving when healthy is unknown, so a live
+    Claw already registered as active is not mis-bucketed into cooldown.
+    """
     out: set[str] = set()
     for b in backends:
-        if not (
-            b.get("enabled", True)
-            and b.get("healthy")
-            and b.get("lifecycle") == "active"
-        ):
+        if not b.get("enabled", True):
             continue
-        aid = str(b.get("account_id") or b.get("account") or "").strip()
+        if b.get("lifecycle") != "active":
+            continue
+        # Only reject when health is *explicitly* False.
+        if b.get("healthy") is False:
+            continue
+        aid = str(b.get("account_id") or b.get("account") or b.get("name") or "").strip()
         if aid:
             out |= _match_keys(aid)
     return out
+
 
 
 def classify_one(
@@ -245,6 +257,9 @@ def classify_one(
         risk_effective = risk_blocked
 
     # mutual-exclusive deploy_pool for UI
+    # Priority: risk > dead > disabled > serving > cooldown > available
+    # serving MUST beat cooldown: a live active backend is "已部署/服役",
+    # even if today's create quota is already spent.
     if inventory == "archive":
         deploy_pool = "archive"
     elif risk_effective:
@@ -416,13 +431,14 @@ def snapshot(*, probe: bool = True, include_archive: bool = False) -> dict:
         "rows": rows,
         "legend": {
             "available": "可用池：可被 relay 选中 create",
-            "serving": "服役中：已有 healthy active 后端",
-            "cooldown": "冷却池：今日北京时间已 create",
+            "serving": "服役中：已有 active 后端（即使今日已 create）",
+            "cooldown": "冷却池：今日已 create 且当前无 active 后端",
             "risk": "风控池：risk_blocked / ban",
             "dead": "ck 已死：401 等，需归档补号",
             "disabled": "停用：enabled=false",
             "archive": "归档目录",
         },
+
     }
 
 

@@ -1510,17 +1510,20 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     var enabled = cfg.enabled || false;
     var isRisk = !!cfg.risk_blocked;
     var hasBackend = (schedInfo.backend_count || 0) > 0;
+    // Beijing calendar day (UTC+8), not browser local / raw UTC date
     var inCooldown = !isRisk && !!cfg.last_create_at && (function() {
-      var d = new Date(cfg.last_create_at * 1000);
-      var now = new Date();
-      return d.getUTCFullYear() === now.getUTCFullYear() &&
-             d.getUTCMonth() === now.getUTCMonth() &&
-             d.getUTCDate() === now.getUTCDate();
+      var created = new Date((cfg.last_create_at * 1000) + 8 * 3600 * 1000);
+      var nowBj = new Date(Date.now() + 8 * 3600 * 1000);
+      return created.getUTCFullYear() === nowBj.getUTCFullYear() &&
+             created.getUTCMonth() === nowBj.getUTCMonth() &&
+             created.getUTCDate() === nowBj.getUTCDate();
     })();
     var badge = enabled
       ? '<span style="background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:4px;font-size:0.72rem">已启用</span>'
       : '<span style="background:#222;color:#666;padding:2px 8px;border-radius:4px;font-size:0.72rem">已禁用</span>';
     if (isRisk) badge += ' <span class="badge-risk">🚫 ' + (cfg.risk_kind === 'create_gate' ? '建号风控' : '风控') + '隔离</span>';
+    else if (hasBackend && inCooldown) badge += ' <span style="background:#0a2a1a;color:#4ade80;padding:2px 8px;border-radius:4px;font-size:0.72rem">服役</span><span style="background:#2a2a00;color:#c8a800;padding:2px 8px;border-radius:4px;font-size:0.72rem;margin-left:4px">今日已create</span>';
+    else if (hasBackend) badge += ' <span style="background:#0a2a1a;color:#4ade80;padding:2px 8px;border-radius:4px;font-size:0.72rem">已部署</span>';
     else if (inCooldown) badge += ' <span style="background:#2a2a00;color:#c8a800;padding:2px 8px;border-radius:4px;font-size:0.72rem">冷却中</span>';
 
     var card = '<div style="background:#0d1b2a;border-radius:8px;padding:16px;margin-bottom:12px;border:1px solid ' + (isRisk ? 'var(--red)' : (enabled ? 'rgba(34,197,94,.3)' : 'var(--border)')) + (isRisk ? ';box-shadow:0 0 0 1px rgba(239,68,68,.25)' : '') + '">';
@@ -1544,11 +1547,13 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     card += '</div>';
     card += '</div>';
-    // 分组优先级：风控 > 冷却 > 已部署 > 可部署
+    // 分组优先级：风控 > 已部署/服役 > 冷却 > 可部署
+    // 冷却只表示「今日不能再 create」，不能盖过已经在跑的后端
     if (isRisk) { riskHtml += card; nRisk++; }
-    else if (inCooldown) { cooldownHtml += card; nCooldown++; }
     else if (hasBackend) { deployedHtml += card; nDeployed++; }
+    else if (inCooldown) { cooldownHtml += card; nCooldown++; }
     else { readyHtml += card; nReady++; }
+
   }
   if (nDeployed === 0) deployedHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无已部署账号</div>';
   if (nReady === 0) readyHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无可用账号</div>';
