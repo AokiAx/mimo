@@ -506,6 +506,10 @@ def _invalidate_summary(filename: str | None = None) -> None:
 
 _http_client_loop = None  # event loop the async client is bound to
 
+# Optional proxy for MiMo API calls (e.g. WARP to bypass IP risk control).
+# Set MIMO_PROXY=socks5://127.0.0.1:40001 or http://127.0.0.1:40001
+_MIMO_PROXY = os.environ.get("MIMO_PROXY") or None
+
 
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client, _http_client_loop
@@ -520,6 +524,7 @@ def _get_http_client() -> httpx.AsyncClient:
     # FDS-upload step). Rebuild whenever the running loop changes.
     if _http_client is None or _http_client_loop is not loop:
         _http_client = httpx.AsyncClient(
+            proxy=_MIMO_PROXY,
             timeout=httpx.Timeout(20.0, connect=10.0),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             trust_env=False,
@@ -538,6 +543,7 @@ def _get_sync_http_client() -> httpx.Client:
     global _sync_http_client
     if _sync_http_client is None:
         _sync_http_client = httpx.Client(
+            proxy=_MIMO_PROXY,
             timeout=httpx.Timeout(20.0, connect=10.0),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
             trust_env=False,
