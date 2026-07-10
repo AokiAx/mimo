@@ -1500,13 +1500,15 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     head += '<span>在线 <b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
     head += '</div>';
   }
-  var normalHtml = '', riskHtml = '', nNormal = 0, nRisk = 0;
+  var deployedHtml = '', idleHtml = '', riskHtml = '', nDeployed = 0, nIdle = 0, nRisk = 0;
   for (var i = 0; i < window.accounts.length; i++) {
     var a = window.accounts[i];
     var fn = a.filename;
     var cfg = (deployCfg && deployCfg[fn]) || {};
+    var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var enabled = cfg.enabled || false;
     var isRisk = !!cfg.risk_blocked;
+    var hasBackend = (schedInfo.backend_count || 0) > 0;
     var badge = enabled
       ? '<span style="background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:4px;font-size:0.72rem">已启用</span>'
       : '<span style="background:#222;color:#666;padding:2px 8px;border-radius:4px;font-size:0.72rem">已禁用</span>';
@@ -1525,7 +1527,6 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<label style="font-size:0.78rem;color:var(--text3)">启用</label> ';
     card += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="updateAccountDeploy(\'' + fn + '\',\'enabled\',this.checked)" style="width:auto;margin-left:6px;vertical-align:middle">';
     card += '</div>';
-    var schedInfo = (scheduler.accounts && scheduler.accounts[fn]) || {};
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
     var ageMin = schedInfo.age_min || 0;
     var relayReason = schedInfo.next_relay_reason || '';
@@ -1537,28 +1538,34 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     card += '</div>';
     card += '</div>';
-    if (isRisk) { riskHtml += card; nRisk++; } else { normalHtml += card; nNormal++; }
+    if (isRisk) { riskHtml += card; nRisk++; }
+    else if (hasBackend) { deployedHtml += card; nDeployed++; }
+    else { idleHtml += card; nIdle++; }
   }
-  if (nNormal === 0) normalHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无账号</div>';
+  if (nDeployed === 0) deployedHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无已部署账号</div>';
+  if (nIdle === 0) idleHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无待部署账号</div>';
   if (nRisk === 0) riskHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无风控隔离账号 🎉</div>';
-  var tabs = '<div style="display:flex;gap:8px;margin-bottom:14px">' +
-    '<button id="adTabBtnNormal" class="btn btn-primary" onclick="switchAdTab(\'normal\')">正常账号 (' + nNormal + ')</button>' +
+  var tabs = '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
+    '<button id="adTabBtnDeployed" class="btn btn-primary" onclick="switchAdTab(\'deployed\')">已部署 (' + nDeployed + ')</button>' +
+    '<button id="adTabBtnIdle" class="btn btn-ghost" onclick="switchAdTab(\'idle\')">待部署 (' + nIdle + ')</button>' +
     '<button id="adTabBtnRisk" class="btn btn-ghost" onclick="switchAdTab(\'risk\')">🚫 风控隔离 (' + nRisk + ')</button>' +
     '</div>';
   el.innerHTML = head + tabs +
-    '<div id="adTabNormal">' + normalHtml + '</div>' +
+    '<div id="adTabDeployed">' + deployedHtml + '</div>' +
+    '<div id="adTabIdle" style="display:none">' + idleHtml + '</div>' +
     '<div id="adTabRisk" style="display:none">' + riskHtml + '</div>';
 }
 
 function switchAdTab(which) {
-  var n = document.getElementById('adTabNormal'), r = document.getElementById('adTabRisk');
-  var bn = document.getElementById('adTabBtnNormal'), br = document.getElementById('adTabBtnRisk');
-  if (!n || !r) return;
-  var risk = (which === 'risk');
-  n.style.display = risk ? 'none' : '';
-  r.style.display = risk ? '' : 'none';
-  if (bn) bn.className = 'btn ' + (risk ? 'btn-ghost' : 'btn-primary');
-  if (br) br.className = 'btn ' + (risk ? 'btn-primary' : 'btn-ghost');
+  var d = document.getElementById('adTabDeployed'), i = document.getElementById('adTabIdle'), r = document.getElementById('adTabRisk');
+  var bd = document.getElementById('adTabBtnDeployed'), bi = document.getElementById('adTabBtnIdle'), br = document.getElementById('adTabBtnRisk');
+  if (!d || !i || !r) return;
+  d.style.display = which === 'deployed' ? '' : 'none';
+  i.style.display = which === 'idle' ? '' : 'none';
+  r.style.display = which === 'risk' ? '' : 'none';
+  if (bd) bd.className = 'btn ' + (which === 'deployed' ? 'btn-primary' : 'btn-ghost');
+  if (bi) bi.className = 'btn ' + (which === 'idle' ? 'btn-primary' : 'btn-ghost');
+  if (br) br.className = 'btn ' + (which === 'risk' ? 'btn-primary' : 'btn-ghost');
 }
 
 function updateAccountDeploy(filename, key, value) {
