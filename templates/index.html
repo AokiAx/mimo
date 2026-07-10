@@ -1500,7 +1500,8 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     head += '<span>在线 <b style="color:var(--green)">' + (counts.active_selectable || 0) + '</b></span>';
     head += '</div>';
   }
-  var deployedHtml = '', idleHtml = '', riskHtml = '', nDeployed = 0, nIdle = 0, nRisk = 0;
+  var deployedHtml = '', readyHtml = '', cooldownHtml = '', riskHtml = '';
+  var nDeployed = 0, nReady = 0, nCooldown = 0, nRisk = 0;
   for (var i = 0; i < window.accounts.length; i++) {
     var a = window.accounts[i];
     var fn = a.filename;
@@ -1509,10 +1510,18 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     var enabled = cfg.enabled || false;
     var isRisk = !!cfg.risk_blocked;
     var hasBackend = (schedInfo.backend_count || 0) > 0;
+    var inCooldown = !isRisk && !!cfg.last_create_at && (function() {
+      var d = new Date(cfg.last_create_at * 1000);
+      var now = new Date();
+      return d.getUTCFullYear() === now.getUTCFullYear() &&
+             d.getUTCMonth() === now.getUTCMonth() &&
+             d.getUTCDate() === now.getUTCDate();
+    })();
     var badge = enabled
       ? '<span style="background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:4px;font-size:0.72rem">已启用</span>'
       : '<span style="background:#222;color:#666;padding:2px 8px;border-radius:4px;font-size:0.72rem">已禁用</span>';
     if (isRisk) badge += ' <span class="badge-risk">🚫 ' + (cfg.risk_kind === 'create_gate' ? '建号风控' : '风控') + '隔离</span>';
+    else if (inCooldown) badge += ' <span style="background:#2a2a00;color:#c8a800;padding:2px 8px;border-radius:4px;font-size:0.72rem">冷却中</span>';
 
     var card = '<div style="background:#0d1b2a;border-radius:8px;padding:16px;margin-bottom:12px;border:1px solid ' + (isRisk ? 'var(--red)' : (enabled ? 'rgba(34,197,94,.3)' : 'var(--border)')) + (isRisk ? ';box-shadow:0 0 0 1px rgba(239,68,68,.25)' : '') + '">';
     card += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
@@ -1529,43 +1538,44 @@ function renderAutoDeployList(el, deployCfg, scheduler) {
     card += '</div>';
     var lastRun = schedInfo.last_run || (cfg.last_run ? new Date(cfg.last_run * 1000).toLocaleString('zh-CN') : '从未');
     var ageMin = schedInfo.age_min || 0;
-    var relayReason = schedInfo.next_relay_reason || '';
-    var skipReason = schedInfo.skip_reason || '';
     card += '<div style="display:flex;gap:20px;margin-bottom:10px;font-size:0.78rem;color:var(--text3)">';
     card += '<span>上次：<b style="color:var(--text2)">' + escapeHtml(String(lastRun)) + '</b></span>';
     if (ageMin > 0) card += '<span>年龄：<b style="color:' + (ageMin >= 230 ? 'var(--red)' : ageMin >= 210 ? 'var(--yellow)' : 'var(--text2)') + '">' + ageMin + ' 分钟</b></span>';
-    if (ageMin > 0) { /* age already shown */ }
     card += '<a href="javascript:void(0)" onclick="showRunHistory(\'' + fn + '\')" style="color:var(--accent);margin-left:auto">历史</a>';
     card += '</div>';
     card += '</div>';
+    // 分组优先级：风控 > 冷却 > 已部署 > 可部署
     if (isRisk) { riskHtml += card; nRisk++; }
+    else if (inCooldown) { cooldownHtml += card; nCooldown++; }
     else if (hasBackend) { deployedHtml += card; nDeployed++; }
-    else { idleHtml += card; nIdle++; }
+    else { readyHtml += card; nReady++; }
   }
   if (nDeployed === 0) deployedHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无已部署账号</div>';
-  if (nIdle === 0) idleHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无待部署账号</div>';
+  if (nReady === 0) readyHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无可用账号</div>';
+  if (nCooldown === 0) cooldownHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无冷却中账号 🎉</div>';
   if (nRisk === 0) riskHtml = '<div style="color:var(--text3);text-align:center;padding:20px">无风控隔离账号 🎉</div>';
   var tabs = '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
     '<button id="adTabBtnDeployed" class="btn btn-primary" onclick="switchAdTab(\'deployed\')">已部署 (' + nDeployed + ')</button>' +
-    '<button id="adTabBtnIdle" class="btn btn-ghost" onclick="switchAdTab(\'idle\')">待部署 (' + nIdle + ')</button>' +
+    '<button id="adTabBtnReady" class="btn btn-ghost" onclick="switchAdTab(\'ready\')">可部署 (' + nReady + ')</button>' +
+    '<button id="adTabBtnCooldown" class="btn btn-ghost" onclick="switchAdTab(\'cooldown\')">⏳ 冷却隔离 (' + nCooldown + ')</button>' +
     '<button id="adTabBtnRisk" class="btn btn-ghost" onclick="switchAdTab(\'risk\')">🚫 风控隔离 (' + nRisk + ')</button>' +
     '</div>';
   el.innerHTML = head + tabs +
     '<div id="adTabDeployed">' + deployedHtml + '</div>' +
-    '<div id="adTabIdle" style="display:none">' + idleHtml + '</div>' +
+    '<div id="adTabReady" style="display:none">' + readyHtml + '</div>' +
+    '<div id="adTabCooldown" style="display:none">' + cooldownHtml + '</div>' +
     '<div id="adTabRisk" style="display:none">' + riskHtml + '</div>';
 }
 
 function switchAdTab(which) {
-  var d = document.getElementById('adTabDeployed'), i = document.getElementById('adTabIdle'), r = document.getElementById('adTabRisk');
-  var bd = document.getElementById('adTabBtnDeployed'), bi = document.getElementById('adTabBtnIdle'), br = document.getElementById('adTabBtnRisk');
-  if (!d || !i || !r) return;
-  d.style.display = which === 'deployed' ? '' : 'none';
-  i.style.display = which === 'idle' ? '' : 'none';
-  r.style.display = which === 'risk' ? '' : 'none';
-  if (bd) bd.className = 'btn ' + (which === 'deployed' ? 'btn-primary' : 'btn-ghost');
-  if (bi) bi.className = 'btn ' + (which === 'idle' ? 'btn-primary' : 'btn-ghost');
-  if (br) br.className = 'btn ' + (which === 'risk' ? 'btn-primary' : 'btn-ghost');
+  var tabs = ['deployed','ready','cooldown','risk'];
+  for (var i = 0; i < tabs.length; i++) {
+    var t = tabs[i];
+    var panel = document.getElementById('adTab' + t.charAt(0).toUpperCase() + t.slice(1));
+    var btn = document.getElementById('adTabBtn' + t.charAt(0).toUpperCase() + t.slice(1));
+    if (panel) panel.style.display = (which === t) ? '' : 'none';
+    if (btn) btn.className = 'btn ' + (which === t ? 'btn-primary' : 'btn-ghost');
+  }
 }
 
 function updateAccountDeploy(filename, key, value) {
